@@ -11,7 +11,7 @@ use rmap_core::{HostState, PortState, Timing, service_name};
 
 use crate::app::{App, Field, HostRow, ScanView, Screen};
 
-const ACCENT: Color = Color::Cyan;
+pub(crate) const ACCENT: Color = Color::Cyan;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
@@ -21,13 +21,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 draw_results(frame, view);
             }
         }
+        Screen::Diff => {
+            if let Some(diff) = app.diff.as_ref() {
+                crate::report_ui::draw_diff(frame, diff);
+            }
+        }
+    }
+    if let Some(dialog) = &app.dialog {
+        crate::report_ui::draw_dialog(frame, dialog);
     }
     if let Some((_, public)) = &app.pending {
         draw_public_warning(frame, public);
     }
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let [area] = Layout::horizontal([Constraint::Length(width)])
         .flex(Flex::Center)
         .areas(area);
@@ -37,7 +45,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     area
 }
 
-fn key_help(pairs: &[(&str, &str)]) -> Line<'static> {
+pub(crate) fn key_help(pairs: &[(&str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
     for (key, what) in pairs {
         spans.push(Span::styled(
@@ -236,7 +244,12 @@ fn draw_results(frame: &mut Frame, view: &ScanView) {
     if view.is_running() {
         help.push(("s", "stop"));
     }
-    help.extend([("n", "new scan"), ("q", "quit")]);
+    help.extend([
+        ("e", "export"),
+        ("c", "compare"),
+        ("n", "new scan"),
+        ("q", "quit"),
+    ]);
     frame.render_widget(Paragraph::new(key_help(&help)), footer);
 }
 

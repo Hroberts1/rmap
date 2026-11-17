@@ -2,13 +2,17 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rmap_core::{HostState, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets};
 use rmap_engine::{Scan, ScanConfig};
+use rmap_report::{ReportBuilder, ScanStore, unix_millis_now};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
+
+use crate::report::{Dialog, DiffView};
 
 /// Most engine events handled per frame, so a burst can't stall input.
 const EVENTS_PER_FRAME: usize = 5_000;
@@ -94,6 +98,11 @@ pub struct ScanView {
     /// The engine went away without finishing, most likely a panic.
     pub failed: bool,
     pub log: Vec<String>,
+    /// Everything the engine reported, for export and saving.
+    pub report: ReportBuilder,
+    /// Where the scan was auto-saved, once it ended.
+    pub saved: Option<PathBuf>,
+    pub save_attempted: bool,
 }
 
 impl ScanView {
@@ -133,14 +142,15 @@ impl ScanView {
         self.selected = Some(visible[next]);
     }
 
-    fn log(&mut self, line: String) {
+    pub(crate) fn log(&mut self, line: String) {
         self.log.push(line);
         if self.log.len() > MAX_LOG_LINES {
             self.log.remove(0);
         }
     }
 
-    fn apply(&mut self, event: ScanEvent) {
+    pub(crate) fn apply(&mut self, event: ScanEvent) {
+        self.report.apply(&event);
         match event {
             ScanEvent::Started { hosts, .. } => self.total_hosts = hosts,
             ScanEvent::Host {
@@ -222,6 +232,8 @@ impl ScanView {
 pub enum Screen {
     Setup,
     Results,
+    /// Comparing the current scan with a saved one.
+    Diff,
 }
 
 pub struct App {
@@ -231,6 +243,11 @@ pub struct App {
     pub scan: Option<ScanView>,
     /// A scan waiting on the user to confirm it may touch public addresses.
     pub pending: Option<(ScanConfig, Vec<String>)>,
+    /// Saved scans and exports; `None` turns saving off (unit tests).
+    pub store: Option<ScanStore>,
+    /// Export dialog or saved-scan picker over the results screen.
+    pub dialog: Option<Dialog>,
+    pub diff: Option<DiffView>,
     quit: bool,
 }
 
@@ -242,12 +259,19 @@ impl App {
             form: Form::default(),
             scan: None,
             pending: None,
+            store: crate::report::default_store(),
+            dialog: None,
+            diff: None,
             quit: false,
         }
     }
 
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    pub(crate) fn request_quit(&mut self) {
+        self.quit = true;
     }
 
     /// Pull whatever the engine has produced since the last frame.
@@ -275,6 +299,7 @@ impl App {
                 }
             }
         }
+        self.autosave_if_done();
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -288,9 +313,14 @@ impl App {
             self.on_confirm_key(key);
             return;
         }
+        if self.dialog.is_some() {
+            self.on_dialog_key(key);
+            return;
+        }
         match self.screen {
             Screen::Setup => self.on_setup_key(key),
             Screen::Results => self.on_results_key(key),
+            Screen::Diff => self.on_diff_key(key),
         }
     }
 
@@ -392,6 +422,8 @@ impl App {
                 view.log("scan stopped".into());
             }
             KeyCode::Char('d') => view.show_down = !view.show_down,
+            KeyCode::Char('e') => self.open_export(),
+            KeyCode::Char('c') => self.open_compare(),
             KeyCode::Down | KeyCode::Char('j') => view.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => view.move_selection(-1),
             KeyCode::PageDown => view.move_selection(10),
@@ -445,6 +477,12 @@ impl App {
     }
 
     fn launch(&mut self, config: ScanConfig) {
+        // Save the previous scan before it's replaced.
+        self.autosave_if_done();
+        let report = ReportBuilder::new(
+            crate::report::config_summary(&self.form.targets, &config),
+            unix_millis_now(),
+        );
         let summary = format!(
             "{} · {} · {} port{} · T{} {}{}",
             self.form.targets.trim(),
@@ -472,6 +510,9 @@ impl App {
             stopped: false,
             failed: false,
             log: Vec::new(),
+            report,
+            saved: None,
+            save_attempted: false,
         });
         self.screen = Screen::Results;
     }

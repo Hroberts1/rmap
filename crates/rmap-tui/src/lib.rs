@@ -5,6 +5,8 @@
 //! network; it polls the engine's event channel between keypresses.
 
 mod app;
+mod report;
+mod report_ui;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -57,6 +59,7 @@ fn event_loop(terminal: &mut Term, rt: Handle) -> io::Result<()> {
             last_flush = Instant::now();
         }
     }
+    app.shutdown();
     Ok(())
 }
 
