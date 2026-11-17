@@ -259,3 +259,14 @@ async fn udp_uses_the_port_table_for_now() {
         ("dns", DetectMethod::PortTable)
     );
 }
+
+#[tokio::test]
+async fn plain_http_on_the_https_port() {
+    let addr = serve(Behaviour::Reply {
+        needle: b"\x16\x03\x01",
+        reply: b"HTTP/1.1 400 Bad Request\r\nServer: nginx/1.25.3\r\n\r\n",
+    })
+    .await;
+    let s = detect_as(addr, 443).await;
+    assert_eq!(s.version_label().as_deref(), Some("nginx 1.25.3"));
+}
