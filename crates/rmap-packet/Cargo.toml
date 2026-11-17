@@ -1,0 +1,9 @@
+[package]
+name = "rmap-packet"
+description = "Packet building and parsing for rmap: Ethernet, ARP, IPv4, TCP, UDP, ICMPv4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
