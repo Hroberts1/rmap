@@ -25,9 +25,11 @@ rust-version = "1.88"
 rmap-core = { path = "crates/rmap-core" }
 rmap-engine = { path = "crates/rmap-engine" }
 rmap-log = { path = "crates/rmap-log" }
+rmap-report = { path = "crates/rmap-report" }
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync"] }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
