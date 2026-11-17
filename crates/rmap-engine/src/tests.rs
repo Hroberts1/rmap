@@ -347,3 +347,274 @@ fn describe_truncates_long_target_lists() {
 fn hostname_target_counts_as_one_host() {
     assert_eq!(Target::Hostname("x".into()).count(), 1);
 }
+
+// ------------------------------------------------------ SYN and UDP scans ---
+//
+// These run everywhere. Without raw sockets (Windows, macOS, or Linux
+// without CAP_NET_RAW) the engine falls back and warns, and the results
+// must be the same. The `raw_` tests below insist on the raw backend.
+
+fn typed(targets: &str, ports: &str, timing: Timing, scan_type: ScanType) -> ScanConfig {
+    ScanConfig {
+        scan_type,
+        ..config(targets, ports, timing, false)
+    }
+}
+
+const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+impl Outcome {
+    fn port_states(&self) -> Vec<(u16, rmap_core::Protocol, PortState)> {
+        let mut v: Vec<_> = self
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                ScanEvent::Port { result, .. } => {
+                    Some((result.port, result.protocol, result.state))
+                }
+                _ => None,
+            })
+            .collect();
+        v.sort_by_key(|p| p.0);
+        v
+    }
+
+    fn fell_back(&self) -> bool {
+        self.warnings().iter().any(|w| w.contains("falling back"))
+    }
+}
+
+/// A UDP service that echoes every datagram (an empty one gets a byte back).
+async fn udp_echo() -> u16 {
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = s.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = s.recv_from(&mut buf).await {
+            let _ = s.send_to(&buf[..n.max(1)], from).await;
+        }
+    });
+    port
+}
+
+/// A UDP port that is bound but never answers. Keep the socket alive.
+async fn udp_silent() -> (tokio::net::UdpSocket, u16) {
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = s.local_addr().unwrap().port();
+    (s, port)
+}
+
+/// A UDP port nothing is bound to.
+async fn udp_closed() -> u16 {
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    s.local_addr().unwrap().port()
+}
+
+fn udp_timing() -> Timing {
+    Timing {
+        connect_timeout: Duration::from_millis(1500),
+        retries: 0,
+        ..Timing::template(4)
+    }
+}
+
+async fn check_syn_scan() -> Outcome {
+    let open = listener().await;
+    let shut = closed_port().await;
+    let ports = format!("{open},{shut}");
+    let out = run_scan(typed("127.0.0.1", &ports, patient(), ScanType::Syn)).await;
+    assert!(out.finished());
+    assert_eq!(out.open_ports(), [(LO, open)]);
+    assert_eq!(out.host_done(), [(LO, 1, 0)], "the closed port is counted");
+    assert!(
+        !out.warnings().iter().any(|w| w.contains("not implemented")),
+        "{:?}",
+        out.warnings()
+    );
+    out
+}
+
+async fn check_udp_scan() -> Outcome {
+    let echo = udp_echo().await;
+    let (_keep, silent) = udp_silent().await;
+    let shut = udp_closed().await;
+    let ports = format!("{echo},{silent},{shut}");
+    let out = run_scan(typed("127.0.0.1", &ports, udp_timing(), ScanType::Udp)).await;
+    assert!(out.finished());
+    let mut expected = vec![
+        (echo, rmap_core::Protocol::Udp, PortState::Open),
+        (silent, rmap_core::Protocol::Udp, PortState::OpenFiltered),
+    ];
+    expected.sort_by_key(|p| p.0);
+    assert_eq!(out.port_states(), expected);
+    assert_eq!(out.host_done(), [(LO, 1, 0)], "the unbound port is closed");
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn syn_scan_finds_open_and_closed_ports() {
+    let out = check_syn_scan().await;
+    if out.fell_back() {
+        assert!(
+            out.warnings()
+                .iter()
+                .any(|w| w.starts_with("SYN scan") && w.contains("TCP connect"))
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(out.fell_back(), "raw sockets are Linux-only");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_scan_sorts_open_silent_and_closed() {
+    let out = check_udp_scan().await;
+    if out.fell_back() {
+        assert!(
+            out.warnings()
+                .iter()
+                .any(|w| w.contains("unprivileged UDP"))
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert!(out.fell_back(), "raw sockets are Linux-only");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_scan_never_warns_about_privileges() {
+    let port = listener().await;
+    let out = run_scan(config("127.0.0.1", &port.to_string(), patient(), true)).await;
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_discovery_and_unroutable_hosts_finish() {
+    let timing = Timing {
+        connect_timeout: Duration::from_millis(300),
+        retries: 0,
+        ..Timing::template(4)
+    };
+    let mut c = typed("192.0.2.1", "53,161", timing, ScanType::Udp);
+    c.discovery = true;
+    let out = run_scan(c).await;
+    assert!(out.finished());
+    assert_eq!(out.hosts()[0].2, HostState::Down);
+}
+
+// --------------------------------------------- raw sockets (privileged) ---
+//
+// These need CAP_NET_RAW, so they are ignored by default. On Linux, run
+// them as root, or unprivileged inside a fresh user and network namespace,
+// which grants CAP_NET_RAW over that namespace's own loopback:
+//
+//   cargo test -p rmap-engine --no-run
+//   unshare -rn sh -c 'ip link set lo up && <test binary> --ignored raw_'
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW (see comment)"]
+async fn raw_syn_scan_uses_raw_sockets() {
+    let out = check_syn_scan().await;
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW (see comment)"]
+async fn raw_udp_scan_uses_raw_sockets() {
+    let out = check_udp_scan().await;
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW (see comment)"]
+async fn raw_syn_scan_of_many_ports() {
+    let open = listener().await;
+    let out = run_scan(typed("127.0.0.1", "1-2000", patient(), ScanType::Syn)).await;
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+    let found: Vec<u16> = out.open_ports().iter().map(|p| p.1).collect();
+    if open <= 2000 {
+        assert!(found.contains(&open));
+    }
+    let (_, closed, filtered) = out.host_done()[0];
+    assert_eq!(found.len() as u32 + closed, 2000);
+    assert_eq!(filtered, 0, "loopback answers every SYN");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW (see comment)"]
+async fn raw_icmp_echo_answers_on_loopback() {
+    let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient())
+        .expect("raw sockets should open with CAP_NET_RAW");
+    let rtt = raw
+        .echo_ping(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, &patient())
+        .await;
+    assert!(rtt.is_some(), "loopback answers ICMP echo");
+}
+
+/// SYN, UDP and ARP over a real link instead of loopback. Needs a veth
+/// pair into a second namespace; the test does nothing unless
+/// `RMAP_VETH_PEER` names the far end. For example, inside `unshare -rn`:
+///
+/// ```sh
+/// ip link add v0 type veth peer name v1
+/// unshare -n sleep 600 & sleep 0.5; peer=$!
+/// ip link set v1 netns $peer
+/// nsenter -t $peer -n sh -c 'ip addr add 10.9.0.2/24 dev v1; ip link set v1 up; ip link set lo up'
+/// ip addr add 10.9.0.1/24 dev v0; ip link set v0 up; ip link set lo up
+/// nsenter -t $peer -n python3 -m http.server 8000 &
+/// RMAP_VETH_PEER=10.9.0.2 RMAP_VETH_OPEN_PORT=8000 <test binary> --ignored raw_veth
+/// ```
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs CAP_NET_RAW and a veth peer (see comment)"]
+async fn raw_veth_peer() {
+    let Some(peer) = std::env::var("RMAP_VETH_PEER").ok() else {
+        return;
+    };
+    let peer: Ipv4Addr = peer.parse().unwrap();
+    let open: u16 = std::env::var("RMAP_VETH_OPEN_PORT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let src = crate::raw::route_source(peer).unwrap();
+    let absent = Ipv4Addr::from(u32::from(peer) + 1);
+
+    let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient()).unwrap();
+    let quick = Timing {
+        connect_timeout: Duration::from_millis(500),
+        retries: 1,
+        ..patient()
+    };
+    let up = raw.arp_ping(src, peer, &quick).await;
+    assert!(
+        matches!(up, Some(Some(_))),
+        "ARP answer from {peer}: {up:?}"
+    );
+    let down = raw.arp_ping(src, absent, &quick).await;
+    assert_eq!(down, Some(None), "no ARP answer from {absent}");
+
+    let mut syn = typed(
+        &peer.to_string(),
+        &format!("{open},1"),
+        patient(),
+        ScanType::Syn,
+    );
+    syn.discovery = true;
+    let out = run_scan(syn).await;
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+    assert_eq!(out.hosts()[0].2, HostState::Up);
+    assert_eq!(out.open_ports(), [(IpAddr::V4(peer), open)]);
+    assert_eq!(out.host_done()[0].1, 1, "port 1 answers RST");
+
+    let udp = typed(&peer.to_string(), "9", udp_timing(), ScanType::Udp);
+    let out = run_scan(udp).await;
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+    assert_eq!(out.host_done()[0].1, 1, "port 9 answers port-unreachable");
+
+    let mut dead = typed(&absent.to_string(), "80", quick, ScanType::Syn);
+    dead.discovery = true;
+    let out = run_scan(dead).await;
+    assert_eq!(out.hosts()[0].2, HostState::Down);
+}
