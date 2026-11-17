@@ -10,6 +10,80 @@ rmap takes inspiration from Nmap's feature set but shares none of its code or da
 
 Milestone 1 is done: unprivileged TCP connect scanning with a live TUI. See the [roadmap](#roadmap).
 
+## Building on Linux
+
+rmap builds with the standard Rust toolchain. It needs no system libraries beyond a C linker: no OpenSSL, libpcap or pkg-config.
+
+### 1. Install a C linker and git
+
+Rust uses the system linker to produce the final binary.
+
+```bash
+# Debian, Ubuntu, Mint, Pop!_OS
+sudo apt update && sudo apt install -y build-essential git curl
+
+# Fedora, RHEL, Rocky, Alma
+sudo dnf install -y gcc git curl
+
+# Arch, Manjaro
+sudo pacman -S --needed base-devel git curl
+
+# openSUSE
+sudo zypper install -y gcc git curl
+```
+
+### 2. Install Rust 1.88 or newer
+
+Use [rustup](https://rustup.rs). Distribution-packaged `rustc` is often too old for this project.
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version   # should report 1.88.0 or later
+```
+
+If Rust is already installed through rustup, run `rustup update stable`.
+
+### 3. Clone and build
+
+```bash
+git clone https://github.com/Hroberts1/rmap.git
+cd rmap
+cargo build --release
+```
+
+The binary is written to `target/release/rmap`. The first build downloads dependencies from crates.io and takes a minute or two; later builds are incremental.
+
+### 4. Run it
+
+```bash
+./target/release/rmap
+```
+
+Or install it into `~/.cargo/bin`, which rustup puts on your `PATH`:
+
+```bash
+cargo install --path .
+rmap
+```
+
+### 5. Run the tests (optional)
+
+```bash
+cargo test --workspace
+```
+
+The tests need no network access and no root.
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `linker 'cc' not found` | Install the C toolchain from step 1. |
+| `requires rustc 1.88` or edition 2024 errors | Your Rust is too old. Run `rustup update stable`, and check that `which cargo` points into `~/.cargo/bin`, not `/usr/bin`. |
+| Garbled boxes or missing colors | Use a terminal with UTF-8 and 256-color support. Check that `echo $LANG` ends in `UTF-8`. |
+| Screen left in a bad state after a crash | Run `reset`. The crash report path is printed after the terminal is restored; see [Logs and crash reports](#logs-and-crash-reports). |
+
 ## Running
 
 ```bash
