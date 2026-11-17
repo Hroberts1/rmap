@@ -29,6 +29,8 @@ fn config(targets: &str, ports: &str, timing: Timing, discovery: bool) -> ScanCo
         ports: PortList::parse(ports).unwrap(),
         timing,
         discovery,
+        scan_type: ScanType::Connect,
+        service_detection: false,
     }
 }
 

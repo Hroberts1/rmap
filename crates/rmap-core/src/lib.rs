@@ -3,11 +3,15 @@
 
 pub mod ports;
 pub mod result;
+pub mod scan;
+pub mod service;
 pub mod target;
 pub mod timing;
 
 pub use ports::{PortList, service_name};
-pub use result::{HostState, PortResult, PortState, ScanEvent};
+pub use result::{HostState, PortResult, PortState, Protocol, ScanEvent};
+pub use scan::ScanType;
+pub use service::{DetectMethod, Service};
 pub use target::{Target, parse_targets};
 pub use timing::Timing;
 

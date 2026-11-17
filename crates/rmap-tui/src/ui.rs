@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
-use rmap_core::{HostState, Timing, service_name};
+use rmap_core::{HostState, PortState, Timing, service_name};
 
 use crate::app::{App, Field, HostRow, ScanView, Screen};
 
@@ -56,7 +56,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     let area = centered(
         frame.area(),
         76.min(frame.area().width),
-        19.min(frame.area().height),
+        21.min(frame.area().height),
     );
     let block = Block::bordered()
         .title(Line::from(" rmap · new scan ").bold().fg(ACCENT))
@@ -69,9 +69,11 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         targets_hint,
         ports,
         ports_hint,
+        scan_type,
         timing,
         timing_hint,
         discovery,
+        services,
         _,
         error,
         log_line,
@@ -80,8 +82,10 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(2),
+        Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
@@ -132,6 +136,16 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     text_field(frame, ports, Field::Ports, "Ports", &form.ports, "common");
     frame.render_widget(hint("22,80,443 · 1-1024 · common · all"), ports_hint);
 
+    let kind = form.scan_type;
+    let mut kind_spans = vec![
+        label(Field::ScanType, "Scan type"),
+        Span::raw(format!("◂ {} ▸", kind.label())).bold(),
+    ];
+    if kind.needs_raw_sockets() {
+        kind_spans.push(Span::raw("  needs root / CAP_NET_RAW").fg(Color::Yellow));
+    }
+    frame.render_widget(Paragraph::new(Line::from(kind_spans)), scan_type);
+
     let t = Timing::template(form.timing);
     let pips: String = (0..=5)
         .map(|i| if i == form.timing { '●' } else { '○' })
@@ -167,6 +181,19 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         discovery,
     );
 
+    let services_check = if form.service_detection {
+        "[x] identify software and versions on open ports"
+    } else {
+        "[ ] report open ports only"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            label(Field::Services, "Services"),
+            Span::raw(services_check),
+        ])),
+        services,
+    );
+
     if let Some(err) = &form.error {
         frame.render_widget(
             Paragraph::new(Line::from(format!("✗ {err}")).fg(Color::Red)).wrap(Wrap { trim: true }),
@@ -198,7 +225,7 @@ fn draw_results(frame: &mut Frame, view: &ScanView) {
 
     draw_header(frame, header, view);
     let [hosts, detail] =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body);
+        Layout::horizontal([Constraint::Percentage(36), Constraint::Percentage(64)]).areas(body);
     draw_host_table(frame, hosts, view);
     draw_host_detail(frame, detail, view);
     if log_height > 0 {
@@ -364,23 +391,40 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &ScanView) {
     frame.render_widget(Paragraph::new(host_info(host)), info);
 
     let rows = host.open.iter().map(|p| {
+        let state_color = match p.state {
+            PortState::Open => Color::Green,
+            _ => Color::Yellow,
+        };
+        let (name, version) = match &p.service {
+            Some(s) => (s.name.clone(), s.version_label().unwrap_or_default()),
+            None => (
+                service_name(p.port).unwrap_or("unknown").to_string(),
+                String::new(),
+            ),
+        };
         Row::new(vec![
-            Cell::from(format!("{}/tcp", p.port)),
-            Cell::from(p.state.as_str()).fg(Color::Green),
-            Cell::from(service_name(p.port).unwrap_or("unknown")),
+            Cell::from(format!("{}/{}", p.port, p.protocol.as_str())),
+            Cell::from(p.state.as_str()).fg(state_color),
+            Cell::from(name),
+            Cell::from(version),
             Cell::from(p.rtt.map(fmt_rtt).unwrap_or_default()).dim(),
         ])
     });
     let table = Table::new(
         rows,
         [
-            Constraint::Length(11),
-            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(13),
+            Constraint::Length(12),
             Constraint::Fill(1),
             Constraint::Length(7),
         ],
     )
-    .header(Row::new(["PORT", "STATE", "SERVICE", "RTT"]).bold().dim());
+    .header(
+        Row::new(["PORT", "STATE", "SERVICE", "VERSION", "RTT"])
+            .bold()
+            .dim(),
+    );
     frame.render_widget(table, ports);
 
     let not_shown = if host.done {

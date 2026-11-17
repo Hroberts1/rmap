@@ -5,7 +5,7 @@ use std::io;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use rmap_core::{PortResult, PortState, Timing};
+use rmap_core::{PortResult, PortState, Protocol, Timing};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
@@ -81,13 +81,9 @@ pub async fn probe(ip: IpAddr, port: u16, timing: &Timing, stats: &Stats) -> Por
             }
             Outcome::TimedOut => continue,
         };
-        return PortResult { port, state, rtt };
+        return PortResult::new(port, Protocol::Tcp, state, rtt);
     }
-    PortResult {
-        port,
-        state: PortState::Filtered,
-        rtt: None,
-    }
+    PortResult::new(port, Protocol::Tcp, PortState::Filtered, None)
 }
 
 /// Check whether a host is up. Returns the round-trip time of the first

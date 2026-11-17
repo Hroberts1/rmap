@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rmap_core::{HostState, PortList, PortResult, ScanEvent, Timing, parse_targets};
+use rmap_core::{HostState, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets};
 use rmap_engine::{Scan, ScanConfig};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -18,16 +18,20 @@ const MAX_LOG_LINES: usize = 200;
 pub enum Field {
     Targets,
     Ports,
+    ScanType,
     Timing,
     Discovery,
+    Services,
 }
 
 impl Field {
-    const ALL: [Field; 4] = [
+    const ALL: [Field; 6] = [
         Field::Targets,
         Field::Ports,
+        Field::ScanType,
         Field::Timing,
         Field::Discovery,
+        Field::Services,
     ];
 
     fn step(self, forward: bool) -> Field {
@@ -44,8 +48,10 @@ impl Field {
 pub struct Form {
     pub targets: String,
     pub ports: String,
+    pub scan_type: ScanType,
     pub timing: u8,
     pub discovery: bool,
+    pub service_detection: bool,
     pub focus: Field,
     pub error: Option<String>,
 }
@@ -55,8 +61,10 @@ impl Default for Form {
         Form {
             targets: String::new(),
             ports: "common".into(),
+            scan_type: ScanType::Connect,
             timing: 3,
             discovery: true,
+            service_detection: false,
             focus: Field::Targets,
             error: None,
         }
@@ -159,11 +167,31 @@ impl ScanView {
             }
             ScanEvent::Port { ip, result } => match self.hosts.get_mut(&ip) {
                 Some(host) => {
-                    let at = host.open.partition_point(|p| p.port < result.port);
+                    let key = (result.port, result.protocol);
+                    let at = host.open.partition_point(|p| (p.port, p.protocol) < key);
                     host.open.insert(at, result);
                 }
                 None => rmap_log::warn!("open port {ip}:{} arrived before its host", result.port),
             },
+            ScanEvent::Service {
+                ip,
+                protocol,
+                port,
+                service,
+            } => {
+                let found = self.hosts.get_mut(&ip).and_then(|h| {
+                    h.open
+                        .iter_mut()
+                        .find(|p| p.port == port && p.protocol == protocol)
+                });
+                match found {
+                    Some(p) => p.service = Some(service),
+                    None => rmap_log::warn!(
+                        "service for {ip} {port}/{} arrived before its port",
+                        protocol.as_str()
+                    ),
+                }
+            }
             ScanEvent::HostDone {
                 ip,
                 closed,
@@ -312,9 +340,28 @@ impl App {
                     KeyCode::Char(c @ '0'..='5') => form.timing = c as u8 - b'0',
                     _ => {}
                 },
+                Field::ScanType => {
+                    let i = ScanType::ALL
+                        .iter()
+                        .position(|t| *t == form.scan_type)
+                        .unwrap_or(0);
+                    let n = ScanType::ALL.len();
+                    match code {
+                        KeyCode::Right | KeyCode::Char(' ') => {
+                            form.scan_type = ScanType::ALL[(i + 1) % n]
+                        }
+                        KeyCode::Left => form.scan_type = ScanType::ALL[(i + n - 1) % n],
+                        _ => {}
+                    }
+                }
                 Field::Discovery => {
                     if matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
                         form.discovery = !form.discovery;
+                    }
+                }
+                Field::Services => {
+                    if matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        form.service_detection = !form.service_detection;
                     }
                 }
             },
@@ -386,6 +433,8 @@ impl App {
             ports,
             timing: Timing::template(form.timing),
             discovery: form.discovery,
+            scan_type: form.scan_type,
+            service_detection: form.service_detection,
         };
         if public.is_empty() {
             self.launch(config);
@@ -397,8 +446,9 @@ impl App {
 
     fn launch(&mut self, config: ScanConfig) {
         let summary = format!(
-            "{} · {} port{} · T{} {}{}",
+            "{} · {} · {} port{} · T{} {}{}",
             self.form.targets.trim(),
+            config.scan_type.label(),
             config.ports.len(),
             if config.ports.len() == 1 { "" } else { "s" },
             config.timing.level,
@@ -433,6 +483,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyEvent;
+    use rmap_core::Protocol;
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -551,15 +602,17 @@ mod tests {
         assert_eq!(app.form.focus, Field::Targets);
         for expected in [
             Field::Ports,
+            Field::ScanType,
             Field::Timing,
             Field::Discovery,
+            Field::Services,
             Field::Targets,
         ] {
             press(&mut app, KeyCode::Tab);
             assert_eq!(app.form.focus, expected);
         }
         press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.form.focus, Field::Discovery);
+        assert_eq!(app.form.focus, Field::Services);
     }
 
     #[test]
@@ -700,15 +753,64 @@ mod tests {
         for port in [443, 22, 8080, 80] {
             view.apply(ScanEvent::Port {
                 ip,
-                result: PortResult {
-                    port,
-                    state: rmap_core::PortState::Open,
-                    rtt: None,
-                },
+                result: PortResult::new(port, Protocol::Tcp, rmap_core::PortState::Open, None),
             });
         }
         let ports: Vec<u16> = view.hosts[&ip].open.iter().map(|p| p.port).collect();
         assert_eq!(ports, [22, 80, 443, 8080]);
+    }
+
+    #[test]
+    fn service_events_attach_to_their_port() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let open = rmap_core::PortState::Open;
+        view.apply(ScanEvent::Port {
+            ip,
+            result: PortResult::new(53, Protocol::Tcp, open, None),
+        });
+        view.apply(ScanEvent::Port {
+            ip,
+            result: PortResult::new(53, Protocol::Udp, open, None),
+        });
+        let service = rmap_core::Service {
+            name: "domain".into(),
+            product: Some("ISC BIND".into()),
+            version: Some("9.18".into()),
+            ..Default::default()
+        };
+        view.apply(ScanEvent::Service {
+            ip,
+            protocol: Protocol::Udp,
+            port: 53,
+            service,
+        });
+        let host = &view.hosts[&ip];
+        assert_eq!(host.open.len(), 2, "same port number, different protocols");
+        assert!(host.open[0].service.is_none(), "tcp/53 untouched");
+        assert_eq!(host.open[1].service.as_ref().unwrap().name, "domain");
+        app.scan.as_mut().unwrap().selected = Some(ip);
+        let screen = render(&mut app, 110, 30);
+        assert!(
+            screen.contains("53/udp") && screen.contains("ISC BIND 9.18"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn scan_type_cycles() {
+        let (_rt, mut app) = app();
+        app.form.focus = Field::ScanType;
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.form.scan_type, ScanType::Syn);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.form.scan_type, ScanType::Udp, "wraps around");
+        app.form.focus = Field::Services;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.form.service_detection);
     }
 
     #[test]
@@ -719,11 +821,7 @@ mod tests {
         let ghost: IpAddr = "10.9.9.9".parse().unwrap();
         view.apply(ScanEvent::Port {
             ip: ghost,
-            result: PortResult {
-                port: 1,
-                state: rmap_core::PortState::Open,
-                rtt: None,
-            },
+            result: PortResult::new(1, Protocol::Tcp, rmap_core::PortState::Open, None),
         });
         view.apply(ScanEvent::HostDone {
             ip: ghost,

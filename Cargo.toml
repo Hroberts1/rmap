@@ -27,6 +27,7 @@ rmap-engine = { path = "crates/rmap-engine" }
 rmap-log = { path = "crates/rmap-log" }
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync"] }
 ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
 
 [profile.release]
 lto = "thin"

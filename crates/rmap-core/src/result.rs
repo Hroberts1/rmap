@@ -3,14 +3,45 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use crate::service::Service;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "lowercase")
+)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum PortState {
-    /// Something accepted the connection.
+    /// Something accepted the connection or answered the probe.
     Open,
-    /// The host answered with a reset: reachable, nothing listening.
+    /// The host answered with a reset or ICMP port-unreachable: reachable,
+    /// nothing listening.
     Closed,
     /// No answer, or an ICMP error: a firewall is likely in the way.
     Filtered,
+    /// No answer to a probe that an open port may legitimately ignore
+    /// (typical for UDP). Can't tell open from filtered.
+    OpenFiltered,
 }
 
 impl PortState {
@@ -19,11 +50,17 @@ impl PortState {
             PortState::Open => "open",
             PortState::Closed => "closed",
             PortState::Filtered => "filtered",
+            PortState::OpenFiltered => "open|filtered",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
 pub enum HostState {
     /// Answered a discovery probe.
     Up,
@@ -33,12 +70,28 @@ pub enum HostState {
     Assumed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PortResult {
     pub port: u16,
+    pub protocol: Protocol,
     pub state: PortState,
-    /// Time to connect, when the port answered.
+    /// Time to answer, when the port answered.
     pub rtt: Option<Duration>,
+    /// Filled in by service detection, possibly after the port is reported.
+    pub service: Option<Service>,
+}
+
+impl PortResult {
+    pub fn new(port: u16, protocol: Protocol, state: PortState, rtt: Option<Duration>) -> Self {
+        PortResult {
+            port,
+            protocol,
+            state,
+            rtt,
+            service: None,
+        }
+    }
 }
 
 /// Progress and results emitted by the engine while a scan runs.
@@ -53,9 +106,17 @@ pub enum ScanEvent {
         state: HostState,
         rtt: Option<Duration>,
     },
-    /// An open port. Closed and filtered ports are counted in `HostDone`
-    /// instead, so large scans don't flood the UI.
+    /// An open (or open|filtered) port. Closed and filtered ports are
+    /// counted in `HostDone` instead, so large scans don't flood the UI.
     Port { ip: IpAddr, result: PortResult },
+    /// Service detection identified what is listening on a port that was
+    /// already reported with `Port`.
+    Service {
+        ip: IpAddr,
+        protocol: Protocol,
+        port: u16,
+        service: Service,
+    },
     /// Every port on this host has been probed.
     HostDone {
         ip: IpAddr,

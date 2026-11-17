@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rmap_core::{HostState, PortList, PortState, ScanEvent, Target, Timing};
+use rmap_core::{HostState, PortList, PortState, ScanEvent, ScanType, Target, Timing};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -40,6 +40,10 @@ pub struct ScanConfig {
     pub timing: Timing,
     /// Probe each host before scanning it, and skip hosts that don't answer.
     pub discovery: bool,
+    /// Technique used to probe ports.
+    pub scan_type: ScanType,
+    /// Identify the software behind open ports (Milestone 3).
+    pub service_detection: bool,
 }
 
 impl ScanConfig {
@@ -53,7 +57,7 @@ impl ScanConfig {
             .collect();
         let more = self.targets.len().saturating_sub(shown.len());
         format!(
-            "targets=[{}{}] ports={} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={}",
+            "targets=[{}{}] ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={}",
             shown.join(","),
             if more > 0 {
                 format!(",+{more} more")
@@ -61,6 +65,7 @@ impl ScanConfig {
                 String::new()
             },
             self.ports.len(),
+            self.scan_type,
             self.timing.level,
             self.timing.name,
             self.timing.concurrency,
@@ -68,6 +73,7 @@ impl ScanConfig {
             self.timing.connect_timeout,
             self.timing.retries,
             self.discovery,
+            self.service_detection,
         )
     }
 }
@@ -231,6 +237,20 @@ async fn run(
     stats: Arc<Stats>,
 ) {
     let started = Instant::now();
+    // Placeholders until Milestones 2 and 3 land; replace these when they do.
+    if config.scan_type != ScanType::Connect {
+        let msg = format!(
+            "{} scans are not implemented yet; using TCP connect",
+            config.scan_type.label()
+        );
+        rmap_log::warn!("{msg}");
+        let _ = tx.send(ScanEvent::Warning(msg));
+    }
+    if config.service_detection {
+        let msg = "service detection is not implemented yet".to_string();
+        rmap_log::warn!("{msg}");
+        let _ = tx.send(ScanEvent::Warning(msg));
+    }
     let hosts: u64 = config.targets.iter().map(Target::count).sum();
     let per_host = config.ports.len();
     progress
@@ -397,7 +417,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
             let result = tcp::probe(ip, port, &sh.timing, &sh.stats).await;
             sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
-                PortState::Open => {
+                PortState::Open | PortState::OpenFiltered => {
                     sh.stats.open.fetch_add(1, Ordering::Relaxed);
                     rmap_log::debug!("open {ip}:{port} rtt={:?}", result.rtt);
                     let _ = sh.tx.send(ScanEvent::Port { ip, result });
