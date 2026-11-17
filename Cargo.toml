@@ -1,0 +1,31 @@
+[package]
+name = "rmap"
+description = "A from-scratch network scanner in Rust with an interactive TUI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmap-tui = { path = "crates/rmap-tui" }
+tokio = { workspace = true }
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+
+[workspace.dependencies]
+rmap-core = { path = "crates/rmap-core" }
+rmap-engine = { path = "crates/rmap-engine" }
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync"] }
+ratatui = "0.30"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
