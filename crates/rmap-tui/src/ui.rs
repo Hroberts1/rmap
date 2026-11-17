@@ -142,7 +142,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         Span::raw(format!("◂ {} ▸", kind.label())).bold(),
     ];
     if kind.needs_raw_sockets() {
-        kind_spans.push(Span::raw("  needs root / CAP_NET_RAW").fg(Color::Yellow));
+        kind_spans.push(Span::raw("  needs root / CAP_NET_RAW, else falls back").fg(Color::Yellow));
     }
     frame.render_widget(Paragraph::new(Line::from(kind_spans)), scan_type);
 
@@ -465,7 +465,13 @@ fn draw_log(frame: &mut Frame, area: Rect, view: &ScanView) {
         .rev()
         .take(height)
         .rev()
-        .map(|l| Line::from(l.clone()).dim())
+        .map(|l| {
+            if l.starts_with(crate::app::WARNING_PREFIX) {
+                Line::from(l.clone()).fg(Color::Yellow)
+            } else {
+                Line::from(l.clone()).dim()
+            }
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" log ")),
