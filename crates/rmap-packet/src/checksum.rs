@@ -5,11 +5,11 @@ use std::net::Ipv4Addr;
 /// Add `data` to a running one's-complement sum as big-endian 16-bit words.
 /// An odd trailing byte is padded with a zero, as RFC 1071 specifies.
 pub fn add(mut sum: u64, data: &[u8]) -> u64 {
-    let mut words = data.chunks_exact(2);
-    for w in &mut words {
-        sum += u64::from(u16::from_be_bytes([w[0], w[1]]));
+    let (words, rest) = data.as_chunks::<2>();
+    for w in words {
+        sum += u64::from(u16::from_be_bytes(*w));
     }
-    if let [last] = words.remainder() {
+    if let [last] = rest {
         sum += u64::from(u16::from_be_bytes([*last, 0]));
     }
     sum

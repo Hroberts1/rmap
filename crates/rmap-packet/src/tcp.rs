@@ -125,11 +125,13 @@ impl TcpOption {
                     TcpOption::SackPermitted
                 }
                 5 => {
-                    if data.len() % 8 != 0 {
+                    if !data.len().is_multiple_of(8) {
                         return Err(Error::Invalid("SACK option length not a multiple of 8"));
                     }
                     TcpOption::Sack(
-                        data.chunks_exact(8)
+                        data.as_chunks::<8>()
+                            .0
+                            .iter()
                             .map(|c| (be32(c, 0), be32(c, 4)))
                             .collect(),
                     )
