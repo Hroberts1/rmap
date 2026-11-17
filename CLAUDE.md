@@ -16,6 +16,7 @@ A from-scratch network scanner in Rust with an interactive TUI. Read README.md f
 | `rmap-core` | Shared types: `Target`, `PortList`, `Timing`, `ScanType`, `Protocol`, `PortState`, `PortResult`, `Service`, `ScanEvent`. Optional `serde` feature. |
 | `rmap-engine` | Async scan engine. `Scan::start(handle, ScanConfig)` streams `ScanEvent`s. |
 | `rmap-log` | Local logs and crash reports. Use `rmap_log::{error,warn,info,debug,trace}!`. |
+| `rmap-report` | `ScanReport` model, `ReportBuilder` (events → report), JSON and Nmap XML export, saved scans (`ScanStore`), and `diff`. |
 | `rmap-tui` | Setup form (`app.rs` state, `ui.rs` drawing) and live results. |
 
 New milestone work should live in **its own crate** where possible (for example `rmap-packet`, `rmap-detect`, `rmap-vuln`, `rmap-report`) and plug into the engine/TUI through small, well-named hooks. Parallel milestone branches then touch shared files as little as possible.

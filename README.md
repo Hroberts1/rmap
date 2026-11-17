@@ -2,7 +2,7 @@
 
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
 
-rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime and [ratatui](https://ratatui.rs) for the terminal.
+rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, and [serde](https://serde.rs)/serde_json for the JSON report format.
 
 > **Only scan networks you own or have written permission to test.** rmap asks for confirmation before it touches public addresses.
 
@@ -25,7 +25,34 @@ Fill in the setup form and press **Enter**:
 | Timing | T0 paranoid … T3 normal … T5 insane |
 | Discovery | Probe hosts first and skip the ones that don't answer |
 
-Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` stop · `n` new scan · `q` quit.
+Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` stop · `e` export · `c` compare with a saved scan · `n` new scan · `q` quit.
+
+## Saved scans, export and comparing
+
+Every scan is saved automatically when it finishes, is stopped, or fails (and when you quit mid-scan). The log panel shows the file it went to. Stopped and failed scans are marked as partial.
+
+| Platform | Saved scans | Exports (default) |
+|---|---|---|
+| Linux | `$XDG_DATA_HOME/rmap/scans`, or `~/.local/share/rmap/scans` | `.../rmap/exports` |
+| macOS | `~/Library/Application Support/rmap/scans` | `.../rmap/exports` |
+| Windows | `%LOCALAPPDATA%\rmap\scans` | `%LOCALAPPDATA%\rmap\exports` |
+
+Set `RMAP_SCAN_DIR` to keep scans somewhere else; exports then default to `$RMAP_SCAN_DIR/exports`. Files are named `scan-YYYYMMDD-HHMMSS-mmm.json` (UTC start time), so they sort oldest to newest.
+
+**Export (`e`).** Pick a format with `Tab`, edit the path if you like (`Ctrl-U` clears it), and press `Enter`:
+
+- **JSON:** rmap's own report format, the same one used for saved scans. It carries a `format_version` so later versions of rmap can keep reading old files. It records the rmap version, start and end times, how the scan ended (`completed`, `stopped`, `failed`), the configuration, and every host with its open and open|filtered ports, detected services and CPEs, and closed/filtered counts.
+- **Nmap XML:** the commonly used subset of Nmap's documented XML output (`nmaprun`, `scaninfo`, `host`, `status`, `address`, `hostnames`, `ports`, `extraports`, `port`, `state`, `service` with product/version/extrainfo/CPE, `times`, `runstats`), so tools that import Nmap results can read rmap scans. It's written by rmap's own small XML writer; times are in UTC, and CPEs are converted to the `cpe:/` form Nmap uses.
+
+**Compare (`c`).** Once a scan has finished or been stopped, press `c` to pick a saved scan to compare against. The list is newest first, with the most recent earlier scan of the same targets selected. The diff screen lists, color-coded:
+
+- new hosts and hosts that are gone
+- hosts that went up or down
+- newly open ports, and ports that closed or vanished
+- ports whose state changed (for example `open|filtered` → `open`)
+- services whose name, product or version changed, such as `OpenSSH 8.9 → OpenSSH 9.6`
+
+Hosts match by address and ports by port number and protocol, so ordering doesn't matter. A port that had no service identified in one of the scans isn't reported as a service change. Scroll with `↑↓`/`PgUp`/`PgDn` and press `Esc` to go back.
 
 ## How it works
 
@@ -34,6 +61,7 @@ crates/
 ├── rmap-core     targets, port lists, timing templates, result types
 ├── rmap-engine   async scan engine (tokio)
 ├── rmap-log      local log files and crash reports (no dependencies)
+├── rmap-report   scan reports: JSON and Nmap XML export, saved scans, diffs
 └── rmap-tui      ratatui front end
 src/main.rs       starts logging, the runtime and the UI
 ```
@@ -92,7 +120,7 @@ The suite runs real scans against loopback listeners and the reserved, never-rou
 - [ ] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, adaptive timing. Needs root or `CAP_NET_RAW`.
 - [ ] **M3: service detection.** rmap's own probe and match database, version strings, CPE identifiers.
 - [ ] **M4: vulnerability matching.** Offline CPE → CVE lookup against locally cached public feeds, flagged as *potentially* vulnerable to allow for vendor backports.
-- [ ] **M5: export and diffing.** JSON and XML export from the TUI, and comparing two saved scans.
+- [x] **M5: export and diffing.** JSON and XML export from the TUI, saved scans, and comparing two scans.
 
 ## Platform notes
 
