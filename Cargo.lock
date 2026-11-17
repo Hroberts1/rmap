@@ -1130,6 +1130,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rmap"
 version = "0.1.0"
 dependencies = [
+ "rmap-log",
  "rmap-tui",
  "tokio",
 ]
@@ -1143,8 +1144,13 @@ name = "rmap-engine"
 version = "0.1.0"
 dependencies = [
  "rmap-core",
+ "rmap-log",
  "tokio",
 ]
+
+[[package]]
+name = "rmap-log"
+version = "0.1.0"
 
 [[package]]
 name = "rmap-tui"
@@ -1153,6 +1159,7 @@ dependencies = [
  "ratatui",
  "rmap-core",
  "rmap-engine",
+ "rmap-log",
  "tokio",
 ]
 

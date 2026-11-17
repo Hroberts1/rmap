@@ -7,6 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rmap-log = { workspace = true }
 rmap-tui = { path = "crates/rmap-tui" }
 tokio = { workspace = true }
 
@@ -23,6 +24,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 rmap-core = { path = "crates/rmap-core" }
 rmap-engine = { path = "crates/rmap-engine" }
+rmap-log = { path = "crates/rmap-log" }
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync"] }
 ratatui = "0.30"
 

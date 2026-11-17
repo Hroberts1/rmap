@@ -23,6 +23,15 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Parse an unsigned number written only with ASCII digits. Unlike
+/// `str::parse`, this rejects a leading `+`.
+pub(crate) fn parse_digits<T: std::str::FromStr>(s: &str) -> Option<T> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
 pub(crate) fn err<T>(msg: impl Into<String>) -> Result<T, ParseError> {
     Err(ParseError(msg.into()))
 }

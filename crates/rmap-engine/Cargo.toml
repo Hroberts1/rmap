@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 rmap-core = { workspace = true }
+rmap-log = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

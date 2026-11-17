@@ -61,9 +61,9 @@ impl PortList {
 }
 
 fn parse_port(s: &str, item: &str) -> Result<u16, ParseError> {
-    match s.trim().parse::<u16>() {
-        Ok(0) | Err(_) => err(format!("{item}: ports must be 1-65535")),
-        Ok(p) => Ok(p),
+    match crate::parse_digits::<u16>(s.trim()) {
+        Some(0) | None => err(format!("{item}: ports must be 1-65535")),
+        Some(p) => Ok(p),
     }
 }
 

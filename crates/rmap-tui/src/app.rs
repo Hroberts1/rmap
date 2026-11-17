@@ -8,6 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rmap_core::{HostState, PortList, PortResult, ScanEvent, Timing, parse_targets};
 use rmap_engine::{Scan, ScanConfig};
 use tokio::runtime::Handle;
+use tokio::sync::mpsc::error::TryRecvError;
 
 /// Most engine events handled per frame, so a burst can't stall input.
 const EVENTS_PER_FRAME: usize = 5_000;
@@ -82,12 +83,14 @@ pub struct ScanView {
     pub started: Instant,
     pub finished: Option<Duration>,
     pub stopped: bool,
+    /// The engine went away without finishing, most likely a panic.
+    pub failed: bool,
     pub log: Vec<String>,
 }
 
 impl ScanView {
     pub fn is_running(&self) -> bool {
-        self.finished.is_none() && !self.stopped
+        self.finished.is_none() && !self.stopped && !self.failed
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -154,24 +157,26 @@ impl ScanView {
                     self.selected = Some(ip);
                 }
             }
-            ScanEvent::Port { ip, result } => {
-                if let Some(host) = self.hosts.get_mut(&ip) {
+            ScanEvent::Port { ip, result } => match self.hosts.get_mut(&ip) {
+                Some(host) => {
                     let at = host.open.partition_point(|p| p.port < result.port);
                     host.open.insert(at, result);
                 }
-            }
+                None => rmap_log::warn!("open port {ip}:{} arrived before its host", result.port),
+            },
             ScanEvent::HostDone {
                 ip,
                 closed,
                 filtered,
                 ..
-            } => {
-                if let Some(host) = self.hosts.get_mut(&ip) {
+            } => match self.hosts.get_mut(&ip) {
+                Some(host) => {
                     host.closed = closed;
                     host.filtered = filtered;
                     host.done = true;
                 }
-            }
+                None => rmap_log::warn!("completion for {ip} arrived before its host"),
+            },
             ScanEvent::Warning(msg) => self.log(msg),
             ScanEvent::Finished { elapsed } => {
                 self.finished = Some(elapsed);
@@ -225,13 +230,29 @@ impl App {
         for _ in 0..EVENTS_PER_FRAME {
             match view.scan.events.try_recv() {
                 Ok(event) => view.apply(event),
-                Err(_) => break,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The engine always sends Finished before hanging up, so
+                    // hanging up without it means the scan died.
+                    if view.finished.is_none() && !view.stopped && !view.failed {
+                        view.failed = true;
+                        rmap_log::error!("scan engine stopped without finishing");
+                        let hint = match rmap_log::log_dir() {
+                            Some(dir) => format!("; details in {}", dir.display()),
+                            None => String::new(),
+                        };
+                        view.log(format!("scan engine stopped unexpectedly{hint}"));
+                    }
+                    break;
+                }
             }
         }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        rmap_log::trace!("key {:?} {:?}", key.code, key.modifiers);
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            rmap_log::info!("quit via ctrl-c");
             self.quit = true;
             return;
         }
@@ -249,10 +270,14 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some((config, _)) = self.pending.take() {
+                    rmap_log::info!("user confirmed scanning public addresses");
                     self.launch(config);
                 }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.pending = None,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                rmap_log::info!("user declined scanning public addresses");
+                self.pending = None;
+            }
             _ => {}
         }
     }
@@ -302,9 +327,16 @@ impl App {
             return;
         };
         match key.code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                rmap_log::info!("quit from results screen");
+                self.quit = true;
+            }
             KeyCode::Char('n') | KeyCode::Esc => {
-                view.scan.stop();
+                if view.is_running() {
+                    view.scan.stop();
+                    view.stopped = true;
+                }
+                rmap_log::debug!("back to setup screen");
                 self.screen = Screen::Setup;
             }
             KeyCode::Char('s') if view.is_running() => {
@@ -328,6 +360,7 @@ impl App {
         let targets = match parse_targets(&form.targets) {
             Ok(t) => t,
             Err(e) => {
+                rmap_log::info!("rejected targets {:?}: {e}", form.targets);
                 form.error = Some(format!("Targets: {e}"));
                 form.focus = Field::Targets;
                 return;
@@ -336,6 +369,7 @@ impl App {
         let ports = match PortList::parse(&form.ports) {
             Ok(p) => p,
             Err(e) => {
+                rmap_log::info!("rejected ports {:?}: {e}", form.ports);
                 form.error = Some(format!("Ports: {e}"));
                 form.focus = Field::Ports;
                 return;
@@ -356,6 +390,7 @@ impl App {
         if public.is_empty() {
             self.launch(config);
         } else {
+            rmap_log::info!("asking to confirm public targets: {public:?}");
             self.pending = Some((config, public));
         }
     }
@@ -385,6 +420,7 @@ impl App {
             started: Instant::now(),
             finished: None,
             stopped: false,
+            failed: false,
             log: Vec::new(),
         });
         self.screen = Screen::Results;
@@ -472,5 +508,302 @@ mod tests {
         render(&mut app, 20, 6);
         press(&mut app, KeyCode::Char('n'));
         render(&mut app, 20, 6);
+    }
+
+    fn app() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let app = App::new(rt.handle().clone());
+        (rt, app)
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    /// A results view fed synthetic events, without running a real scan.
+    fn fake_results(app: &mut App) {
+        app.form.targets = "127.0.0.1".into();
+        app.form.ports = "9".into();
+        app.form.discovery = false;
+        press(app, KeyCode::Enter);
+        let view = app.scan.as_mut().unwrap();
+        view.scan.stop();
+        view.stopped = true; // keep the disconnect from counting as a failure
+        for (ip, state) in [
+            ("10.0.0.3", HostState::Up),
+            ("10.0.0.1", HostState::Down),
+            ("10.0.0.2", HostState::Up),
+        ] {
+            view.apply(ScanEvent::Host {
+                ip: ip.parse().unwrap(),
+                hostname: None,
+                state,
+                rtt: None,
+            });
+        }
+    }
+
+    #[test]
+    fn tab_cycles_fields_both_ways() {
+        let (_rt, mut app) = app();
+        assert_eq!(app.form.focus, Field::Targets);
+        for expected in [
+            Field::Ports,
+            Field::Timing,
+            Field::Discovery,
+            Field::Targets,
+        ] {
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.form.focus, expected);
+        }
+        press(&mut app, KeyCode::BackTab);
+        assert_eq!(app.form.focus, Field::Discovery);
+    }
+
+    #[test]
+    fn editing_text_fields() {
+        let (_rt, mut app) = app();
+        type_text(&mut app, "10.0.0.1x");
+        press(&mut app, KeyCode::Backspace);
+        assert_eq!(app.form.targets, "10.0.0.1");
+        press(&mut app, KeyCode::Tab);
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Backspace); // extra presses on empty text are harmless
+        }
+        type_text(&mut app, "22");
+        assert_eq!(app.form.ports, "22");
+    }
+
+    #[test]
+    fn timing_clamps_and_accepts_digits() {
+        let (_rt, mut app) = app();
+        app.form.focus = Field::Timing;
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.form.timing, 5);
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Left);
+        }
+        assert_eq!(app.form.timing, 0);
+        press(&mut app, KeyCode::Char('4'));
+        assert_eq!(app.form.timing, 4);
+        press(&mut app, KeyCode::Char('9'));
+        assert_eq!(app.form.timing, 4, "out-of-range digits are ignored");
+    }
+
+    #[test]
+    fn discovery_toggles() {
+        let (_rt, mut app) = app();
+        app.form.focus = Field::Discovery;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.form.discovery);
+        press(&mut app, KeyCode::Right);
+        assert!(app.form.discovery);
+    }
+
+    #[test]
+    fn bad_ports_focus_the_ports_field() {
+        let (_rt, mut app) = app();
+        app.form.targets = "127.0.0.1".into();
+        app.form.ports = "0-10".into();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.form.focus, Field::Ports);
+        assert!(app.form.error.as_deref().unwrap().starts_with("Ports:"));
+        app.form.ports = "22".into();
+        app.form.discovery = false;
+        press(&mut app, KeyCode::Enter);
+        assert!(app.form.error.is_none(), "error clears on a good submit");
+    }
+
+    #[test]
+    fn empty_targets_are_rejected() {
+        let (_rt, mut app) = app();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.screen, Screen::Setup));
+        assert!(app.form.error.is_some());
+    }
+
+    #[test]
+    fn confirming_public_targets_starts_the_scan() {
+        let (_rt, mut app) = app();
+        app.form.targets = "192.0.2.1".into(); // TEST-NET, counted as public
+        app.form.ports = "80".into();
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.pending.is_some(), "other keys leave the prompt up");
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.pending.is_none());
+        assert!(matches!(app.screen, Screen::Results));
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_anywhere() {
+        let (_rt, mut app) = app();
+        app.form.targets = "8.8.8.8".into();
+        press(&mut app, KeyCode::Enter);
+        assert!(app.pending.is_some());
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn esc_quits_setup_but_not_results() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Setup) && !app.should_quit());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn host_list_hides_down_hosts_and_navigates() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let selected = |app: &App| app.scan.as_ref().unwrap().selected;
+        let view = app.scan.as_ref().unwrap();
+        assert_eq!(
+            view.visible(),
+            [ip("10.0.0.2"), ip("10.0.0.3")],
+            "sorted, down host hidden"
+        );
+        assert_eq!(
+            view.selected,
+            Some(ip("10.0.0.3")),
+            "first up host seen is selected"
+        );
+
+        press(&mut app, KeyCode::Up);
+        assert_eq!(selected(&app), Some(ip("10.0.0.2")));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(selected(&app), Some(ip("10.0.0.2")), "stops at the top");
+        press(&mut app, KeyCode::End);
+        assert_eq!(selected(&app), Some(ip("10.0.0.3")));
+
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.scan.as_ref().unwrap().visible().len(), 3);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(selected(&app), Some(ip("10.0.0.1")));
+        render(&mut app, 100, 30);
+    }
+
+    #[test]
+    fn open_ports_stay_sorted() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        for port in [443, 22, 8080, 80] {
+            view.apply(ScanEvent::Port {
+                ip,
+                result: PortResult {
+                    port,
+                    state: rmap_core::PortState::Open,
+                    rtt: None,
+                },
+            });
+        }
+        let ports: Vec<u16> = view.hosts[&ip].open.iter().map(|p| p.port).collect();
+        assert_eq!(ports, [22, 80, 443, 8080]);
+    }
+
+    #[test]
+    fn events_for_unknown_hosts_are_ignored() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        let ghost: IpAddr = "10.9.9.9".parse().unwrap();
+        view.apply(ScanEvent::Port {
+            ip: ghost,
+            result: PortResult {
+                port: 1,
+                state: rmap_core::PortState::Open,
+                rtt: None,
+            },
+        });
+        view.apply(ScanEvent::HostDone {
+            ip: ghost,
+            closed: 1,
+            filtered: 1,
+            elapsed: Duration::ZERO,
+        });
+        assert!(!view.hosts.contains_key(&ghost));
+    }
+
+    #[test]
+    fn log_panel_is_bounded() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        for i in 0..MAX_LOG_LINES + 50 {
+            view.apply(ScanEvent::Warning(format!("w{i}")));
+        }
+        assert_eq!(view.log.len(), MAX_LOG_LINES);
+        assert_eq!(
+            view.log.last().unwrap(),
+            &format!("w{}", MAX_LOG_LINES + 49)
+        );
+    }
+
+    fn start_slow_scan(app: &mut App) {
+        app.form.targets = "192.0.2.1".into();
+        app.form.ports = "1-1000".into();
+        app.form.discovery = false;
+        press(app, KeyCode::Enter);
+        press(app, KeyCode::Char('y'));
+        assert!(matches!(app.screen, Screen::Results));
+    }
+
+    #[test]
+    fn engine_vanishing_marks_the_scan_failed() {
+        let (_rt, mut app) = app();
+        start_slow_scan(&mut app);
+        // Abort the engine behind the UI's back, as a panic would.
+        app.scan.as_ref().unwrap().scan.stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.scan.as_ref().unwrap().failed {
+            assert!(Instant::now() < deadline, "failure not detected");
+            app.drain_events();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let view = app.scan.as_ref().unwrap();
+        assert!(!view.is_running());
+        assert!(view.log.iter().any(|l| l.contains("stopped unexpectedly")));
+        assert!(render(&mut app, 100, 30).contains("failed"));
+    }
+
+    #[test]
+    fn user_stop_is_not_a_failure() {
+        let (_rt, mut app) = app();
+        start_slow_scan(&mut app);
+        press(&mut app, KeyCode::Char('s'));
+        std::thread::sleep(Duration::from_millis(100));
+        app.drain_events();
+        let view = app.scan.as_ref().unwrap();
+        assert!(view.stopped && !view.failed);
+        assert!(render(&mut app, 100, 30).contains("stopped"));
+    }
+
+    #[test]
+    fn leaving_a_running_scan_is_not_a_failure() {
+        let (_rt, mut app) = app();
+        start_slow_scan(&mut app);
+        press(&mut app, KeyCode::Char('n'));
+        assert!(matches!(app.screen, Screen::Setup));
+        std::thread::sleep(Duration::from_millis(100));
+        app.drain_events();
+        let view = app.scan.as_ref().unwrap();
+        assert!(view.stopped && !view.failed);
+    }
+
+    #[test]
+    fn setup_screen_shows_log_status() {
+        let (_rt, mut app) = app();
+        // Logging isn't initialised in unit tests.
+        assert!(render(&mut app, 90, 24).contains("logging off"));
     }
 }

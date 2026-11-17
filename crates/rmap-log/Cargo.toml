@@ -1,0 +1,9 @@
+[package]
+name = "rmap-log"
+description = "Local diagnostic logging and crash reports for rmap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

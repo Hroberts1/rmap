@@ -164,6 +164,17 @@ fn parse_one(s: &str) -> Result<Target, ParseError> {
         }
         return checked(Target::V4Range { start, end }, s);
     }
+    if let Some((a, b)) = s.split_once('-')
+        && let (Ok(start), Ok(end)) = (a.parse::<Ipv6Addr>(), b.parse::<Ipv6Addr>())
+    {
+        if start > end {
+            return err(format!("{s}: range start is after its end"));
+        }
+        if u128::from(end) - u128::from(start) >= 1 << (128 - MIN_V6_PREFIX) {
+            return err(format!("{s}: IPv6 ranges are limited to 65,536 addresses"));
+        }
+        return Ok(Target::V6Range { start, end });
+    }
     if let Some(t) = parse_octets(s)? {
         return checked(t, s);
     }
@@ -186,9 +197,8 @@ fn parse_cidr(s: &str, addr: &str, prefix: &str) -> Result<Target, ParseError> {
     let ip: IpAddr = addr
         .parse()
         .map_err(|_| ParseError(format!("{s}: CIDR base must be an IP address")))?;
-    let prefix: u8 = prefix
-        .parse()
-        .map_err(|_| ParseError(format!("{s}: invalid prefix length")))?;
+    let prefix: u8 = crate::parse_digits(prefix)
+        .ok_or_else(|| ParseError(format!("{s}: invalid prefix length")))?;
     match ip {
         IpAddr::V4(v4) => {
             if prefix > 32 {
@@ -266,6 +276,8 @@ fn checked(t: Target, s: &str) -> Result<Target, ParseError> {
 }
 
 fn is_hostname(s: &str) -> bool {
+    // A single trailing dot marks a fully qualified name.
+    let s = s.strip_suffix('.').unwrap_or(s);
     s.len() <= 253
         && s.split('.').all(|label| {
             !label.is_empty()
@@ -274,8 +286,9 @@ fn is_hostname(s: &str) -> bool {
                 && !label.ends_with('-')
                 && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
-        // An all-numeric dotted string is a malformed address, not a name.
-        && !s.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        // No top-level domain is all digits, so "1.2.3" or "1.2.3.4-1.2.3"
+        // is a mistyped address or range, not a name.
+        && !s.rsplit('.').next().is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[cfg(test)]

@@ -56,7 +56,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     let area = centered(
         frame.area(),
         76.min(frame.area().width),
-        18.min(frame.area().height),
+        19.min(frame.area().height),
     );
     let block = Block::bordered()
         .title(Line::from(" rmap · new scan ").bold().fg(ACCENT))
@@ -74,6 +74,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         discovery,
         _,
         error,
+        log_line,
     ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(2),
@@ -84,6 +85,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(1),
+        Constraint::Length(1),
     ])
     .margin(1)
     .areas(inner);
@@ -171,6 +173,15 @@ fn draw_setup(frame: &mut Frame, app: &App) {
             error,
         );
     }
+
+    let log_text = match rmap_log::log_path() {
+        Some(path) => format!("log: {}", path.display()),
+        None => "logging off (set RMAP_LOG=info to enable)".into(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(log_text).dim().italic()),
+        log_line,
+    );
 }
 
 // -------------------------------------------------------------- results ---
@@ -203,7 +214,9 @@ fn draw_results(frame: &mut Frame, view: &ScanView) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
-    let (status, color) = if view.stopped {
+    let (status, color) = if view.failed {
+        ("failed", Color::Red)
+    } else if view.stopped {
         ("stopped", Color::Yellow)
     } else if view.finished.is_some() {
         ("done", Color::Green)

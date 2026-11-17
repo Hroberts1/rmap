@@ -8,19 +8,29 @@
 //!
 //! Stopping a scan aborts the coordinator. Each level owns its children in a
 //! `JoinSet`, so dropping it cancels everything below.
+//!
+//! Diagnostics go to `rmap_log`: the scan's configuration and summary at
+//! `info`, per-host results at `debug`, and every probe at `trace`.
+//! Unexpected connect errors are tallied by kind so odd network behaviour
+//! shows up in the summary even when it isn't logged line by line.
 
-mod tcp;
+pub mod tcp;
 
+use std::collections::BTreeMap;
+use std::io;
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rmap_core::{HostState, PortList, PortState, ScanEvent, Target, Timing};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
+
+/// Unexpected errors logged individually per scan; the rest are only counted.
+const DETAILED_ERRORS: u64 = 20;
 
 /// What to scan and how.
 #[derive(Debug, Clone)]
@@ -30,6 +40,36 @@ pub struct ScanConfig {
     pub timing: Timing,
     /// Probe each host before scanning it, and skip hosts that don't answer.
     pub discovery: bool,
+}
+
+impl ScanConfig {
+    /// One-line description for logs.
+    pub fn describe(&self) -> String {
+        let shown: Vec<String> = self
+            .targets
+            .iter()
+            .take(10)
+            .map(ToString::to_string)
+            .collect();
+        let more = self.targets.len().saturating_sub(shown.len());
+        format!(
+            "targets=[{}{}] ports={} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={}",
+            shown.join(","),
+            if more > 0 {
+                format!(",+{more} more")
+            } else {
+                String::new()
+            },
+            self.ports.len(),
+            self.timing.level,
+            self.timing.name,
+            self.timing.concurrency,
+            self.timing.host_parallelism,
+            self.timing.connect_timeout,
+            self.timing.retries,
+            self.discovery,
+        )
+    }
 }
 
 /// Probe counts shared between the engine and the UI.
@@ -50,29 +90,89 @@ impl Progress {
     }
 }
 
+/// Counters for the end-of-scan summary.
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub open: AtomicU64,
+    pub closed: AtomicU64,
+    pub filtered: AtomicU64,
+    pub hosts_up: AtomicU64,
+    pub hosts_down: AtomicU64,
+    pub unexpected_errors: AtomicU64,
+    pub socket_backoffs: AtomicU64,
+    pub task_panics: AtomicU64,
+    error_kinds: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Stats {
+    /// Note a connect error that wasn't a plain refusal or timeout.
+    pub fn record_error(&self, ip: IpAddr, port: u16, e: &io::Error) {
+        let n = self.unexpected_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        let key = match e.raw_os_error() {
+            Some(code) => format!("{:?}(os {code})", e.kind()),
+            None => format!("{:?}", e.kind()),
+        };
+        *self
+            .error_kinds
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(key.clone())
+            .or_default() += 1;
+        if n <= DETAILED_ERRORS {
+            rmap_log::debug!("connect {ip}:{port} failed: {e} [{key}]");
+            if n == DETAILED_ERRORS {
+                rmap_log::debug!("further connect errors are counted, not logged");
+            }
+        }
+    }
+
+    /// Error tallies as `kind=count` pairs, most frequent first.
+    pub fn error_summary(&self) -> String {
+        let kinds = self.error_kinds.lock().unwrap_or_else(|p| p.into_inner());
+        let mut pairs: Vec<_> = kinds.iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        pairs
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// A running scan.
 pub struct Scan {
     pub events: UnboundedReceiver<ScanEvent>,
     pub progress: Arc<Progress>,
+    pub stats: Arc<Stats>,
     task: JoinHandle<()>,
 }
 
 impl Scan {
     /// Start a scan on the given runtime. Results arrive on `events`.
     pub fn start(rt: &Handle, config: ScanConfig) -> Scan {
+        rmap_log::info!("scan starting {}", config.describe());
         let (tx, events) = unbounded_channel();
         let progress = Arc::new(Progress::default());
-        let task = rt.spawn(run(config, tx, progress.clone()));
+        let stats = Arc::new(Stats::default());
+        let task = rt.spawn(run(config, tx, progress.clone(), stats.clone()));
         Scan {
             events,
             progress,
+            stats,
             task,
         }
     }
 
     /// Cancel every outstanding probe.
     pub fn stop(&self) {
-        self.task.abort();
+        if !self.task.is_finished() {
+            rmap_log::info!(
+                "scan cancelled at {}/{} probes",
+                self.progress.completed.load(Ordering::Relaxed),
+                self.progress.total.load(Ordering::Relaxed)
+            );
+            self.task.abort();
+        }
     }
 
     pub fn is_finished(&self) -> bool {
@@ -82,7 +182,7 @@ impl Scan {
 
 impl Drop for Scan {
     fn drop(&mut self) {
-        self.task.abort();
+        self.stop();
     }
 }
 
@@ -94,9 +194,42 @@ struct Shared {
     probe_slots: Semaphore,
     tx: UnboundedSender<ScanEvent>,
     progress: Arc<Progress>,
+    stats: Arc<Stats>,
 }
 
-async fn run(config: ScanConfig, tx: UnboundedSender<ScanEvent>, progress: Arc<Progress>) {
+impl Shared {
+    fn warn_ui(&self, msg: String) {
+        let _ = self.tx.send(ScanEvent::Warning(msg));
+    }
+}
+
+/// Holds one probe slot and hands it back when dropped, even if the probe
+/// task panics or is cancelled.
+struct ProbeSlot(Arc<Shared>);
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        self.0.probe_slots.add_permits(1);
+    }
+}
+
+/// Log a child task that panicked. Cancellation is expected and ignored.
+fn note_join_error(e: JoinError, what: &str, shared: &Shared) {
+    if e.is_panic() {
+        shared.stats.task_panics.fetch_add(1, Ordering::Relaxed);
+        rmap_log::error!("{what} task panicked; its results are incomplete");
+        shared.warn_ui(format!(
+            "internal error while scanning {what}; see the log file"
+        ));
+    }
+}
+
+async fn run(
+    config: ScanConfig,
+    tx: UnboundedSender<ScanEvent>,
+    progress: Arc<Progress>,
+    stats: Arc<Stats>,
+) {
     let started = Instant::now();
     let hosts: u64 = config.targets.iter().map(Target::count).sum();
     let per_host = config.ports.len();
@@ -116,17 +249,25 @@ async fn run(config: ScanConfig, tx: UnboundedSender<ScanEvent>, progress: Arc<P
         probe_slots: Semaphore::new(config.timing.concurrency),
         tx,
         progress,
+        stats,
     });
 
-    let mut host_tasks = JoinSet::new();
+    let mut host_tasks: JoinSet<IpAddr> = JoinSet::new();
+    let reap = |r: Result<IpAddr, JoinError>, shared: &Shared| {
+        if let Err(e) = r {
+            note_join_error(e, "a host", shared);
+        }
+    };
     for target in config.targets {
         let addrs: Box<dyn Iterator<Item = (IpAddr, Option<String>)> + Send> = match &target {
             Target::Hostname(name) => match resolve(name).await {
-                Some(ip) => Box::new(std::iter::once((ip, Some(name.clone())))),
-                None => {
-                    let _ = shared
-                        .tx
-                        .send(ScanEvent::Warning(format!("could not resolve {name}")));
+                Ok(ip) => {
+                    rmap_log::debug!("resolved {name} to {ip}");
+                    Box::new(std::iter::once((ip, Some(name.clone()))))
+                }
+                Err(e) => {
+                    rmap_log::warn!("could not resolve {name}: {e}");
+                    shared.warn_ui(format!("could not resolve {name}: {e}"));
                     shared
                         .progress
                         .completed
@@ -142,26 +283,54 @@ async fn run(config: ScanConfig, tx: UnboundedSender<ScanEvent>, progress: Arc<P
                 .acquire_owned()
                 .await
                 .expect("semaphore never closed");
-            let shared = shared.clone();
+            let task_shared = shared.clone();
             host_tasks.spawn(async move {
-                scan_host(ip, hostname, &shared).await;
-                drop(slot);
+                let _slot = slot;
+                scan_host(ip, hostname, &task_shared).await;
+                ip
             });
-            while host_tasks.try_join_next().is_some() {}
+            while let Some(r) = host_tasks.try_join_next() {
+                reap(r, &shared);
+            }
         }
     }
-    while host_tasks.join_next().await.is_some() {}
+    while let Some(r) = host_tasks.join_next().await {
+        reap(r, &shared);
+    }
 
-    let _ = shared.tx.send(ScanEvent::Finished {
-        elapsed: started.elapsed(),
-    });
+    let elapsed = started.elapsed();
+    let s = &shared.stats;
+    let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    rmap_log::info!(
+        "scan finished in {elapsed:?}: hosts up={} down={} ports open={} closed={} filtered={} \
+         probes={}/{} unexpected_errors={} socket_backoffs={} task_panics={}",
+        load(&s.hosts_up),
+        load(&s.hosts_down),
+        load(&s.open),
+        load(&s.closed),
+        load(&s.filtered),
+        load(&shared.progress.completed),
+        load(&shared.progress.total),
+        load(&s.unexpected_errors),
+        load(&s.socket_backoffs),
+        load(&s.task_panics),
+    );
+    if load(&s.unexpected_errors) > 0 {
+        rmap_log::info!("connect errors by kind: {}", s.error_summary());
+    }
+    if load(&s.socket_backoffs) > 0 {
+        shared.warn_ui(format!(
+            "ran out of local sockets {} times; results are valid but the scan was slowed",
+            load(&s.socket_backoffs)
+        ));
+    }
+    let _ = shared.tx.send(ScanEvent::Finished { elapsed });
 }
 
 /// Resolve a name, preferring an IPv4 address.
-async fn resolve(name: &str) -> Option<IpAddr> {
+async fn resolve(name: &str) -> io::Result<IpAddr> {
     let addrs: Vec<IpAddr> = tokio::net::lookup_host((name, 0))
-        .await
-        .ok()?
+        .await?
         .map(|a| a.ip())
         .collect();
     addrs
@@ -169,18 +338,32 @@ async fn resolve(name: &str) -> Option<IpAddr> {
         .find(|a| a.is_ipv4())
         .or(addrs.first())
         .copied()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses returned"))
 }
 
 async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
     let started = Instant::now();
+
+    #[cfg(test)]
+    if ip == tests::PANIC_IP {
+        panic!("test-only panic for {ip}");
+    }
+
     let (state, rtt) = if shared.discovery {
-        match tcp::ping(ip, &shared.timing).await {
+        match tcp::ping(ip, &shared.timing, &shared.stats).await {
             Some(rtt) => (HostState::Up, Some(rtt)),
             None => (HostState::Down, None),
         }
     } else {
         (HostState::Assumed, None)
     };
+    let counter = if state == HostState::Down {
+        &shared.stats.hosts_down
+    } else {
+        &shared.stats.hosts_up
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    rmap_log::debug!("host {ip} {state:?} rtt={rtt:?}");
     let _ = shared.tx.send(ScanEvent::Host {
         ip,
         hostname,
@@ -201,73 +384,59 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
     for &port in &shared.ports {
         // Wait for a free probe slot before spawning, so memory stays flat
         // no matter how many ports are queued.
-        let slot = shared
+        shared
             .probe_slots
             .acquire()
             .await
-            .expect("semaphore never closed");
-        slot.forget();
-        let (shared, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
+            .expect("semaphore never closed")
+            .forget();
+        let slot = ProbeSlot(shared.clone());
+        let (sh, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
         probes.spawn(async move {
-            let result = tcp::probe(ip, port, &shared.timing).await;
-            shared.probe_slots.add_permits(1);
-            shared.progress.completed.fetch_add(1, Ordering::Relaxed);
+            let _slot = slot;
+            let result = tcp::probe(ip, port, &sh.timing, &sh.stats).await;
+            sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
                 PortState::Open => {
-                    let _ = shared.tx.send(ScanEvent::Port { ip, result });
+                    sh.stats.open.fetch_add(1, Ordering::Relaxed);
+                    rmap_log::debug!("open {ip}:{port} rtt={:?}", result.rtt);
+                    let _ = sh.tx.send(ScanEvent::Port { ip, result });
                 }
                 PortState::Closed => {
+                    sh.stats.closed.fetch_add(1, Ordering::Relaxed);
                     closed.fetch_add(1, Ordering::Relaxed);
                 }
                 PortState::Filtered => {
+                    sh.stats.filtered.fetch_add(1, Ordering::Relaxed);
                     filtered.fetch_add(1, Ordering::Relaxed);
                 }
             }
         });
-        while probes.try_join_next().is_some() {}
+        while let Some(r) = probes.try_join_next() {
+            if let Err(e) = r {
+                note_join_error(e, &format!("{ip}"), shared);
+            }
+        }
     }
-    while probes.join_next().await.is_some() {}
+    while let Some(r) = probes.join_next().await {
+        if let Err(e) = r {
+            note_join_error(e, &format!("{ip}"), shared);
+        }
+    }
 
+    let (closed, filtered) = (
+        closed.load(Ordering::Relaxed),
+        filtered.load(Ordering::Relaxed),
+    );
+    let elapsed = started.elapsed();
+    rmap_log::debug!("host {ip} done in {elapsed:?}: closed={closed} filtered={filtered}");
     let _ = shared.tx.send(ScanEvent::HostDone {
         ip,
-        closed: closed.load(Ordering::Relaxed),
-        filtered: filtered.load(Ordering::Relaxed),
-        elapsed: started.elapsed(),
+        closed,
+        filtered,
+        elapsed,
     });
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rmap_core::parse_targets;
-    use tokio::net::TcpListener;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn finds_an_open_port_on_localhost() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let _ = listener.accept().await;
-            }
-        });
-
-        let config = ScanConfig {
-            targets: parse_targets("127.0.0.1").unwrap(),
-            ports: PortList::parse(&port.to_string()).unwrap(),
-            timing: Timing::template(4),
-            discovery: false,
-        };
-        let mut scan = Scan::start(&Handle::current(), config);
-        let mut open = Vec::new();
-        while let Some(ev) = scan.events.recv().await {
-            match ev {
-                ScanEvent::Port { result, .. } => open.push(result.port),
-                ScanEvent::Finished { .. } => break,
-                _ => {}
-            }
-        }
-        assert_eq!(open, [port]);
-        assert_eq!(scan.progress.ratio(), 1.0);
-    }
-}
+mod tests;

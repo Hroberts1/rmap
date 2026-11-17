@@ -33,8 +33,9 @@ Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` sto
 crates/
 ├── rmap-core     targets, port lists, timing templates, result types
 ├── rmap-engine   async scan engine (tokio)
+├── rmap-log      local log files and crash reports (no dependencies)
 └── rmap-tui      ratatui front end
-src/main.rs       starts the runtime and the UI
+src/main.rs       starts logging, the runtime and the UI
 ```
 
 The engine runs a scan as a tree of tasks: one coordinator, one task per host (limited by the timing template's host parallelism), and one task per probe (limited by a global semaphore). Results stream to the UI over a channel. Progress is shared through atomics, so a scan of 65,535 ports doesn't send 65,535 messages. Closed and filtered ports are counted, not stored, so memory stays flat on large ranges.
@@ -50,6 +51,40 @@ Stopping a scan aborts the coordinator. Every level owns its children in a `Join
 | No answer after retries, or unreachable | filtered |
 
 Host discovery without root works the same way: a host counts as up if any of ports 80, 443, 22, 445 or 3389 accepts or refuses a connection.
+
+## Logs and crash reports
+
+rmap keeps local diagnostic logs so bugs can be reproduced. **Nothing is sent anywhere**: there is no network telemetry.
+
+Each run writes one log file, and its path is shown at the bottom of the setup screen:
+
+| Platform | Default location |
+|---|---|
+| Linux | `$XDG_STATE_HOME/rmap/logs`, or `~/.local/state/rmap/logs` |
+| macOS | `~/Library/Logs/rmap` |
+| Windows | `%LOCALAPPDATA%\rmap\logs` |
+
+| Variable | Effect |
+|---|---|
+| `RMAP_LOG` | `off`, `error`, `warn`, `info` (default), `debug`, or `trace` (every probe; very large) |
+| `RMAP_LOG_DIR` | Write logs somewhere else |
+
+What gets logged:
+- **info:** session start (version, OS, arguments), each scan's full configuration, user decisions such as confirming public targets, and an end-of-scan summary with unexpected connect errors tallied by kind
+- **debug:** host up/down results, open ports, name resolution, and the first 20 unexpected connect errors in full
+- **trace:** every probe attempt and keypress
+
+If rmap panics, it writes `crash-<time>-<pid>.txt` next to the log. The report holds the panic message, location, a backtrace, and the last 500 log lines at debug level, even when the log file itself is at info. A panic inside a scan worker doesn't crash the app: the scan shows **failed** and the report is written in the background.
+
+The newest 20 logs and 20 crash reports are kept; older ones are deleted. Logs contain the addresses you scanned, so review them before attaching one to a public issue.
+
+## Testing
+
+```bash
+cargo test --workspace
+```
+
+The suite runs real scans against loopback listeners and the reserved, never-routed `192.0.2.0/24` block, so it needs no network access or privileges. It includes randomized parser tests that feed 100,000 generated strings through target and port parsing to catch inputs that could panic. If one fails, it prints the seed and the input that broke it.
 
 ## Roadmap
 
