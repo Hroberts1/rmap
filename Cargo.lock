@@ -1162,6 +1162,7 @@ name = "rmap-engine"
 version = "0.1.0"
 dependencies = [
  "rmap-core",
+ "rmap-detect",
  "rmap-log",
  "tokio",
 ]

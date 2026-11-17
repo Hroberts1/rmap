@@ -21,6 +21,8 @@ pub mod payloads;
 pub mod tls;
 
 #[cfg(test)]
+mod e2e_tests;
+#[cfg(test)]
 mod rule_tests;
 
 use std::io;

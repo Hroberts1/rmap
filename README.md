@@ -8,7 +8,7 @@ rmap takes inspiration from Nmap's feature set but shares none of its code or da
 
 ## Status
 
-Milestone 1 is done: unprivileged TCP connect scanning with a live TUI. See the [roadmap](#roadmap).
+Milestones 1 and 3 are done: unprivileged TCP connect scanning with a live TUI, and service and version detection. See the [roadmap](#roadmap).
 
 ## Running
 
@@ -33,6 +33,7 @@ Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` sto
 crates/
 ├── rmap-core     targets, port lists, timing templates, result types
 ├── rmap-engine   async scan engine (tokio)
+├── rmap-detect   service detection: probes, matcher, TLS, CPEs
 ├── rmap-log      local log files and crash reports (no dependencies)
 └── rmap-tui      ratatui front end
 src/main.rs       starts logging, the runtime and the UI
@@ -51,6 +52,51 @@ Stopping a scan aborts the coordinator. Every level owns its children in a `Join
 | No answer after retries, or unreachable | filtered |
 
 Host discovery without root works the same way: a host counts as up if any of ports 80, 443, 22, 445 or 3389 accepts or refuses a connection.
+
+## Service detection
+
+Tick **Services** on the setup form and rmap identifies the software behind each open TCP port. The port table shows the service and version, and the details pane adds a line per port with extra information, the OS the service revealed, and a [CPE 2.3](https://nvd.nist.gov/products/cpe) name:
+
+```
+22/tcp  open  ssh   OpenSSH 8.9p1
+                    └ protocol 2.0; Ubuntu-3ubuntu0.6 · os: Ubuntu Linux · cpe:2.3:a:openbsd:openssh:8.9:p1
+```
+
+How it works (`crates/rmap-detect`):
+
+1. **Choose probes.** Probes that list the port go first, then the generic ones: wait for a banner, `GET / HTTP/1.0`, a TLS ClientHello, and blank lines. So HTTP on port 8443 or SSH on port 2200 is still found.
+2. **Send and read.** Each probe uses a fresh connection and reads until the server closes, goes quiet for half a second, has sent 16 KiB, or the probe's wait runs out. Each port gets a time budget of ten connect timeouts (5-30 s). Detection runs at most `concurrency / 8` ports at once (1-64), separately from port probes, so it can't slow the scan down.
+3. **Match.** The reply is checked against the probe's rules, then against the rules of its `fallback` probes (an SSH server answering an HTTP probe still sends its banner). TLS replies are decoded in code: protocol version, and the certificate's common name, alternative names, issuer and expiry, read with a small DER parser. rmap offers TLS 1.2 at most, so the certificate arrives unencrypted.
+4. **Report.** Matches get a CPE from rmap's product table, with versions split the way NVD records them (`8.9p1` becomes version `8.9`, update `p1`). If nothing matches, rmap reports the port-table name with low confidence, plus the start of any reply it didn't recognise.
+
+`Service::method` says how the result was reached (`banner`, `probe`, or `port_table`), and `confidence` runs from 0 (guess) to 10.
+
+Covered today: OpenSSH, Dropbear, nginx, Apache httpd, Microsoft IIS and HTTPAPI, lighttpd, Caddy, Tomcat Coyote, Elasticsearch, Postfix, Exim, Sendmail, Microsoft Exchange, vsftpd, ProFTPD, Pure-FTPd, FileZilla Server, Microsoft FTP, Dovecot, Courier, MySQL, MariaDB, PostgreSQL, Redis, Valkey, MongoDB, Memcached, RabbitMQ, Asterisk and Apple Remote Desktop, plus the protocols SSH, HTTP (any `Server:` header), FTP, SMTP, POP3, IMAP, TLS, SMB, RDP, VNC, telnet, SIP, RTSP, AMQP and MQTT. UDP detection isn't done yet; the database and API already take a protocol.
+
+### Adding a probe or match rule
+
+The database is [`crates/rmap-detect/src/probes.txt`](crates/rmap-detect/src/probes.txt), in a format specific to rmap. It is not Nmap's format and must not contain Nmap data.
+
+```text
+probe memcached
+  send     "version\r\n"          # quoted bytes with \r \n \t \0 \ \" \xHH, or @builtin
+  ports    11211                  # tried first on these ports
+  wait     5s                     # optional, default 5s
+  fallback banner                 # also apply these probes' rules
+
+match memcached ^VERSION ([\d.]+)\r\n
+  product  Memcached
+  version  $1                     # $1-$9 insert capture groups
+  info     ...                    # optional: info, os, confidence (0-10)
+```
+
+A probe without `send` waits for a banner, and `generic` runs it on every port. Rules are tried top to bottom and the first match wins, so put specific rules first. A pattern is the rest of its `match` line, written in a small regex-like language that runs in linear time on raw bytes (no backtracking): literals, `.`, classes like `[^\r\n]`, `\d \w \s`, `\xHH`, groups `( )` and `(?: )`, `|`, `* + ?` and their lazy forms, `{n,m}`, `^` (start of reply), `$` (end of line), and leading `(?i)` / `(?s)` flags. [`pattern.rs`](crates/rmap-detect/src/pattern.rs) documents the full syntax.
+
+When you add a rule:
+
+1. Add a realistic reply for it to `rule_tests.rs`. The test fails if any rule has no test.
+2. If it names a new product, add the product's NVD vendor and product to the table in `cpe.rs` with a test case, or list it as having no CPE.
+3. Run `cargo test -p rmap-detect`.
 
 ## Logs and crash reports
 
@@ -71,8 +117,8 @@ Each run writes one log file, and its path is shown at the bottom of the setup s
 
 What gets logged:
 - **info:** session start (version, OS, arguments), each scan's full configuration, user decisions such as confirming public targets, and an end-of-scan summary with unexpected connect errors tallied by kind
-- **debug:** host up/down results, open ports, name resolution, and the first 20 unexpected connect errors in full
-- **trace:** every probe attempt and keypress
+- **debug:** host up/down results, open ports, name resolution, the first 20 unexpected connect errors in full, and which detection probes ran and which rule matched
+- **trace:** every probe attempt and keypress, and the first 160 bytes of each detection reply, escaped
 
 If rmap panics, it writes `crash-<time>-<pid>.txt` next to the log. The report holds the panic message, location, a backtrace, and the last 500 log lines at debug level, even when the log file itself is at info. A panic inside a scan worker doesn't crash the app: the scan shows **failed** and the report is written in the background.
 
@@ -84,13 +130,13 @@ The newest 20 logs and 20 crash reports are kept; older ones are deleted. Logs c
 cargo test --workspace
 ```
 
-The suite runs real scans against loopback listeners and the reserved, never-routed `192.0.2.0/24` block, so it needs no network access or privileges. It includes randomized parser tests that feed 100,000 generated strings through target and port parsing to catch inputs that could panic. If one fails, it prints the seed and the input that broke it.
+The suite runs real scans against loopback listeners and the reserved, never-routed `192.0.2.0/24` block, so it needs no network access or privileges. It includes randomized parser tests that feed 100,000 generated strings through target and port parsing to catch inputs that could panic. If one fails, it prints the seed and the input that broke it. Service detection is tested the same way: fake SSH, HTTP, SMTP, FTP, Redis and TLS servers on loopback, a realistic reply for every match rule, and randomized garbage fed through the pattern matcher, the probe database parser and the TLS and certificate parsers.
 
 ## Roadmap
 
 - [x] **M1: engine + TUI shell.** Target parsing, TCP connect scan, unprivileged discovery, live results.
 - [ ] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, adaptive timing. Needs root or `CAP_NET_RAW`.
-- [ ] **M3: service detection.** rmap's own probe and match database, version strings, CPE identifiers.
+- [x] **M3: service detection.** rmap's own probe and match database, version strings, TLS certificate names, CPE identifiers.
 - [ ] **M4: vulnerability matching.** Offline CPE → CVE lookup against locally cached public feeds, flagged as *potentially* vulnerable to allow for vendor backports.
 - [ ] **M5: export and diffing.** JSON and XML export from the TUI, and comparing two saved scans.
 

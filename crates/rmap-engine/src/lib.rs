@@ -14,6 +14,7 @@
 //! Unexpected connect errors are tallied by kind so odd network behaviour
 //! shows up in the summary even when it isn't logged line by line.
 
+mod service;
 pub mod tcp;
 
 use std::collections::BTreeMap;
@@ -23,7 +24,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rmap_core::{HostState, PortList, PortState, ScanEvent, ScanType, Target, Timing};
+use rmap_core::{HostState, PortList, PortState, Protocol, ScanEvent, ScanType, Target, Timing};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -42,7 +43,7 @@ pub struct ScanConfig {
     pub discovery: bool,
     /// Technique used to probe ports.
     pub scan_type: ScanType,
-    /// Identify the software behind open ports (Milestone 3).
+    /// Identify the software behind open ports.
     pub service_detection: bool,
 }
 
@@ -198,6 +199,8 @@ struct Shared {
     timing: Timing,
     discovery: bool,
     probe_slots: Semaphore,
+    /// Present when service detection is on.
+    services: Option<service::Detection>,
     tx: UnboundedSender<ScanEvent>,
     progress: Arc<Progress>,
     stats: Arc<Stats>,
@@ -237,17 +240,12 @@ async fn run(
     stats: Arc<Stats>,
 ) {
     let started = Instant::now();
-    // Placeholders until Milestones 2 and 3 land; replace these when they do.
+    // Placeholder until Milestone 2 lands; replace it when it does.
     if config.scan_type != ScanType::Connect {
         let msg = format!(
             "{} scans are not implemented yet; using TCP connect",
             config.scan_type.label()
         );
-        rmap_log::warn!("{msg}");
-        let _ = tx.send(ScanEvent::Warning(msg));
-    }
-    if config.service_detection {
-        let msg = "service detection is not implemented yet".to_string();
         rmap_log::warn!("{msg}");
         let _ = tx.send(ScanEvent::Warning(msg));
     }
@@ -267,6 +265,9 @@ async fn run(
         timing: config.timing,
         discovery: config.discovery,
         probe_slots: Semaphore::new(config.timing.concurrency),
+        services: config
+            .service_detection
+            .then(|| service::Detection::new(config.timing)),
         tx,
         progress,
         stats,
@@ -335,6 +336,13 @@ async fn run(
         load(&s.socket_backoffs),
         load(&s.task_panics),
     );
+    if let Some(d) = &shared.services {
+        rmap_log::info!(
+            "service detection: {} of {} open ports identified",
+            load(&d.identified),
+            load(&d.attempted)
+        );
+    }
     if load(&s.unexpected_errors) > 0 {
         rmap_log::info!("connect errors by kind: {}", s.error_summary());
     }
@@ -413,14 +421,20 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         let slot = ProbeSlot(shared.clone());
         let (sh, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
         probes.spawn(async move {
-            let _slot = slot;
             let result = tcp::probe(ip, port, &sh.timing, &sh.stats).await;
             sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
                 PortState::Open | PortState::OpenFiltered => {
                     sh.stats.open.fetch_add(1, Ordering::Relaxed);
                     rmap_log::debug!("open {ip}:{port} rtt={:?}", result.rtt);
+                    let open = result.state == PortState::Open;
                     let _ = sh.tx.send(ScanEvent::Port { ip, result });
+                    if let Some(services) = sh.services.as_ref().filter(|_| open) {
+                        // Free the probe slot first so detection can't
+                        // hold up the port scan.
+                        drop(slot);
+                        services.identify(ip, port, Protocol::Tcp, &sh.tx).await;
+                    }
                 }
                 PortState::Closed => {
                     sh.stats.closed.fetch_add(1, Ordering::Relaxed);

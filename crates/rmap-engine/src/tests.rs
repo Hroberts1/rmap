@@ -347,3 +347,105 @@ fn describe_truncates_long_target_lists() {
 fn hostname_target_counts_as_one_host() {
     assert_eq!(Target::Hostname("x".into()).count(), 1);
 }
+
+// ----------------------------------------------------- service detection ---
+
+/// A loopback server that greets every connection with `banner` and then
+/// stays silent, like an SSH daemon.
+async fn banner_server(banner: &'static [u8]) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            tokio::spawn(async move {
+                let _ = s.write_all(banner).await;
+                let mut buf = [0u8; 256];
+                let _ = timeout(Duration::from_secs(30), s.read(&mut buf)).await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn service_detection_reports_after_the_port() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+    let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
+    cfg.service_detection = true;
+    let out = run_scan(cfg).await;
+    assert!(out.finished());
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+    let port_at = out
+        .events
+        .iter()
+        .position(|e| matches!(e, ScanEvent::Port { .. }))
+        .expect("port event");
+    let (service_at, service) = out
+        .events
+        .iter()
+        .enumerate()
+        .find_map(|(i, e)| match e {
+            ScanEvent::Service {
+                port: p,
+                protocol,
+                service,
+                ..
+            } if *p == port && *protocol == rmap_core::Protocol::Tcp => Some((i, service)),
+            _ => None,
+        })
+        .expect("service event");
+    assert!(service_at > port_at);
+    assert_eq!(service.version_label().as_deref(), Some("OpenSSH 9.6p1"));
+    assert_eq!(
+        service.cpes,
+        ["cpe:2.3:a:openbsd:openssh:9.6:p1:*:*:*:*:*:*"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_service_events_when_detection_is_off() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6\r\n").await;
+    let out = run_scan(config("127.0.0.1", &port.to_string(), patient(), false)).await;
+    assert_eq!(out.open_ports().len(), 1);
+    assert!(
+        !out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Service { .. }))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_cancels_service_detection() {
+    // A silent service keeps detection busy for its whole budget.
+    let port = banner_server(b"").await;
+    let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
+    cfg.service_detection = true;
+    let mut scan = Scan::start(&Handle::current(), cfg);
+    // Wait for the port to be reported, then stop mid-detection.
+    timeout(Duration::from_secs(10), async {
+        while let Some(ev) = scan.events.recv().await {
+            if matches!(ev, ScanEvent::Port { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("port reported");
+    scan.stop();
+    let rest = timeout(Duration::from_secs(5), async {
+        let mut rest = Vec::new();
+        while let Some(ev) = scan.events.recv().await {
+            rest.push(ev);
+        }
+        rest
+    })
+    .await
+    .expect("channel closes soon after stop");
+    assert!(
+        !rest
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Service { .. } | ScanEvent::Finished { .. })),
+        "{rest:?}"
+    );
+}
