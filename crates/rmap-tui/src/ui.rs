@@ -892,6 +892,8 @@ fn draw_help(frame: &mut Frame) {
         ("e", "export JSON / XML"),
         ("c", "compare with a saved scan"),
         ("L", "full log (scrollable)"),
+        ("y", "copy IP (or ip:port) to clipboard"),
+        ("Y", "copy CVE IDs (port, or whole host)"),
         ("n Esc", "new scan"),
         ("q", "quit"),
         ("Ctrl-C", "quit immediately"),

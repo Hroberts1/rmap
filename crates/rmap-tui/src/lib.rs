@@ -6,6 +6,7 @@
 
 mod app;
 mod filter;
+mod clipboard;
 mod input;
 mod limits;
 mod log_view;
@@ -18,7 +19,7 @@ mod theme;
 mod rescan;
 mod ui;
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
@@ -64,6 +65,9 @@ fn event_loop(terminal: &mut Term, rt: Handle) -> io::Result<()> {
                 _ => {}
             }
         }
+        if let Some(text) = app.clipboard.take() {
+            copy_to_clipboard(terminal, &text);
+        }
         app.drain_events();
         // Info and above flush as written; this catches buffered debug lines.
         if last_flush.elapsed() >= Duration::from_secs(1) {
@@ -73,6 +77,18 @@ fn event_loop(terminal: &mut Term, rt: Handle) -> io::Result<()> {
     }
     app.shutdown();
     Ok(())
+}
+
+/// Written straight to the terminal between frames; OSC 52 doesn't move
+/// the cursor or draw, so ratatui's screen state stays valid.
+fn copy_to_clipboard(terminal: &mut Term, text: &str) {
+    let Some(seq) = clipboard::osc52(text, std::env::var_os("TMUX").is_some()) else {
+        return;
+    };
+    let out = terminal.backend_mut();
+    if let Err(e) = out.write_all(seq.as_bytes()).and_then(|()| out.flush()) {
+        rmap_log::warn!("clipboard write failed: {e}");
+    }
 }
 
 fn setup() -> io::Result<Term> {
