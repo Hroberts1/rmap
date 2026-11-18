@@ -100,6 +100,8 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         timing_hint,
         max_rate,
         discovery,
+        names,
+        dns_server,
         services,
         vulns,
         shortcuts,
@@ -114,7 +116,9 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -130,6 +134,7 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         (Field::ScanType, scan_type),
         (Field::Timing, timing),
         (Field::Discovery, discovery),
+        (Field::Names, names),
         (Field::Services, services),
         (Field::Vulns, vulns),
     ];
@@ -237,6 +242,31 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
             Span::raw(check),
         ])),
         discovery,
+    );
+
+    let names_check = if form.resolve_names {
+        "[x] look up names: reverse DNS, NetBIOS, mDNS"
+    } else {
+        "[ ] show addresses only"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            label(Field::Names, "Names"),
+            Span::raw(names_check),
+        ])),
+        names,
+    );
+    text_field(
+        frame,
+        dns_server,
+        Field::DnsServer,
+        "DNS server",
+        &form.dns_server,
+        if cfg!(unix) {
+            "system resolver (or e.g. the client's DC: 10.0.0.10)"
+        } else {
+            "e.g. the client's DC, 10.0.0.10 (needed for DNS names)"
+        },
     );
 
     let services_check = if form.service_detection {
@@ -667,6 +697,7 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
     frame.render_widget(block, area);
 
     let mut info_lines = vec![host_info(host)];
+    info_lines.extend(crate::names::detail_line(host));
     info_lines.extend(crate::mac::detail_line(host));
     let [info, ports, footer] = Layout::vertical([
         Constraint::Length(info_lines.len() as u16),

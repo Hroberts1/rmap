@@ -62,6 +62,15 @@ pub struct MacChange {
     pub new: MacAddr,
 }
 
+/// A host whose name changed: usually a different device now has the
+/// address, or a DNS record went stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameChange {
+    pub ip: IpAddr,
+    pub old: String,
+    pub new: String,
+}
+
 /// Everything that differs between two scans, each list sorted by address
 /// then port.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -76,6 +85,8 @@ pub struct ScanDiff {
     pub services: Vec<ServiceChange>,
     /// Only when both scans learned a MAC for the host.
     pub macs: Vec<MacChange>,
+    /// Only when both scans have a name for the host; case is ignored.
+    pub names: Vec<NameChange>,
 }
 
 impl ScanDiff {
@@ -88,6 +99,7 @@ impl ScanDiff {
             && self.port_states.is_empty()
             && self.services.is_empty()
             && self.macs.is_empty()
+            && self.names.is_empty()
     }
 
     /// Total number of changes.
@@ -100,6 +112,7 @@ impl ScanDiff {
             + self.port_states.len()
             + self.services.len()
             + self.macs.len()
+            + self.names.len()
     }
 }
 
@@ -161,6 +174,15 @@ pub fn diff(old: &ScanReport, new: &ScanReport) -> ScanDiff {
                     && old != new
                 {
                     d.macs.push(MacChange { ip: *ip, old, new });
+                }
+                if let (Some(old), Some(new)) = (&o.hostname, &n.hostname)
+                    && !old.eq_ignore_ascii_case(new)
+                {
+                    d.names.push(NameChange {
+                        ip: *ip,
+                        old: old.clone(),
+                        new: new.clone(),
+                    });
                 }
                 compare_ports(*ip, o, n, &mut d)
             }
@@ -427,6 +449,19 @@ impl ScanDiff {
                 })
                 .collect(),
         );
+        section(
+            "Name changed",
+            self.names.len(),
+            self.names
+                .iter()
+                .map(|c| {
+                    line(
+                        DiffKind::Changed,
+                        format!("~ {}  {} → {}", c.ip, c.old, c.new),
+                    )
+                })
+                .collect(),
+        );
         out
     }
 }
@@ -513,6 +548,25 @@ mod tests {
         );
         b.mac = a.mac;
         assert!(diff(&report(vec![a]), &report(vec![b])).is_empty());
+    }
+
+    #[test]
+    fn name_changes_only_when_both_sides_have_one() {
+        let mut a = host("10.0.0.1", UP, &[]);
+        let mut b = host("10.0.0.1", UP, &[]);
+        a.hostname = Some("FRONTDESK".into());
+        let d = diff(&report(vec![a.clone()]), &report(vec![b.clone()]));
+        assert!(d.is_empty(), "one side without a name is not a change");
+        b.hostname = Some("frontdesk".into());
+        let d = diff(&report(vec![a.clone()]), &report(vec![b.clone()]));
+        assert!(d.is_empty(), "case is ignored");
+        b.hostname = Some("LAPTOP-12".into());
+        let d = diff(&report(vec![a.clone()]), &report(vec![b.clone()]));
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            d.lines().last().unwrap().text,
+            "~ 10.0.0.1  FRONTDESK → LAPTOP-12"
+        );
     }
 
     #[test]

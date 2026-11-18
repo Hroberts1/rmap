@@ -62,6 +62,15 @@ impl ReportBuilder {
                 }
                 None => self.orphans += 1,
             },
+            ScanEvent::Hostnames { ip, names } => match self.hosts.get_mut(ip) {
+                Some(h) => {
+                    if h.hostname.is_none() {
+                        h.hostname = names.first().map(|n| n.name.clone());
+                    }
+                    h.names = names.clone();
+                }
+                None => self.orphans += 1,
+            },
             ScanEvent::Port { ip, result } => {
                 let Some(host) = self.hosts.get_mut(ip) else {
                     self.orphans += 1;
@@ -201,6 +210,8 @@ pub(crate) mod tests {
             service_detection: true,
             exclude: String::new(),
             max_rate: None,
+            resolve_names: true,
+            dns_server: None,
         }
     }
 
@@ -375,6 +386,37 @@ pub(crate) mod tests {
             h.mac.is_some() && h.vendor.is_none(),
             "randomised: no vendor"
         );
+        assert_eq!(b.orphans(), 1);
+    }
+
+    #[test]
+    fn hostnames_fill_names_and_an_empty_hostname() {
+        use rmap_core::{HostName, NameSource};
+        let mut b = ReportBuilder::new(config(), 0);
+        host(&mut b, "10.0.0.2", HostState::Up);
+        b.apply(&ScanEvent::Host {
+            ip: ip("10.0.0.3"),
+            hostname: Some("typed.lan".into()),
+            state: HostState::Up,
+            rtt: None,
+        });
+        let names = vec![
+            HostName::new("pc.corp.lan", NameSource::Dns).unwrap(),
+            HostName::new("PC", NameSource::Netbios).unwrap(),
+        ];
+        for addr in ["10.0.0.2", "10.0.0.3", "10.9.9.9"] {
+            b.apply(&ScanEvent::Hostnames {
+                ip: ip(addr),
+                names: names.clone(),
+            });
+        }
+        let r = b.report();
+        let h = r.host(ip("10.0.0.2")).unwrap();
+        assert_eq!(h.hostname.as_deref(), Some("pc.corp.lan"));
+        assert_eq!(h.names, names);
+        let h = r.host(ip("10.0.0.3")).unwrap();
+        assert_eq!(h.hostname.as_deref(), Some("typed.lan"), "typed name kept");
+        assert_eq!(h.names.len(), 2);
         assert_eq!(b.orphans(), 1);
     }
 

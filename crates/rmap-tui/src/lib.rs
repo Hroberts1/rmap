@@ -12,6 +12,7 @@ mod limits;
 mod log_view;
 mod mac;
 mod mouse;
+mod names;
 mod profiles;
 mod rate;
 mod report;

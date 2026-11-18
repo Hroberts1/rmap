@@ -106,6 +106,7 @@ mod tests {
             state: HostState::Up,
             rtt: None,
             mac: None,
+            names: Vec::new(),
             open: ports
                 .iter()
                 .map(|&p| PortResult::new(p, Protocol::Tcp, PortState::Open, None))

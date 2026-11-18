@@ -1,0 +1,15 @@
+[package]
+name = "rmap-names"
+description = "Host name lookup for rmap: reverse DNS, NetBIOS and mDNS, written from scratch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmap-core = { workspace = true }
+rmap-log = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }

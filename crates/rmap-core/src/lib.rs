@@ -2,6 +2,7 @@
 //! port lists, timing templates and scan results.
 
 pub mod mac;
+pub mod names;
 pub mod ports;
 pub mod result;
 pub mod scan;
@@ -11,6 +12,7 @@ pub mod timing;
 pub mod vuln;
 
 pub use mac::MacAddr;
+pub use names::{HostName, NameSource};
 pub use ports::{PortList, service_name};
 pub use result::{HostState, PortResult, PortState, Protocol, ScanEvent};
 pub use scan::ScanType;

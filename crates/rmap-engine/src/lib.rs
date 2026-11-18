@@ -20,6 +20,7 @@
 
 mod backend;
 pub mod exclude;
+mod names;
 pub mod rate;
 pub mod raw;
 pub mod rtt;
@@ -68,6 +69,11 @@ pub struct ScanConfig {
     /// port probes and service detection each count as one). `None` means
     /// no cap beyond the timing template.
     pub max_rate: Option<u32>,
+    /// Look up each live host's names: reverse DNS, NetBIOS and mDNS.
+    pub resolve_names: bool,
+    /// DNS server for reverse lookups. `None` uses the system's resolver
+    /// where it can be read (Unix); without one, reverse DNS is skipped.
+    pub dns_server: Option<IpAddr>,
 }
 
 impl ScanConfig {
@@ -83,7 +89,7 @@ impl ScanConfig {
             }
         };
         format!(
-            "targets=[{}] exclude=[{}] max_rate={} ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={} vuln_matching={}",
+            "targets=[{}] exclude=[{}] max_rate={} ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={} vuln_matching={} resolve_names={} dns_server={}",
             list(&self.targets),
             list(&self.exclude),
             self.max_rate
@@ -99,6 +105,9 @@ impl ScanConfig {
             self.discovery,
             self.service_detection,
             self.vuln_matching,
+            self.resolve_names,
+            self.dns_server
+                .map_or("system".to_string(), |ip| ip.to_string()),
         )
     }
 }
@@ -234,6 +243,8 @@ struct Shared {
     /// Present when vulnerability matching is on and there is a service
     /// detector to feed it CPEs.
     vulns: Option<vuln::Matching>,
+    /// Present when name lookup is on.
+    naming: Option<names::Naming>,
     tx: UnboundedSender<ScanEvent>,
     progress: Arc<Progress>,
     stats: Arc<Stats>,
@@ -317,6 +328,19 @@ async fn run(
         ports_per_host: per_host,
     });
 
+    let naming = config
+        .resolve_names
+        .then(|| names::Naming::new(config.dns_server, &config.timing));
+    if let Some(n) = &naming {
+        rmap_log::info!("{}", n.describe());
+        if n.dns.is_none() {
+            let _ = tx.send(ScanEvent::Warning(
+                "no DNS server found for reverse lookups; set one on the setup form to get DNS names"
+                    .into(),
+            ));
+        }
+    }
+
     let host_slots = Arc::new(Semaphore::new(config.timing.host_parallelism));
     let shared = Arc::new(Shared {
         ports: config.ports.as_slice().into(),
@@ -330,6 +354,7 @@ async fn run(
             .service_detection
             .then(|| service::Detection::new(config.timing)),
         vulns: (config.service_detection && config.vuln_matching).then(vuln::Matching::new),
+        naming,
         tx,
         progress,
         stats,
@@ -510,6 +535,12 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         return;
     }
 
+    // Names are looked up alongside the port scan, and in before HostDone.
+    let naming = shared
+        .naming
+        .clone()
+        .map(|n| names::LookupTask::spawn(ip, n, shared.clone()));
+
     let host_rtt = Arc::new(rtt::HostRtt::seeded(rtt));
     rmap_log::debug!(
         "host {ip} probe timeout starts at {:?}",
@@ -594,6 +625,12 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         if let Err(e) = r {
             note_join_error(e, &format!("{ip}"), shared);
         }
+    }
+
+    if let Some(task) = naming
+        && let Err(e) = task.finish().await
+    {
+        note_join_error(e, &format!("{ip} name lookup"), shared);
     }
 
     let (closed, filtered) = (

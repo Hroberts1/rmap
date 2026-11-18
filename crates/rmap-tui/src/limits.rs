@@ -29,9 +29,36 @@ pub fn parse_max_rate(input: &str) -> Result<Option<u32>, String> {
     }
 }
 
+/// The DNS server field: an IP address, or empty for the system's resolver.
+pub fn parse_dns_server(input: &str) -> Result<Option<std::net::IpAddr>, String> {
+    let s = input.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    s.parse()
+        .map(Some)
+        .map_err(|_| format!("{s}: use an IP address such as 10.0.0.10, or leave empty"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_server_is_an_address_or_empty() {
+        assert_eq!(parse_dns_server("  "), Ok(None));
+        assert_eq!(
+            parse_dns_server(" 10.0.0.10 "),
+            Ok(Some("10.0.0.10".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_dns_server("2001:db8::53"),
+            Ok(Some("2001:db8::53".parse().unwrap()))
+        );
+        for bad in ["dc01.corp.lan", "10.0.0.10:53", "10.0.0", "\u{1b}[2J"] {
+            assert!(parse_dns_server(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn max_rate_accepts_numbers_and_empty() {
@@ -163,6 +190,45 @@ mod tests {
         app.form.focus = Field::Exclude;
         app.on_paste("\r\n192.0.2.10\n192.0.2.11\n");
         assert_eq!(app.form.exclude, "192.0.2.9,192.0.2.10,192.0.2.11");
+    }
+
+    #[test]
+    fn name_fields_toggle_validate_and_reach_the_config() {
+        let (_rt, mut app) = app();
+        app.form.resolve_names = true;
+        app.form.focus = Field::Names;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.form.resolve_names);
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.form.resolve_names);
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.form.focus, Field::DnsServer);
+        app.on_paste("dc01.corp.lan\nignored");
+        app.form.targets = "192.168.50.0/30".into();
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.screen, Screen::Setup));
+        assert_eq!(app.form.focus, Field::DnsServer);
+        let screen = render(&mut app, 80, 24);
+        for want in [
+            "Names",
+            "reverse DNS, NetBIOS, mDNS",
+            "DNS server: dc01.corp.lan",
+        ] {
+            assert!(screen.contains(want), "missing {want:?}\n{screen}");
+        }
+
+        app.form.dns_server = " 10.0.0.10 ".into();
+        app.form.discovery = false;
+        // Names on with the scan stopped at once: no lookups go anywhere
+        // beyond the private test range.
+        app.form.resolve_names = false;
+        press(&mut app, KeyCode::Enter);
+        let view = app.scan.as_mut().expect("scan started");
+        view.scan.stop();
+        view.stopped = true;
+        let config = view.report.report().config;
+        assert_eq!(config.dns_server, Some("10.0.0.10".parse().unwrap()));
+        assert!(!config.resolve_names);
     }
 
     #[test]

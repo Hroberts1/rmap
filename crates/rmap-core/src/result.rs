@@ -115,6 +115,13 @@ pub enum ScanEvent {
     /// discovery. Sent after `Host`, and only for hosts on a directly
     /// connected Ethernet subnet scanned with raw sockets.
     Mac { ip: IpAddr, mac: crate::MacAddr },
+    /// Names the host answered to: reverse DNS, NetBIOS and mDNS, best
+    /// first. Sent after `Host` (and `Mac`), possibly while its ports are
+    /// still being scanned, and never when `names` would be empty.
+    Hostnames {
+        ip: IpAddr,
+        names: Vec<crate::HostName>,
+    },
     /// An open (or open|filtered) port. Closed and filtered ports are
     /// counted in `HostDone` instead, so large scans don't flood the UI.
     Port { ip: IpAddr, result: PortResult },

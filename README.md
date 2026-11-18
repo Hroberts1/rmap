@@ -212,6 +212,7 @@ crates/
 ├── rmap-detect   service detection: probes, matcher, TLS, CPEs
 ├── rmap-log      local log files and crash reports (no dependencies)
 ├── rmap-oui      MAC address vendor lookup, hand-written table (no dependencies)
+├── rmap-names    host names: reverse DNS, NetBIOS and mDNS lookups (tokio only)
 ├── rmap-packet   Ethernet/ARP/IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 building and parsing (no dependencies)
 ├── rmap-report   scan reports: JSON, Nmap XML, Markdown, CSV and HTML export, saved scans, diffs
 ├── rmap-vuln     vulnerability matching: CPE -> CVE lookup against a local database (no dependencies beyond rmap-core)
@@ -261,6 +262,12 @@ Each host keeps a smoothed round-trip time and its variation (SRTT/RTTVAR, as in
 ### MAC vendor lookup
 
 When ARP discovers a host's hardware address, the host detail pane shows it with the vendor, if known: `mac 00:11:32:aa:bb:cc · Synology`. The table (`crates/rmap-oui`) is small and hand-written - vendors common on small-business and home networks, only prefixes rmap is sure of - not the IEEE registry, so an unlisted prefix means "not in this table," not "unregistered." A locally administered address (randomised Wi-Fi MACs, most VMs and containers) is reported as "random MAC" instead of guessed, since its prefix isn't a real vendor's. A host with no hostname but a recognised vendor shows the vendor name in the host list in its place.
+
+### Host names
+
+With **Names** ticked on the setup form (the default), rmap looks up every live host's names while its ports are scanned, from three sources at once: reverse DNS (a PTR query), the host's NetBIOS name table (UDP 137) and its own mDNS responder (UDP 5353). No single one names everything: DNS covers domain-joined and DHCP-registered machines, NetBIOS covers Windows PCs, Samba, NAS boxes and many printers, and mDNS covers Macs, phones, Linux, printers and IoT. The best name fills the host list (DNS first, then NetBIOS, then mDNS); the detail pane lists all of them with their source, e.g. `names frontdesk.corp.lan (DNS) · FRONTDESK (NetBIOS)`, which makes a stale DNS record easy to spot. A name typed as the target is kept.
+
+Reverse DNS uses the **DNS server** field if set, otherwise the system resolver from `/etc/resolv.conf`. Windows keeps its resolver where rmap can't read it without extra dependencies, so there reverse DNS needs the field set (for example to the client's domain controller); NetBIOS and mDNS work either way. Each lookup is one small UDP packet that waits its turn under the rate cap, loopback targets skip reverse DNS, and names from the network are cleaned of control characters before they're shown or saved. Names go into every export, and the scan diff reports a host whose name changed.
 
 ## Service detection
 

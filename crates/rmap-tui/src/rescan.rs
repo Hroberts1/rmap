@@ -51,6 +51,8 @@ fn rescan_config(ip: IpAddr, original: &ConfigSummary) -> ScanConfig {
         // fragile device is no harder on it than the first pass.
         exclude: Vec::new(),
         max_rate: original.max_rate,
+        resolve_names: original.resolve_names,
+        dns_server: original.dns_server,
     }
 }
 
@@ -279,12 +281,16 @@ mod tests {
             service_detection: false,
             exclude: String::new(),
             max_rate: Some(50),
+            resolve_names: true,
+            dns_server: Some("10.0.0.10".parse().unwrap()),
         };
         let c = rescan_config("10.0.0.7".parse().unwrap(), &summary);
         assert_eq!(c.ports.len(), 65_535);
         assert_eq!((c.scan_type, c.timing.level), (ScanType::Udp, 4));
         assert!(c.service_detection && c.vuln_matching && !c.discovery);
         assert_eq!(c.max_rate, Some(50));
+        assert!(c.resolve_names);
+        assert_eq!(c.dns_server, Some("10.0.0.10".parse().unwrap()));
         assert_eq!(c.targets[0].to_string(), "10.0.0.7");
         let c = rescan_config("::1".parse().unwrap(), &summary);
         assert_eq!(

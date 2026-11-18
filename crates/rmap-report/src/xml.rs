@@ -310,13 +310,26 @@ fn write_host(w: &mut XmlWriter, h: &HostReport, start: &str, end: &str) {
         }
         w.empty("address", &attrs);
     }
-    match &h.hostname {
-        Some(name) => {
-            w.start("hostnames", &[]);
+    // Nmap's format knows user-typed and PTR names only, so NetBIOS and
+    // mDNS names appear here only when one is the host's main name.
+    let extra_dns = h
+        .names
+        .iter()
+        .filter(|n| n.source == rmap_core::NameSource::Dns && Some(&n.name) != h.hostname.as_ref());
+    let names: Vec<&str> = h
+        .hostname
+        .iter()
+        .map(String::as_str)
+        .chain(extra_dns.map(|n| n.name.as_str()))
+        .collect();
+    if names.is_empty() {
+        w.empty("hostnames", &[]);
+    } else {
+        w.start("hostnames", &[]);
+        for name in names {
             w.empty("hostname", &[("name", name), ("type", "PTR")]);
-            w.end();
         }
-        None => w.empty("hostnames", &[]),
+        w.end();
     }
 
     if h.is_up() && h.ports.is_empty() && h.closed == 0 && h.filtered == 0 {

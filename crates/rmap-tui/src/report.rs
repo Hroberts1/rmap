@@ -83,6 +83,8 @@ pub fn config_summary(targets: &str, exclude: &str, config: &ScanConfig) -> Conf
         service_detection: config.service_detection,
         exclude: exclude.trim().to_string(),
         max_rate: config.max_rate,
+        resolve_names: config.resolve_names,
+        dns_server: config.dns_server,
     }
 }
 

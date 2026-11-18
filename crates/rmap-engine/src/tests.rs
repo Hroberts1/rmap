@@ -34,6 +34,8 @@ fn config(targets: &str, ports: &str, timing: Timing, discovery: bool) -> ScanCo
         vuln_matching: false,
         exclude: Vec::new(),
         max_rate: None,
+        resolve_names: false,
+        dns_server: None,
     }
 }
 
@@ -1051,6 +1053,43 @@ fn describe_includes_scope_and_rate() {
             .describe()
             .contains("max_rate=unlimited")
     );
+}
+
+// ---------------------------------------------------------- host names ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn name_lookup_runs_with_the_port_scan_and_reports_in_order() {
+    // Loopback skips reverse DNS, so nothing leaves the machine: NetBIOS
+    // and mDNS go to 127.0.0.1 and almost always find nobody there.
+    let open = listener().await;
+    let c = ScanConfig {
+        resolve_names: true,
+        dns_server: Some("192.0.2.53".parse().unwrap()),
+        ..config("127.0.0.1", &open.to_string(), patient(), false)
+    };
+    assert!(
+        c.describe()
+            .contains("resolve_names=true dns_server=192.0.2.53")
+    );
+    let out = run_scan(c).await;
+    assert!(out.finished());
+    assert_eq!(out.open_ports().len(), 1);
+    let at = |pred: &dyn Fn(&ScanEvent) -> bool| out.events.iter().position(pred);
+    let host = at(&|e| matches!(e, ScanEvent::Host { .. })).unwrap();
+    let done = at(&|e| matches!(e, ScanEvent::HostDone { .. })).unwrap();
+    if let Some(names) = at(&|e| matches!(e, ScanEvent::Hostnames { .. })) {
+        // Something on this machine answered; it must still be in order.
+        assert!(host < names && names < done, "{:?}", out.events);
+    }
+}
+
+#[test]
+fn naming_picks_the_users_dns_server_and_a_sane_wait() {
+    let t = Timing::template(5);
+    let n = names::Naming::new(Some("10.0.0.10".parse().unwrap()), &t);
+    assert_eq!(n.dns, Some("10.0.0.10:53".parse().unwrap()));
+    assert!(n.wait >= Duration::from_millis(500) && n.wait <= Duration::from_secs(2));
+    assert!(n.describe().contains("reverse DNS via 10.0.0.10:53"));
 }
 
 // ---------------------------------------------------- adaptive timeouts ---

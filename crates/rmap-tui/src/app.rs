@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rmap_core::{
-    HostState, MacAddr, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets,
+    HostName, HostState, MacAddr, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets,
 };
 use rmap_engine::{Scan, ScanConfig};
 use rmap_report::{ReportBuilder, ScanStore, unix_millis_now};
@@ -34,12 +34,14 @@ pub enum Field {
     Timing,
     MaxRate,
     Discovery,
+    Names,
+    DnsServer,
     Services,
     Vulns,
 }
 
 impl Field {
-    const ALL: [Field; 9] = [
+    const ALL: [Field; 11] = [
         Field::Targets,
         Field::Exclude,
         Field::Ports,
@@ -47,6 +49,8 @@ impl Field {
         Field::Timing,
         Field::MaxRate,
         Field::Discovery,
+        Field::Names,
+        Field::DnsServer,
         Field::Services,
         Field::Vulns,
     ];
@@ -72,6 +76,10 @@ pub struct Form {
     pub scan_type: ScanType,
     pub timing: u8,
     pub discovery: bool,
+    /// Look up host names (reverse DNS, NetBIOS, mDNS).
+    pub resolve_names: bool,
+    /// DNS server for reverse lookups; empty means the system's.
+    pub dns_server: TextInput,
     pub service_detection: bool,
     /// Look up detected services' CPEs in the local CVE database (M4).
     /// Only takes effect with `service_detection` also on - there is
@@ -91,6 +99,9 @@ impl Default for Form {
             scan_type: ScanType::Connect,
             timing: 3,
             discovery: true,
+            // Off in tests: their scans must not query the real DNS server.
+            resolve_names: !cfg!(test),
+            dns_server: TextInput::default(),
             service_detection: false,
             vuln_matching: false,
             focus: Field::Targets,
@@ -109,6 +120,9 @@ pub struct HostRow {
     pub done: bool,
     /// Learned over ARP; only on the local subnet with raw sockets.
     pub mac: Option<MacAddr>,
+    /// Names the host answered to, best first. The first also fills
+    /// `hostname` when the user didn't type one.
+    pub names: Vec<HostName>,
 }
 
 /// Which results pane the arrow keys move through.
@@ -292,6 +306,7 @@ impl ScanView {
                         filtered: 0,
                         done: state == HostState::Down,
                         mac: None,
+                        names: Vec::new(),
                     },
                 );
                 // With a filter on, drain_events picks the first match instead.
@@ -302,6 +317,15 @@ impl ScanView {
             ScanEvent::Mac { ip, mac } => match self.hosts.get_mut(&ip) {
                 Some(host) => host.mac = Some(mac),
                 None => rmap_log::warn!("MAC for {ip} arrived before its host"),
+            },
+            ScanEvent::Hostnames { ip, names } => match self.hosts.get_mut(&ip) {
+                Some(host) => {
+                    if host.hostname.is_none() {
+                        host.hostname = names.first().map(|n| n.name.clone());
+                    }
+                    host.names = names;
+                }
+                None => rmap_log::warn!("names for {ip} arrived before its host"),
             },
             ScanEvent::Port { ip, result } => match self.hosts.get_mut(&ip) {
                 Some(host) => {
@@ -553,6 +577,9 @@ impl App {
             Field::MaxRate => form
                 .max_rate
                 .insert_str(pasted.lines().next().unwrap_or("").trim()),
+            Field::DnsServer => form
+                .dns_server
+                .insert_str(pasted.lines().next().unwrap_or("").trim()),
             _ => {}
         }
     }
@@ -624,6 +651,14 @@ impl App {
                 }
                 Field::MaxRate => {
                     form.max_rate.handle_key(&key);
+                }
+                Field::DnsServer => {
+                    form.dns_server.handle_key(&key);
+                }
+                Field::Names => {
+                    if matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        form.resolve_names = !form.resolve_names;
+                    }
                 }
                 Field::Timing => match code {
                     KeyCode::Left | KeyCode::Char('-') => {
@@ -806,6 +841,15 @@ impl App {
                 return;
             }
         };
+        let dns_server = match crate::limits::parse_dns_server(&form.dns_server) {
+            Ok(s) => s,
+            Err(e) => {
+                rmap_log::info!("rejected DNS server {:?}: {e}", form.dns_server);
+                form.error = Some(format!("DNS server: {e}"));
+                form.focus = Field::DnsServer;
+                return;
+            }
+        };
         form.error = None;
         let public: Vec<String> = targets
             .iter()
@@ -822,6 +866,8 @@ impl App {
             vuln_matching: form.vuln_matching,
             exclude,
             max_rate,
+            resolve_names: form.resolve_names,
+            dns_server,
         };
         if public.is_empty() {
             self.launch(config);
@@ -1021,6 +1067,8 @@ mod tests {
             Field::Timing,
             Field::MaxRate,
             Field::Discovery,
+            Field::Names,
+            Field::DnsServer,
             Field::Services,
             Field::Vulns,
             Field::Targets,

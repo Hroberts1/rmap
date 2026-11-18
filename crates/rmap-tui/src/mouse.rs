@@ -79,7 +79,7 @@ impl App {
         // the Services/Vulns coupling stays in one place.
         if matches!(
             field,
-            Field::ScanType | Field::Discovery | Field::Services | Field::Vulns
+            Field::ScanType | Field::Discovery | Field::Names | Field::Services | Field::Vulns
         ) {
             self.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         }

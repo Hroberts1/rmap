@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rmap_core::{HostState, MacAddr, PortResult, PortState, ScanType};
+use rmap_core::{HostName, HostState, MacAddr, PortResult, PortState, ScanType};
 use rmap_log::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +61,12 @@ pub struct ConfigSummary {
     /// Cap on probes started per second; `None` means unlimited.
     #[serde(default)]
     pub max_rate: Option<u32>,
+    /// Host names were looked up (reverse DNS, NetBIOS, mDNS).
+    #[serde(default)]
+    pub resolve_names: bool,
+    /// DNS server used for reverse lookups, if the user chose one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_server: Option<IpAddr>,
 }
 
 /// One host's results.
@@ -88,6 +94,10 @@ pub struct HostReport {
     /// Vendor of `mac` from rmap's built-in OUI table, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vendor: Option<String>,
+    /// Names the host answered to (reverse DNS, NetBIOS, mDNS), best
+    /// first. The first also fills `hostname` when no name was typed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<HostName>,
 }
 
 impl HostReport {
@@ -103,6 +113,7 @@ impl HostReport {
             complete: state == HostState::Down,
             mac: None,
             vendor: None,
+            names: Vec::new(),
         }
     }
 

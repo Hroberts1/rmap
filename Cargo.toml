@@ -26,6 +26,7 @@ rmap-core = { path = "crates/rmap-core" }
 rmap-detect = { path = "crates/rmap-detect" }
 rmap-engine = { path = "crates/rmap-engine" }
 rmap-log = { path = "crates/rmap-log" }
+rmap-names = { path = "crates/rmap-names" }
 rmap-oui = { path = "crates/rmap-oui" }
 rmap-packet = { path = "crates/rmap-packet" }
 rmap-report = { path = "crates/rmap-report" }
