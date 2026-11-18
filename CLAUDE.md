@@ -34,6 +34,7 @@ These in `rmap-core` exist so parallel milestones agree on shapes. Extend them; 
 - `ScanEvent::Service { ip, protocol, port, service }`: detection results sent after the `Port` event
 - `Vulnerability { id, summary, severity, score, published }`
 - `ScanEvent::Vulnerabilities { ip, protocol, port, findings }`: sent after the `Service` event for that port, never sent when `findings` would be empty
+- `MacAddr` and `ScanEvent::Mac { ip, mac }`: the host's hardware address from its ARP reply, sent right after its `Host` event; only raw-socket discovery on a local Ethernet subnet learns one. Vendor lookup lives in `rmap-oui` (hand-written table, no IEEE registry)
 - `ScanConfig { .., scan_type, service_detection, vuln_matching }` in `rmap-engine`. SYN/UDP are implemented (raw backend in `rmap-engine/src/raw`, chosen in `backend.rs`, with unprivileged fallbacks). Service detection is implemented (`rmap-detect`, wired in via `rmap-engine/src/service.rs`). Vulnerability matching is implemented (`rmap-vuln`, wired in via `rmap-engine/src/vuln.rs`; has no effect without `service_detection`, since it needs that layer's CPEs). No placeholder warnings remain for any of the three in `rmap_engine::run`.
 
 ## Conventions

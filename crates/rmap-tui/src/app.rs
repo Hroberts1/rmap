@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rmap_core::{HostState, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets};
+use rmap_core::{
+    HostState, MacAddr, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets,
+};
 use rmap_engine::{Scan, ScanConfig};
 use rmap_report::{ReportBuilder, ScanStore, unix_millis_now};
 use tokio::runtime::Handle;
@@ -93,6 +95,8 @@ pub struct HostRow {
     pub closed: u32,
     pub filtered: u32,
     pub done: bool,
+    /// Learned over ARP; only on the local subnet with raw sockets.
+    pub mac: Option<MacAddr>,
 }
 
 /// Which results pane the arrow keys move through.
@@ -240,12 +244,17 @@ impl ScanView {
                         closed: 0,
                         filtered: 0,
                         done: state == HostState::Down,
+                        mac: None,
                     },
                 );
                 if self.selected.is_none() && state != HostState::Down {
                     self.selected = Some(ip);
                 }
             }
+            ScanEvent::Mac { ip, mac } => match self.hosts.get_mut(&ip) {
+                Some(host) => host.mac = Some(mac),
+                None => rmap_log::warn!("MAC for {ip} arrived before its host"),
+            },
             ScanEvent::Port { ip, result } => match self.hosts.get_mut(&ip) {
                 Some(host) => {
                     let key = (result.port, result.protocol);

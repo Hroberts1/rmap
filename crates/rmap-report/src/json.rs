@@ -118,6 +118,21 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mac_round_trips_and_old_files_still_load() {
+        let mut report = sample();
+        let text = to_string(&report).unwrap();
+        assert!(!text.contains("\"mac\""), "absent MACs aren't written");
+        report.hosts[0].mac = Some("00:11:32:aa:bb:cc".parse().unwrap());
+        report.hosts[0].vendor = Some("Synology".into());
+        let text = to_string(&report).unwrap();
+        assert!(text.contains("\"mac\": \"00:11:32:aa:bb:cc\""), "{text}");
+        assert_eq!(from_str(&text).unwrap(), report);
+
+        let bad = text.replace("00:11:32:aa:bb:cc", "00:11:32:aa:bb");
+        assert!(from_str(&bad).unwrap_err().contains("invalid MAC"));
+    }
+
+    #[test]
     fn rejects_newer_and_foreign_files() {
         let mut v: serde_json::Value =
             serde_json::from_str(&to_string(&sample()).unwrap()).unwrap();

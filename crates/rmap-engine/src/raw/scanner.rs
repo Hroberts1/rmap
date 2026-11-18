@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rmap_core::{PortResult, PortState, Protocol, ScanType, Timing};
+use rmap_core::{MacAddr, PortResult, PortState, Protocol, ScanType, Timing};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
@@ -90,7 +90,8 @@ struct Inner {
     send: AsyncFd<OwnedFd>,
     rate: RateLimiter,
     ports: Waiters<PortKey, Reply>,
-    pings: Waiters<Ipv4Addr, ()>,
+    /// Host replies; ARP replies carry the sender's hardware address.
+    pings: Waiters<Ipv4Addr, Option<MacAddr>>,
 }
 
 impl Inner {
@@ -109,8 +110,12 @@ impl Inner {
                 );
             }
             Matched::HostUp(ip) => {
-                let taken = self.pings.deliver(ip, ());
+                let taken = self.pings.deliver(ip, None);
                 rmap_log::trace!("host reply from {ip} wanted={taken}");
+            }
+            Matched::ArpReply { ip, mac } => {
+                let taken = self.pings.deliver(ip, Some(MacAddr(mac.0)));
+                rmap_log::trace!("ARP reply from {ip} is-at {mac} wanted={taken}");
             }
         }
     }
@@ -312,16 +317,17 @@ impl RawScanner {
     }
 
     /// Check whether `dst` is up: ARP on a directly connected subnet,
-    /// otherwise ICMP echo raced against the TCP connect ping.
+    /// otherwise ICMP echo raced against the TCP connect ping. Only ARP
+    /// learns the host's MAC address.
     pub(crate) async fn ping(
         self: &Arc<Self>,
         src: Ipv4Addr,
         dst: Ipv4Addr,
         timing: &Timing,
         stats: &Arc<Stats>,
-    ) -> Option<Duration> {
-        if let Some(rtt) = self.arp_ping(src, dst, timing).await {
-            return rtt;
+    ) -> Option<(Duration, Option<MacAddr>)> {
+        if let Some(answer) = self.arp_ping(src, dst, timing).await {
+            return answer;
         }
         let mut racers = JoinSet::new();
         let (me, t) = (self.clone(), *timing);
@@ -330,7 +336,7 @@ impl RawScanner {
         racers.spawn(async move { crate::tcp::ping(dst.into(), &t, &s).await });
         while let Some(done) = racers.join_next().await {
             if let Ok(Some(rtt)) = done {
-                return Some(rtt);
+                return Some((rtt, None));
             }
         }
         None
@@ -354,7 +360,7 @@ impl RawScanner {
                 }
             };
             rmap_log::trace!("sent echo request {src} -> {dst} try={try_no}");
-            if let Ok(Ok(())) = timeout(limit, reply).await {
+            if let Ok(Ok(_)) = timeout(limit, reply).await {
                 return Some(sent.elapsed());
             }
         }
@@ -369,7 +375,7 @@ impl RawScanner {
         src: Ipv4Addr,
         dst: Ipv4Addr,
         timing: &Timing,
-    ) -> Option<Option<Duration>> {
+    ) -> Option<Option<(Duration, Option<MacAddr>)>> {
         let iface = self.interfaces.iter().find(|i| {
             !i.loopback && i.addr == src && i.addr != dst && i.index != 0 && i.on_link(dst)
         })?;
@@ -386,8 +392,8 @@ impl RawScanner {
                 return None;
             }
             rmap_log::trace!("sent ARP who-has {dst} on {} try={try_no}", iface.name);
-            if let Ok(Ok(())) = timeout(limit, reply).await {
-                return Some(Some(sent.elapsed()));
+            if let Ok(Ok(mac)) = timeout(limit, reply).await {
+                return Some(Some((sent.elapsed(), mac)));
             }
         }
         Some(None)

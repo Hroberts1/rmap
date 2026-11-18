@@ -111,6 +111,10 @@ pub enum ScanEvent {
         state: HostState,
         rtt: Option<Duration>,
     },
+    /// The host's hardware address, learned from its ARP reply during
+    /// discovery. Sent after `Host`, and only for hosts on a directly
+    /// connected Ethernet subnet scanned with raw sockets.
+    Mac { ip: IpAddr, mac: crate::MacAddr },
     /// An open (or open|filtered) port. Closed and filtered ports are
     /// counted in `HostDone` instead, so large scans don't flood the UI.
     Port { ip: IpAddr, result: PortResult },
