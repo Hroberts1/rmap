@@ -13,6 +13,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::input::{TextInput, paste_as_list};
+use crate::mouse::HitMap;
 use crate::report::{Dialog, DiffView};
 
 /// Most engine events handled per frame, so a burst can't stall input.
@@ -171,7 +172,7 @@ impl ScanView {
         self.hosts.values().filter(|h| h.state == state).count()
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    pub(crate) fn move_selection(&mut self, delta: isize) {
         let visible = self.visible();
         if visible.is_empty() {
             return;
@@ -197,7 +198,7 @@ impl ScanView {
             .map_or(&[], |h| h.open.as_slice())
     }
 
-    fn move_port_selection(&mut self, delta: isize) {
+    pub(crate) fn move_port_selection(&mut self, delta: isize) {
         let n = self.selected_ports().len();
         if n == 0 {
             return;
@@ -342,6 +343,10 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// The key help overlay on the results screen.
     pub help: bool,
+    /// Whether the terminal should report mouse events; `m` toggles it.
+    pub mouse_capture: bool,
+    /// Clickable areas of the last frame, written by the renderer.
+    pub hits: HitMap,
     quit: bool,
 }
 
@@ -358,6 +363,8 @@ impl App {
             diff: None,
             confirm: None,
             help: false,
+            mouse_capture: true,
+            hits: HitMap::default(),
             quit: false,
         }
     }
@@ -593,6 +600,7 @@ impl App {
             KeyCode::Char('d') => view.show_down = !view.show_down,
             KeyCode::Char('e') => self.open_export(),
             KeyCode::Char('c') => self.open_compare(),
+            KeyCode::Char('m') => self.toggle_mouse_capture(),
             KeyCode::Down | KeyCode::Char('j') => view.move_focused(1),
             KeyCode::Up | KeyCode::Char('k') => view.move_focused(-1),
             KeyCode::PageDown => view.move_focused(10),

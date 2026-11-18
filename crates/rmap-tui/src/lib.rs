@@ -6,6 +6,7 @@
 
 mod app;
 mod input;
+mod mouse;
 mod report;
 mod report_ui;
 mod ui;
@@ -16,7 +17,8 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -46,14 +48,28 @@ pub fn run(rt: Handle) -> io::Result<()> {
 fn event_loop(terminal: &mut Term, rt: Handle) -> io::Result<()> {
     let mut app = App::new(rt);
     let mut last_flush = Instant::now();
+    // setup() turned capture on; App starts with it on too.
+    let mut captured = app.mouse_capture;
     while !app.should_quit() {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
                 Event::Paste(text) => app.on_paste(&text),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
                 Event::Resize(w, h) => rmap_log::debug!("terminal resized to {w}x{h}"),
                 _ => {}
+            }
+        }
+        if app.mouse_capture != captured {
+            captured = app.mouse_capture;
+            let result = if captured {
+                execute!(io::stdout(), EnableMouseCapture)
+            } else {
+                execute!(io::stdout(), DisableMouseCapture)
+            };
+            if let Err(e) = result {
+                rmap_log::warn!("could not change mouse capture: {e}");
             }
         }
         app.drain_events();
@@ -79,11 +95,17 @@ fn setup() -> io::Result<Term> {
     if let Err(e) = execute!(io::stdout(), EnableBracketedPaste) {
         rmap_log::debug!("bracketed paste unavailable: {e}");
     }
+    if let Err(e) = execute!(io::stdout(), EnableMouseCapture) {
+        rmap_log::debug!("mouse capture unavailable: {e}");
+    }
     Terminal::new(CrosstermBackend::new(io::stdout())).inspect_err(|_| restore())
 }
 
 /// Put the terminal back the way we found it. Safe to call more than once.
 fn restore() {
+    // First: on Windows this restores the console mode saved when capture
+    // was enabled (raw), so it must come before raw mode is turned off.
+    let _ = execute!(io::stdout(), DisableMouseCapture);
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(

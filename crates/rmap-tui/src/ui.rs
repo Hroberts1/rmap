@@ -11,15 +11,17 @@ use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, Vulnerabili
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
 use crate::input::TextInput;
+use crate::mouse::{HitMap, ListHit};
 
 pub(crate) const ACCENT: Color = Color::Cyan;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let mut hits = HitMap::default();
     match app.screen {
-        Screen::Setup => draw_setup(frame, app),
+        Screen::Setup => draw_setup(frame, app, &mut hits),
         Screen::Results => {
             if let Some(view) = app.scan.as_mut() {
-                draw_results(frame, view);
+                draw_results(frame, view, &mut hits);
             }
             if app.help {
                 draw_help(frame);
@@ -40,6 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(confirm) = app.confirm {
         draw_yes_no(frame, confirm);
     }
+    app.hits = hits;
 }
 
 pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -66,7 +69,7 @@ pub(crate) fn key_help(pairs: &[(&str, &str)]) -> Line<'static> {
 
 // ---------------------------------------------------------------- setup ---
 
-fn draw_setup(frame: &mut Frame, app: &App) {
+fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let form = &app.form;
     let area = centered(
         frame.area(),
@@ -110,6 +113,15 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     ])
     .margin(1)
     .areas(inner);
+    hits.fields = vec![
+        (Field::Targets, targets),
+        (Field::Ports, ports),
+        (Field::ScanType, scan_type),
+        (Field::Timing, timing),
+        (Field::Discovery, discovery),
+        (Field::Services, services),
+        (Field::Vulns, vulns),
+    ];
 
     let label = |field: Field, text: &'static str| {
         let style = if form.focus == field {
@@ -252,7 +264,7 @@ const STACK_BELOW: u16 = 100;
 /// Most log lines shown under the results; the panel shrinks to fit fewer.
 const LOG_ROWS: usize = 3;
 
-fn draw_results(frame: &mut Frame, view: &mut ScanView) {
+fn draw_results(frame: &mut Frame, view: &mut ScanView, hits: &mut HitMap) {
     let log_height = match view.log.len().min(LOG_ROWS) {
         0 => 0,
         n => n as u16 + 2,
@@ -274,8 +286,8 @@ fn draw_results(frame: &mut Frame, view: &mut ScanView) {
     } else {
         Layout::horizontal([Constraint::Percentage(36), Constraint::Percentage(64)]).areas(body)
     };
-    draw_host_table(frame, hosts, view);
-    draw_host_detail(frame, detail, view);
+    draw_host_table(frame, hosts, view, hits);
+    draw_host_detail(frame, detail, view, hits);
     if log_height > 0 {
         draw_log(frame, log, view);
     }
@@ -390,7 +402,7 @@ fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> 
     }
 }
 
-fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
+fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut HitMap) {
     let visible = view.visible();
     let focused = view.focus == Pane::Hosts;
 
@@ -482,6 +494,15 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
             .and_then(|s| visible.iter().position(|ip| *ip == s)),
     );
     frame.render_stateful_widget(table, area, &mut state);
+    // Rows start under the top border and header; one line per host.
+    let rows = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(2),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(3),
+    };
+    let shown = visible.iter().skip(state.offset()).copied().collect();
+    hits.hosts = Some(ListHit::new(area, rows, shown));
 
     if visible.is_empty() {
         let msg = if view.is_running() {
@@ -503,7 +524,7 @@ fn state_label(state: PortState) -> &'static str {
     }
 }
 
-fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView) {
+fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &mut HitMap) {
     let focused = view.focus == Pane::Ports;
     let Some((ip, host)) = view
         .selected
@@ -624,6 +645,20 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView) {
         .with_offset(view.port_offset)
         .with_selected(selected_row.filter(|_| focused));
     frame.render_stateful_widget(table, ports, &mut state);
+    // Map each drawn line (under the header) back to its port.
+    let lines = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &(first, last))| (first..=last).map(move |row| (i, row)))
+        .skip(state.offset())
+        .flat_map(|(i, row)| std::iter::repeat_n(i, heights[row]))
+        .collect();
+    let rows = Rect {
+        y: ports.y.saturating_add(1),
+        height: ports.height.saturating_sub(1),
+        ..ports
+    };
+    hits.ports = Some(ListHit::new(area, rows, lines));
 
     let mut notes: Vec<String> = Vec::new();
     match (above, below) {
@@ -801,6 +836,7 @@ fn draw_help(frame: &mut Frame) {
         ("s", "stop the scan"),
         ("e", "export JSON / XML"),
         ("c", "compare with a saved scan"),
+        ("m", "mouse on/off (off = select text)"),
         ("n Esc", "new scan"),
         ("q", "quit"),
         ("Ctrl-C", "quit immediately"),
@@ -817,6 +853,7 @@ fn draw_help(frame: &mut Frame) {
     lines.push(Line::default());
     lines.push(Line::from(" open? = open|filtered: no reply, may be open").dim());
     lines.push(Line::from(" !     = host has potential CVEs").dim());
+    lines.push(Line::from(" Shift-drag selects text while the mouse is on").dim());
     let area = centered(
         frame.area(),
         52.min(frame.area().width),
