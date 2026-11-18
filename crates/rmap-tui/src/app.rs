@@ -12,6 +12,7 @@ use rmap_report::{ReportBuilder, ScanStore, unix_millis_now};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::input::{TextInput, paste_as_list};
 use crate::report::{Dialog, DiffView};
 
 /// Most engine events handled per frame, so a burst can't stall input.
@@ -54,8 +55,8 @@ impl Field {
 }
 
 pub struct Form {
-    pub targets: String,
-    pub ports: String,
+    pub targets: TextInput,
+    pub ports: TextInput,
     pub scan_type: ScanType,
     pub timing: u8,
     pub discovery: bool,
@@ -71,7 +72,7 @@ pub struct Form {
 impl Default for Form {
     fn default() -> Self {
         Form {
-            targets: String::new(),
+            targets: TextInput::default(),
             ports: "common".into(),
             scan_type: ScanType::Connect,
             timing: 3,
@@ -94,6 +95,34 @@ pub struct HostRow {
     pub done: bool,
 }
 
+/// Which results pane the arrow keys move through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Hosts,
+    Ports,
+}
+
+/// A yes/no question shown before a destructive key takes effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    /// Stop the running scan and go back to the setup form.
+    StopAndLeave,
+    /// Quit while a scan is still running.
+    QuitRunning,
+    /// Quit from the setup form.
+    Quit,
+}
+
+impl Confirm {
+    pub fn question(self) -> &'static str {
+        match self {
+            Confirm::StopAndLeave => "Stop the running scan and start a new one?",
+            Confirm::QuitRunning => "A scan is still running. Stop it and quit?",
+            Confirm::Quit => "Quit rmap?",
+        }
+    }
+}
+
 pub struct ScanView {
     pub scan: Scan,
     pub summary: String,
@@ -112,6 +141,12 @@ pub struct ScanView {
     /// Where the scan was auto-saved, once it ended.
     pub saved: Option<PathBuf>,
     pub save_attempted: bool,
+    pub focus: Pane,
+    /// Selected open port (index into the selected host's `open`).
+    pub port_selected: usize,
+    /// First table row drawn in the port pane; kept by the renderer so the
+    /// view only scrolls when the selection would leave it.
+    pub port_offset: usize,
 }
 
 impl ScanView {
@@ -148,7 +183,34 @@ impl ScanView {
             Some(i) => (i as isize + delta).clamp(0, visible.len() as isize - 1) as usize,
             None => 0,
         };
+        if self.selected != Some(visible[next]) {
+            self.port_selected = 0;
+            self.port_offset = 0;
+        }
         self.selected = Some(visible[next]);
+    }
+
+    /// Open ports on the selected host.
+    pub fn selected_ports(&self) -> &[PortResult] {
+        self.selected
+            .and_then(|ip| self.hosts.get(&ip))
+            .map_or(&[], |h| h.open.as_slice())
+    }
+
+    fn move_port_selection(&mut self, delta: isize) {
+        let n = self.selected_ports().len();
+        if n == 0 {
+            return;
+        }
+        self.port_selected =
+            (self.port_selected as isize + delta).clamp(0, n as isize - 1) as usize;
+    }
+
+    fn move_focused(&mut self, delta: isize) {
+        match self.focus {
+            Pane::Hosts => self.move_selection(delta),
+            Pane::Ports => self.move_port_selection(delta),
+        }
     }
 
     pub(crate) fn log(&mut self, line: String) {
@@ -276,6 +338,10 @@ pub struct App {
     /// Export dialog or saved-scan picker over the results screen.
     pub dialog: Option<Dialog>,
     pub diff: Option<DiffView>,
+    /// A destructive key waiting on y/n.
+    pub confirm: Option<Confirm>,
+    /// The key help overlay on the results screen.
+    pub help: bool,
     quit: bool,
 }
 
@@ -290,6 +356,8 @@ impl App {
             store: crate::report::default_store(),
             dialog: None,
             diff: None,
+            confirm: None,
+            help: false,
             quit: false,
         }
     }
@@ -337,8 +405,17 @@ impl App {
             self.quit = true;
             return;
         }
+        if let Some(confirm) = self.confirm {
+            self.on_yes_no_key(confirm, key);
+            return;
+        }
         if self.pending.is_some() {
             self.on_confirm_key(key);
+            return;
+        }
+        if self.help {
+            // Any key closes the overlay; it doesn't fall through.
+            self.help = false;
             return;
         }
         if self.dialog.is_some() {
@@ -349,6 +426,52 @@ impl App {
             Screen::Setup => self.on_setup_key(key),
             Screen::Results => self.on_results_key(key),
             Screen::Diff => self.on_diff_key(key),
+        }
+    }
+
+    /// Bracketed paste. Multi-line text arrives here in one piece instead
+    /// of as keypresses, so a newline in it can't submit the form.
+    pub fn on_paste(&mut self, pasted: &str) {
+        rmap_log::debug!("paste of {} bytes", pasted.len());
+        if self.confirm.is_some() || self.pending.is_some() || self.help {
+            return;
+        }
+        if let Some(Dialog::Export(d)) = self.dialog.as_mut() {
+            d.path.push_str(pasted.lines().next().unwrap_or("").trim());
+            d.status = None;
+            return;
+        }
+        if !matches!(self.screen, Screen::Setup) || self.dialog.is_some() {
+            return;
+        }
+        let form = &mut self.form;
+        match form.focus {
+            Field::Targets => form.targets.insert_str(&paste_as_list(pasted)),
+            Field::Ports => form.ports.insert_str(&paste_as_list(pasted)),
+            _ => {}
+        }
+    }
+
+    fn on_yes_no_key(&mut self, confirm: Confirm, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.confirm = None;
+                rmap_log::info!("user confirmed: {confirm:?}");
+                match confirm {
+                    Confirm::Quit | Confirm::QuitRunning => self.quit = true,
+                    Confirm::StopAndLeave => {
+                        if let Some(view) = self.scan.as_mut()
+                            && view.is_running()
+                        {
+                            view.scan.stop();
+                            view.stopped = true;
+                        }
+                        self.screen = Screen::Setup;
+                    }
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.confirm = None,
+            _ => {}
         }
     }
 
@@ -371,24 +494,16 @@ impl App {
     fn on_setup_key(&mut self, key: KeyEvent) {
         let form = &mut self.form;
         match key.code {
-            KeyCode::Esc => self.quit = true,
+            KeyCode::Esc => self.confirm = Some(Confirm::Quit),
             KeyCode::Enter => self.submit(),
             KeyCode::Tab | KeyCode::Down => form.focus = form.focus.step(true),
             KeyCode::BackTab | KeyCode::Up => form.focus = form.focus.step(false),
             code => match form.focus {
-                Field::Targets | Field::Ports => {
-                    let text = if form.focus == Field::Targets {
-                        &mut form.targets
-                    } else {
-                        &mut form.ports
-                    };
-                    match code {
-                        KeyCode::Char(c) => text.push(c),
-                        KeyCode::Backspace => {
-                            text.pop();
-                        }
-                        _ => {}
-                    }
+                Field::Targets => {
+                    form.targets.handle_key(&key);
+                }
+                Field::Ports => {
+                    form.ports.handle_key(&key);
                 }
                 Field::Timing => match code {
                     KeyCode::Left | KeyCode::Char('-') => {
@@ -420,11 +535,19 @@ impl App {
                 Field::Services => {
                     if matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
                         form.service_detection = !form.service_detection;
+                        if !form.service_detection {
+                            form.vuln_matching = false;
+                        }
                     }
                 }
                 Field::Vulns => {
                     if matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
                         form.vuln_matching = !form.vuln_matching;
+                        // CVE matching needs detected versions; turn
+                        // Services on rather than accept a no-op setting.
+                        if form.vuln_matching {
+                            form.service_detection = true;
+                        }
                     }
                 }
             },
@@ -438,17 +561,30 @@ impl App {
         };
         match key.code {
             KeyCode::Char('q') => {
-                rmap_log::info!("quit from results screen");
-                self.quit = true;
+                if view.is_running() {
+                    self.confirm = Some(Confirm::QuitRunning);
+                } else {
+                    rmap_log::info!("quit from results screen");
+                    self.quit = true;
+                }
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 if view.is_running() {
-                    view.scan.stop();
-                    view.stopped = true;
+                    self.confirm = Some(Confirm::StopAndLeave);
+                } else {
+                    rmap_log::debug!("back to setup screen");
+                    self.screen = Screen::Setup;
                 }
-                rmap_log::debug!("back to setup screen");
-                self.screen = Screen::Setup;
             }
+            KeyCode::Char('?') => self.help = true,
+            KeyCode::Tab | KeyCode::BackTab => {
+                view.focus = match view.focus {
+                    Pane::Hosts => Pane::Ports,
+                    Pane::Ports => Pane::Hosts,
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => view.focus = Pane::Ports,
+            KeyCode::Left | KeyCode::Char('h') => view.focus = Pane::Hosts,
             KeyCode::Char('s') if view.is_running() => {
                 view.scan.stop();
                 view.stopped = true;
@@ -457,12 +593,12 @@ impl App {
             KeyCode::Char('d') => view.show_down = !view.show_down,
             KeyCode::Char('e') => self.open_export(),
             KeyCode::Char('c') => self.open_compare(),
-            KeyCode::Down | KeyCode::Char('j') => view.move_selection(1),
-            KeyCode::Up | KeyCode::Char('k') => view.move_selection(-1),
-            KeyCode::PageDown => view.move_selection(10),
-            KeyCode::PageUp => view.move_selection(-10),
-            KeyCode::Home | KeyCode::Char('g') => view.move_selection(isize::MIN / 2),
-            KeyCode::End | KeyCode::Char('G') => view.move_selection(isize::MAX / 2),
+            KeyCode::Down | KeyCode::Char('j') => view.move_focused(1),
+            KeyCode::Up | KeyCode::Char('k') => view.move_focused(-1),
+            KeyCode::PageDown => view.move_focused(10),
+            KeyCode::PageUp => view.move_focused(-10),
+            KeyCode::Home | KeyCode::Char('g') => view.move_focused(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => view.move_focused(isize::MAX / 2),
             _ => {}
         }
     }
@@ -547,6 +683,9 @@ impl App {
             report,
             saved: None,
             save_attempted: false,
+            focus: Pane::Hosts,
+            port_selected: 0,
+            port_offset: 0,
         });
         self.screen = Screen::Results;
     }
@@ -614,7 +753,7 @@ mod tests {
 
         let mut app = App::new(rt.handle().clone());
         app.form.targets = "127.0.0.1".into();
-        app.form.ports = port.to_string();
+        app.form.ports = port.to_string().into();
         app.form.discovery = false;
         press(&mut app, KeyCode::Enter);
         assert!(matches!(app.screen, Screen::Results));
@@ -785,6 +924,12 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.screen, Screen::Setup) && !app.should_quit());
         press(&mut app, KeyCode::Esc);
+        assert_eq!(app.confirm, Some(Confirm::Quit), "asks first");
+        assert!(render(&mut app, 80, 24).contains("Quit rmap?"));
+        press(&mut app, KeyCode::Char('n'));
+        assert!(!app.should_quit() && app.confirm.is_none());
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('y'));
         assert!(app.should_quit());
     }
 
@@ -1029,11 +1174,231 @@ mod tests {
         let (_rt, mut app) = app();
         start_slow_scan(&mut app);
         press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.confirm, Some(Confirm::StopAndLeave));
+        assert!(app.scan.as_ref().unwrap().is_running(), "nothing stops yet");
+        press(&mut app, KeyCode::Char('y'));
         assert!(matches!(app.screen, Screen::Setup));
         std::thread::sleep(Duration::from_millis(100));
         app.drain_events();
         let view = app.scan.as_ref().unwrap();
         assert!(view.stopped && !view.failed);
+    }
+
+    /// The review's sample: a NAS with five open ports, OpenSSH with two
+    /// CVEs, nginx with TLS, and an open|filtered port at the bottom.
+    fn nas_host(app: &mut App) -> IpAddr {
+        fake_results(app);
+        let view = app.scan.as_mut().unwrap();
+        let ip: IpAddr = "192.168.1.20".parse().unwrap();
+        view.apply(ScanEvent::Host {
+            ip,
+            hostname: Some("nas01.springer.local".into()),
+            state: HostState::Up,
+            rtt: Some(Duration::from_micros(1100)),
+        });
+        let open = rmap_core::PortState::Open;
+        for (port, state) in [
+            (22, open),
+            (80, open),
+            (443, open),
+            (445, open),
+            (5000, rmap_core::PortState::OpenFiltered),
+        ] {
+            view.apply(ScanEvent::Port {
+                ip,
+                result: PortResult::new(port, Protocol::Tcp, state, None),
+            });
+        }
+        view.apply(ScanEvent::Service {
+            ip,
+            protocol: Protocol::Tcp,
+            port: 22,
+            service: rmap_core::Service {
+                name: "ssh".into(),
+                product: Some("OpenSSH".into()),
+                version: Some("8.9p1".into()),
+                info: Some("protocol 2.0".into()),
+                os_hint: Some("Ubuntu Linux".into()),
+                cpes: vec!["cpe:2.3:a:openbsd:openssh:8.9:p1:*:*:*:*:*:*".into()],
+                ..Default::default()
+            },
+        });
+        let cve = |id: &str, summary: &str, severity, score| rmap_core::Vulnerability {
+            id: id.into(),
+            summary: summary.into(),
+            severity,
+            score: Some(score),
+            published: None,
+        };
+        view.apply(ScanEvent::Vulnerabilities {
+            ip,
+            protocol: Protocol::Tcp,
+            port: 22,
+            findings: vec![
+                cve(
+                    "CVE-2024-6387",
+                    "regreSSHion: unauthenticated remote code execution in sshd on glibc-based Linux systems",
+                    rmap_core::VulnSeverity::High,
+                    8.1,
+                ),
+                cve(
+                    "CVE-2023-48795",
+                    "Terrapin: prefix truncation weakens SSH channel integrity",
+                    rmap_core::VulnSeverity::Medium,
+                    5.9,
+                ),
+            ],
+        });
+        view.apply(ScanEvent::Service {
+            ip,
+            protocol: Protocol::Tcp,
+            port: 443,
+            service: rmap_core::Service {
+                name: "https".into(),
+                product: Some("nginx".into()),
+                version: Some("1.24.0".into()),
+                info: Some("TLS cert CN=nas01.springer.local".into()),
+                ..Default::default()
+            },
+        });
+        view.selected = Some(ip);
+        ip
+    }
+
+    #[test]
+    fn cve_lines_are_whole_at_80_and_120_columns() {
+        let (_rt, mut app) = app();
+        nas_host(&mut app);
+        for (w, h) in [(120, 32), (80, 24)] {
+            let screen = render(&mut app, w, h);
+            for needle in [
+                "CVE-2024-6387",
+                "regreSSHion",
+                "glibc-based", // the end of the summary, wrapped
+                "HIGH",
+                "OpenSSH 8.9p1",
+                "protocol 2.0",
+                "nas01.springer.local",
+            ] {
+                assert!(screen.contains(needle), "{needle} at {w}x{h}:\n{screen}");
+            }
+            assert!(
+                !screen
+                    .lines()
+                    .any(|l| l.contains("/tcp") && l.contains("open|filtered")),
+                "short label in table:\n{screen}"
+            );
+            if std::env::var_os("RMAP_SHOW_RENDER").is_some() {
+                println!("{screen}");
+            }
+        }
+    }
+
+    #[test]
+    fn port_pane_scrolls_to_the_last_port() {
+        let (_rt, mut app) = app();
+        nas_host(&mut app);
+        let screen = render(&mut app, 80, 24);
+        assert!(
+            !screen.contains("5000/tcp"),
+            "off screen at first:\n{screen}"
+        );
+        assert!(screen.contains("↓ more"), "{screen}");
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::End);
+        let view = app.scan.as_ref().unwrap();
+        assert_eq!((view.focus, view.port_selected), (Pane::Ports, 4));
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.contains("5000/tcp"), "{screen}");
+        assert!(screen.contains("open?"), "{screen}");
+        // Moving hosts resets the port selection.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.scan.as_ref().unwrap().port_selected, 0);
+    }
+
+    #[test]
+    fn narrow_terminals_keep_names_and_footer() {
+        let (_rt, mut app) = app();
+        nas_host(&mut app);
+        let screen = render(&mut app, 80, 24);
+        let footer = screen.lines().last().unwrap();
+        assert!(
+            footer.contains("help") && footer.contains("quit"),
+            "{footer}"
+        );
+        // Stacked layout: the host table has the full width for names.
+        let host_row = screen
+            .lines()
+            .find(|l| l.contains("192.168.1.20 "))
+            .unwrap();
+        assert!(host_row.contains("nas01.springer.local"), "{host_row}");
+        assert!(
+            host_row.contains("OPEN") || host_row.contains('!'),
+            "{host_row}"
+        );
+        // Nothing panics down to tiny sizes.
+        for (w, h) in [(40, 12), (20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn help_overlay_opens_and_closes() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        press(&mut app, KeyCode::Char('?'));
+        assert!(render(&mut app, 80, 24).contains("switch between hosts and ports"));
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.help);
+        assert!(
+            !app.scan.as_ref().unwrap().show_down,
+            "the key only closed help"
+        );
+    }
+
+    #[test]
+    fn multi_line_paste_does_not_submit() {
+        let (_rt, mut app) = app();
+        app.on_paste("10.0.0.1\r\n10.0.0.2\n\n10.0.0.3\n");
+        assert!(matches!(app.screen, Screen::Setup));
+        assert_eq!(app.form.targets, "10.0.0.1,10.0.0.2,10.0.0.3");
+        // Paste inserts at the cursor, and the cursor keys edit mid-text.
+        press(&mut app, KeyCode::Home);
+        app.on_paste("10.0.0.9,");
+        assert_eq!(app.form.targets, "10.0.0.9,10.0.0.1,10.0.0.2,10.0.0.3");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.form.targets, "");
+        // Pastes into a toggle field are ignored.
+        app.form.focus = Field::Timing;
+        app.on_paste("5");
+        assert_eq!(app.form.timing, 3);
+    }
+
+    #[test]
+    fn quitting_a_running_scan_asks_first() {
+        let (_rt, mut app) = app();
+        start_slow_scan(&mut app);
+        press(&mut app, KeyCode::Char('q'));
+        assert_eq!(app.confirm, Some(Confirm::QuitRunning));
+        assert!(render(&mut app, 80, 24).contains("Stop it and quit?"));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.should_quit() && app.scan.as_ref().unwrap().is_running());
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn vulns_needs_services() {
+        let (_rt, mut app) = app();
+        app.form.focus = Field::Vulns;
+        assert!(render(&mut app, 90, 24).contains("needs Services"));
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.form.vuln_matching && app.form.service_detection);
+        app.form.focus = Field::Services;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(!app.form.vuln_matching && !app.form.service_detection);
     }
 
     #[test]
