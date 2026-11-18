@@ -7,16 +7,24 @@
 //! spoofed traffic is ignored. ICMP echo uses a per-scan identifier, and UDP
 //! probes come from one per-scan source port.
 //!
+//! IPv4 replies arrive with their IP header. IPv6 raw sockets never pass
+//! the IPv6 header up, so the IPv6 matchers take the sender's address (from
+//! `recvfrom`) and the TCP segment or ICMPv6 message separately.
+//!
 //! None of this touches sockets, so it is tested on every platform.
 
 use std::hash::{BuildHasher, RandomState};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use rmap_core::{PortState, Protocol};
 use rmap_packet::arp::OP_REPLY;
 use rmap_packet::ethernet::{ETHERTYPE_ARP, EthernetHeader};
 use rmap_packet::ipv4::{PROTO_ICMP, PROTO_TCP, PROTO_UDP};
-use rmap_packet::{ArpPacket, IcmpMessage, Ipv4Header, MacAddr, TcpFlags, TcpHeader, UdpHeader};
+use rmap_packet::ipv6::NEXT_ICMPV6;
+use rmap_packet::{
+    ArpPacket, IcmpMessage, Icmpv6Message, Ipv4Header, Ipv6Header, MacAddr, TcpFlags, TcpHeader,
+    UdpHeader,
+};
 
 /// TTL for every probe we send.
 const TTL: u8 = 64;
@@ -33,19 +41,46 @@ pub enum Reply {
     Data,
     /// ICMP destination unreachable with this code.
     Unreachable(u8),
+    /// ICMPv6 destination unreachable with this code. Its codes differ
+    /// from ICMPv4's: port unreachable is 4.
+    Unreachable6(u8),
+}
+
+/// Where raw probes to one host go from and to. Both ends are always the
+/// same address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    V4(Ipv4Addr, Ipv4Addr),
+    V6(Ipv6Addr, Ipv6Addr),
+}
+
+impl Route {
+    pub fn src(&self) -> IpAddr {
+        match *self {
+            Route::V4(src, _) => src.into(),
+            Route::V6(src, _) => src.into(),
+        }
+    }
+
+    pub fn dst(&self) -> IpAddr {
+        match *self {
+            Route::V4(_, dst) => dst.into(),
+            Route::V6(_, dst) => dst.into(),
+        }
+    }
 }
 
 /// A reply matched to one of our probes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Matched {
     Port {
-        ip: Ipv4Addr,
+        ip: IpAddr,
         port: u16,
         protocol: Protocol,
         reply: Reply,
     },
     /// An echo reply (or ARP reply) from a host we pinged.
-    HostUp(Ipv4Addr),
+    HostUp(IpAddr),
 }
 
 /// Port state for a TCP SYN probe's reply.
@@ -54,7 +89,7 @@ pub fn tcp_state(reply: Reply) -> PortState {
         Reply::SynAck => PortState::Open,
         Reply::Rst => PortState::Closed,
         // UDP data can't answer a SYN; treat it like any other oddity.
-        Reply::Data | Reply::Unreachable(_) => PortState::Filtered,
+        Reply::Data | Reply::Unreachable(_) | Reply::Unreachable6(_) => PortState::Filtered,
     }
 }
 
@@ -63,7 +98,8 @@ pub fn udp_state(reply: Reply) -> PortState {
     match reply {
         Reply::Data => PortState::Open,
         Reply::Unreachable(rmap_packet::icmp::CODE_PORT_UNREACHABLE) => PortState::Closed,
-        Reply::Unreachable(_) => PortState::Filtered,
+        Reply::Unreachable6(rmap_packet::icmpv6::CODE_PORT_UNREACHABLE) => PortState::Closed,
+        Reply::Unreachable(_) | Reply::Unreachable6(_) => PortState::Filtered,
         // A SYN-ACK or RST can't answer a UDP probe.
         Reply::SynAck | Reply::Rst => PortState::Filtered,
     }
@@ -95,8 +131,8 @@ impl Matcher {
     }
 
     /// The keyed hash used as a SYN's sequence number.
-    pub fn cookie(&self, ip: Ipv4Addr, dst_port: u16, src_port: u16) -> u32 {
-        self.key.hash_one((u32::from(ip), dst_port, src_port)) as u32
+    pub fn cookie(&self, ip: impl Into<IpAddr>, dst_port: u16, src_port: u16) -> u32 {
+        self.key.hash_one((ip.into(), dst_port, src_port)) as u32
     }
 
     /// Source port for a SYN. Each retry uses a new one, so a late answer
@@ -105,37 +141,59 @@ impl Matcher {
         self.src_port_base.wrapping_add(u16::from(try_no))
     }
 
-    /// A complete IPv4 SYN packet.
-    pub fn syn_packet(&self, src: Ipv4Addr, dst: Ipv4Addr, port: u16, try_no: u8) -> Vec<u8> {
+    /// A complete SYN packet, IP header included.
+    pub fn syn_packet(&self, route: Route, port: u16, try_no: u8) -> Vec<u8> {
         let sport = self.src_port(try_no);
-        let seq = self.cookie(dst, port, sport);
+        let seq = self.cookie(route.dst(), port, sport);
         let tcp = TcpHeader::syn(sport, port, seq);
-        let mut buf = Vec::with_capacity(60);
-        Ipv4Header::new(src, dst, PROTO_TCP, TTL, seq as u16).write(tcp.header_len(), &mut buf);
-        tcp.write(src, dst, &[], &mut buf);
-        buf
-    }
-
-    /// A complete IPv4 UDP packet from the scan's UDP source port.
-    pub fn udp_packet(&self, src: Ipv4Addr, dst: Ipv4Addr, port: u16, payload: &[u8]) -> Vec<u8> {
-        let id = self.cookie(dst, port, self.udp_port) as u16;
-        let mut buf = Vec::with_capacity(28 + payload.len());
-        Ipv4Header::new(src, dst, PROTO_UDP, TTL, id).write(8 + payload.len(), &mut buf);
-        UdpHeader::new(self.udp_port, port).write(src, dst, payload, &mut buf);
-        buf
-    }
-
-    /// A complete IPv4 ICMP echo request.
-    pub fn echo_packet(&self, src: Ipv4Addr, dst: Ipv4Addr, seq: u16) -> Vec<u8> {
-        let mut icmp = Vec::with_capacity(8 + ECHO_DATA.len());
-        IcmpMessage::EchoRequest {
-            id: self.icmp_id,
-            seq,
-            data: ECHO_DATA,
+        let mut buf = Vec::with_capacity(80);
+        match route {
+            Route::V4(src, dst) => {
+                Ipv4Header::new(src, dst, PROTO_TCP, TTL, seq as u16)
+                    .write(tcp.header_len(), &mut buf);
+                tcp.write(src, dst, &[], &mut buf);
+            }
+            Route::V6(src, dst) => {
+                Ipv6Header::new(src, dst, PROTO_TCP, TTL).write(tcp.header_len(), &mut buf);
+                tcp.write_v6(src, dst, &[], &mut buf);
+            }
         }
-        .write(&mut icmp);
-        let mut buf = Vec::with_capacity(20 + icmp.len());
-        Ipv4Header::new(src, dst, PROTO_ICMP, TTL, seq).write(icmp.len(), &mut buf);
+        buf
+    }
+
+    /// A complete UDP packet from the scan's UDP source port.
+    pub fn udp_packet(&self, route: Route, port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp = UdpHeader::new(self.udp_port, port);
+        let mut buf = Vec::with_capacity(48 + payload.len());
+        match route {
+            Route::V4(src, dst) => {
+                let id = self.cookie(dst, port, self.udp_port) as u16;
+                Ipv4Header::new(src, dst, PROTO_UDP, TTL, id).write(8 + payload.len(), &mut buf);
+                udp.write(src, dst, payload, &mut buf);
+            }
+            Route::V6(src, dst) => {
+                Ipv6Header::new(src, dst, PROTO_UDP, TTL).write(8 + payload.len(), &mut buf);
+                udp.write_v6(src, dst, payload, &mut buf);
+            }
+        }
+        buf
+    }
+
+    /// A complete ICMP (or ICMPv6) echo request.
+    pub fn echo_packet(&self, route: Route, seq: u16) -> Vec<u8> {
+        let (id, data) = (self.icmp_id, ECHO_DATA);
+        let mut icmp = Vec::with_capacity(8 + ECHO_DATA.len());
+        let mut buf = Vec::with_capacity(48 + ECHO_DATA.len());
+        match route {
+            Route::V4(src, dst) => {
+                IcmpMessage::EchoRequest { id, seq, data }.write(&mut icmp);
+                Ipv4Header::new(src, dst, PROTO_ICMP, TTL, seq).write(icmp.len(), &mut buf);
+            }
+            Route::V6(src, dst) => {
+                Icmpv6Message::EchoRequest { id, seq, data }.write(src, dst, &mut icmp);
+                Ipv6Header::new(src, dst, NEXT_ICMPV6, TTL).write(icmp.len(), &mut buf);
+            }
+        }
         buf.extend_from_slice(&icmp);
         buf
     }
@@ -159,10 +217,19 @@ impl Matcher {
         if ip.protocol != PROTO_TCP || ip.is_later_fragment() {
             return None;
         }
+        self.tcp_reply(ip.src.into(), segment)
+    }
+
+    /// Match a TCP segment from `src`, read from a raw IPv6 TCP socket.
+    pub fn match_tcp6(&self, src: Ipv6Addr, segment: &[u8]) -> Option<Matched> {
+        self.tcp_reply(src.into(), segment)
+    }
+
+    fn tcp_reply(&self, src: IpAddr, segment: &[u8]) -> Option<Matched> {
         let (tcp, _) = TcpHeader::parse(segment).ok()?;
         // Checksums aren't checked: loopback traffic often carries partial
         // ones. The cookie is a stronger test anyway.
-        if tcp.ack.wrapping_sub(1) != self.cookie(ip.src, tcp.src_port, tcp.dst_port) {
+        if tcp.ack.wrapping_sub(1) != self.cookie(src, tcp.src_port, tcp.dst_port) {
             return None;
         }
         let reply = if tcp.flags.contains(TcpFlags::SYN | TcpFlags::ACK) {
@@ -173,9 +240,9 @@ impl Matcher {
             return None;
         };
         Some(Matched::Port {
-            ip: ip.src,
+            ip: src,
             port: tcp.src_port,
-            protocol: rmap_core::Protocol::Tcp,
+            protocol: Protocol::Tcp,
             reply,
         })
     }
@@ -188,32 +255,58 @@ impl Matcher {
         }
         match IcmpMessage::parse(body).ok()? {
             IcmpMessage::EchoReply { id, .. } if id == self.icmp_id => {
-                Some(Matched::HostUp(ip.src))
+                Some(Matched::HostUp(ip.src.into()))
             }
             IcmpMessage::DestUnreachable { code, original } => {
                 let (quoted, inner) = Ipv4Header::parse(original).ok()?;
-                let (port, protocol) = match quoted.protocol {
-                    PROTO_TCP => {
-                        let (sport, dport, seq) = TcpHeader::parse_prefix(inner).ok()?;
-                        (seq == self.cookie(quoted.dst, dport, sport))
-                            .then_some((dport, Protocol::Tcp))?
-                    }
-                    PROTO_UDP => {
-                        let (sport, dport) = UdpHeader::parse_ports(inner).ok()?;
-                        (self.udp_port != 0 && sport == self.udp_port)
-                            .then_some((dport, Protocol::Udp))?
-                    }
-                    _ => return None,
-                };
-                Some(Matched::Port {
-                    ip: quoted.dst,
-                    port,
-                    protocol,
-                    reply: Reply::Unreachable(code),
-                })
+                let reply = Reply::Unreachable(code);
+                self.quoted_probe(quoted.dst.into(), quoted.protocol, inner, reply)
             }
             _ => None,
         }
+    }
+
+    /// Match an ICMPv6 message from `src`, read from a raw ICMPv6 socket.
+    pub fn match_icmp6(&self, src: Ipv6Addr, message: &[u8]) -> Option<Matched> {
+        match Icmpv6Message::parse(message).ok()? {
+            Icmpv6Message::EchoReply { id, .. } if id == self.icmp_id => {
+                Some(Matched::HostUp(src.into()))
+            }
+            Icmpv6Message::DestUnreachable { code, original } => {
+                let (quoted, inner) = Ipv6Header::parse(original).ok()?;
+                let reply = Reply::Unreachable6(code);
+                self.quoted_probe(quoted.dst.into(), quoted.next_header, inner, reply)
+            }
+            _ => None,
+        }
+    }
+
+    /// Match the probe quoted in an ICMP error: `dst` and `protocol` from
+    /// the quoted IP header, `inner` the start of its TCP or UDP header.
+    fn quoted_probe(
+        &self,
+        dst: IpAddr,
+        protocol: u8,
+        inner: &[u8],
+        reply: Reply,
+    ) -> Option<Matched> {
+        let (port, protocol) = match protocol {
+            PROTO_TCP => {
+                let (sport, dport, seq) = TcpHeader::parse_prefix(inner).ok()?;
+                (seq == self.cookie(dst, dport, sport)).then_some((dport, Protocol::Tcp))?
+            }
+            PROTO_UDP => {
+                let (sport, dport) = UdpHeader::parse_ports(inner).ok()?;
+                (self.udp_port != 0 && sport == self.udp_port).then_some((dport, Protocol::Udp))?
+            }
+            _ => return None,
+        };
+        Some(Matched::Port {
+            ip: dst,
+            port,
+            protocol,
+            reply,
+        })
     }
 
     /// Match an Ethernet frame from an ARP packet socket.
@@ -223,7 +316,7 @@ impl Matcher {
             return None;
         }
         let arp = ArpPacket::parse(payload).ok()?;
-        (arp.op == OP_REPLY).then_some(Matched::HostUp(arp.sender_ip))
+        (arp.op == OP_REPLY).then_some(Matched::HostUp(arp.sender_ip.into()))
     }
 }
 
@@ -234,6 +327,10 @@ mod tests {
 
     const US: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
     const THEM: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    const R4: Route = Route::V4(US, THEM);
+    const US6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    const THEM6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+    const R6: Route = Route::V6(US6, THEM6);
 
     /// The target's answer to `syn`, with the given flags and ack offset.
     fn answer(syn: &[u8], flags: TcpFlags, ack_delta: u32) -> Vec<u8> {
@@ -269,7 +366,45 @@ mod tests {
 
     fn port(reply: Reply, protocol: Protocol, port: u16) -> Option<Matched> {
         Some(Matched::Port {
-            ip: THEM,
+            ip: THEM.into(),
+            port,
+            protocol,
+            reply,
+        })
+    }
+
+    /// The target's answer to an IPv6 `syn`: just the TCP segment, as a raw
+    /// IPv6 socket hands it over.
+    fn answer6(syn: &[u8], flags: TcpFlags, ack_delta: u32) -> Vec<u8> {
+        let (ip, seg) = Ipv6Header::parse(syn).unwrap();
+        let (tcp, _) = TcpHeader::parse(seg).unwrap();
+        let reply = TcpHeader {
+            src_port: tcp.dst_port,
+            dst_port: tcp.src_port,
+            ack: tcp.seq.wrapping_add(ack_delta),
+            flags,
+            ..TcpHeader::default()
+        };
+        let mut buf = Vec::new();
+        reply.write_v6(ip.dst, ip.src, &[], &mut buf);
+        buf
+    }
+
+    /// An ICMPv6 destination unreachable quoting `probe`, as a raw ICMPv6
+    /// socket hands it over.
+    fn unreachable6(code: u8, probe: &[u8], from: Ipv6Addr) -> Vec<u8> {
+        let mut buf = Vec::new();
+        Icmpv6Message::DestUnreachable {
+            code,
+            original: probe,
+        }
+        .write(from, US6, &mut buf);
+        buf
+    }
+
+    fn port6(reply: Reply, protocol: Protocol, port: u16) -> Option<Matched> {
+        Some(Matched::Port {
+            ip: THEM6.into(),
             port,
             protocol,
             reply,
@@ -277,9 +412,106 @@ mod tests {
     }
 
     #[test]
+    fn v6_syn_carries_the_cookie() {
+        let m = Matcher::new(0);
+        let syn = m.syn_packet(R6, 443, 2);
+        let (ip, seg) = Ipv6Header::parse(&syn).unwrap();
+        assert_eq!((ip.src, ip.dst, ip.next_header), (US6, THEM6, PROTO_TCP));
+        assert_eq!(usize::from(ip.payload_len), seg.len());
+        assert!(TcpHeader::checksum_valid_v6(US6, THEM6, seg));
+        let (tcp, _) = TcpHeader::parse(seg).unwrap();
+        assert_eq!(tcp.src_port, m.src_port(2));
+        assert_eq!(tcp.seq, m.cookie(THEM6, 443, m.src_port(2)));
+        assert_eq!(R6.src(), IpAddr::V6(US6));
+        assert_eq!(R6.dst(), IpAddr::V6(THEM6));
+    }
+
+    #[test]
+    fn v6_matches_syn_ack_and_rst() {
+        let m = Matcher::new(0);
+        let syn = m.syn_packet(R6, 22, 0);
+        let syn_ack = answer6(&syn, TcpFlags::SYN | TcpFlags::ACK, 1);
+        assert_eq!(
+            m.match_tcp6(THEM6, &syn_ack),
+            port6(Reply::SynAck, Protocol::Tcp, 22)
+        );
+        assert_eq!(
+            m.match_tcp6(THEM6, &answer6(&syn, TcpFlags::RST | TcpFlags::ACK, 1)),
+            port6(Reply::Rst, Protocol::Tcp, 22)
+        );
+        // The cookie is keyed by address: the same answer from elsewhere,
+        // or with the wrong ack, doesn't match.
+        assert_eq!(m.match_tcp6(US6, &syn_ack), None);
+        let wrong = answer6(&syn, TcpFlags::SYN | TcpFlags::ACK, 2);
+        assert_eq!(m.match_tcp6(THEM6, &wrong), None);
+        // An IPv4 address with the same cookie input isn't the same host.
+        let r4 = Matcher::new(0);
+        assert_ne!(r4.cookie(THEM, 22, 1), r4.cookie(THEM6, 22, 1));
+        assert_eq!(m.match_tcp6(THEM6, &[]), None);
+    }
+
+    #[test]
+    fn v6_unreachable_for_a_syn_and_for_udp() {
+        let m = Matcher::new(45_000);
+        let router = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xfe);
+        let syn = m.syn_packet(R6, 8080, 0);
+        let admin = m.match_icmp6(router, &unreachable6(1, &syn, router));
+        assert_eq!(admin, port6(Reply::Unreachable6(1), Protocol::Tcp, 8080));
+        let forged = Matcher::new(45_000).syn_packet(R6, 8080, 0);
+        assert_eq!(
+            m.match_icmp6(router, &unreachable6(1, &forged, router)),
+            None
+        );
+
+        let probe = m.udp_packet(R6, 161, b"x");
+        let (ip, seg) = Ipv6Header::parse(&probe).unwrap();
+        assert_eq!(ip.next_header, PROTO_UDP);
+        assert!(UdpHeader::checksum_valid_v6(US6, THEM6, seg));
+        let closed = m.match_icmp6(THEM6, &unreachable6(4, &probe, THEM6));
+        assert_eq!(closed, port6(Reply::Unreachable6(4), Protocol::Udp, 161));
+        // A clipped quote that still holds the UDP ports is enough.
+        let clipped = m.match_icmp6(THEM6, &unreachable6(4, &probe[..44], THEM6));
+        assert_eq!(clipped, closed);
+        assert_eq!(
+            m.match_icmp6(THEM6, &unreachable6(4, &probe[..43], THEM6)),
+            None
+        );
+        let theirs = Matcher::new(45_001).udp_packet(R6, 161, b"x");
+        assert_eq!(m.match_icmp6(THEM6, &unreachable6(4, &theirs, THEM6)), None);
+        // An IPv4 packet quoted in an ICMPv6 error is nonsense.
+        let v4 = m.udp_packet(R4, 161, b"x");
+        assert_eq!(m.match_icmp6(THEM6, &unreachable6(4, &v4, THEM6)), None);
+    }
+
+    #[test]
+    fn v6_echo_replies_need_our_id() {
+        let m = Matcher::new(0);
+        let request = m.echo_packet(R6, 3);
+        let (ip, body) = Ipv6Header::parse(&request).unwrap();
+        assert_eq!(ip.next_header, NEXT_ICMPV6);
+        assert!(Icmpv6Message::checksum_valid(US6, THEM6, body));
+        let reply_from = |id: u16| {
+            let mut buf = Vec::new();
+            Icmpv6Message::EchoReply {
+                id,
+                seq: 3,
+                data: ECHO_DATA,
+            }
+            .write(THEM6, US6, &mut buf);
+            buf
+        };
+        assert_eq!(
+            m.match_icmp6(THEM6, &reply_from(m.icmp_id())),
+            Some(Matched::HostUp(THEM6.into()))
+        );
+        assert_eq!(m.match_icmp6(THEM6, &reply_from(m.icmp_id() ^ 1)), None);
+        assert_eq!(m.match_icmp6(US6, body), None, "our own request");
+    }
+
+    #[test]
     fn syn_carries_the_cookie() {
         let m = Matcher::new(0);
-        let syn = m.syn_packet(US, THEM, 443, 1);
+        let syn = m.syn_packet(R4, 443, 1);
         assert!(Ipv4Header::checksum_valid(&syn));
         let (ip, seg) = Ipv4Header::parse(&syn).unwrap();
         assert_eq!((ip.src, ip.dst, ip.protocol), (US, THEM, PROTO_TCP));
@@ -293,7 +525,7 @@ mod tests {
     #[test]
     fn matches_syn_ack_and_rst() {
         let m = Matcher::new(0);
-        let syn = m.syn_packet(US, THEM, 22, 0);
+        let syn = m.syn_packet(R4, 22, 0);
         assert_eq!(
             m.match_tcp(&answer(&syn, TcpFlags::SYN | TcpFlags::ACK, 1)),
             port(Reply::SynAck, Protocol::Tcp, 22)
@@ -307,7 +539,7 @@ mod tests {
     #[test]
     fn ignores_replies_without_the_cookie() {
         let m = Matcher::new(0);
-        let syn = m.syn_packet(US, THEM, 22, 0);
+        let syn = m.syn_packet(R4, 22, 0);
         for delta in [0, 2, 0x8000_0000] {
             assert_eq!(
                 m.match_tcp(&answer(&syn, TcpFlags::SYN | TcpFlags::ACK, delta)),
@@ -316,19 +548,19 @@ mod tests {
         }
         // Another scan's key doesn't validate.
         let other = Matcher::new(0);
-        let syn = other.syn_packet(US, THEM, 22, 0);
+        let syn = other.syn_packet(R4, 22, 0);
         assert_eq!(
             m.match_tcp(&answer(&syn, TcpFlags::SYN | TcpFlags::ACK, 1)),
             None
         );
         // Our own outgoing SYN, seen on loopback, is not a reply.
-        assert_eq!(m.match_tcp(&m.syn_packet(US, THEM, 22, 0)), None);
+        assert_eq!(m.match_tcp(&m.syn_packet(R4, 22, 0)), None);
     }
 
     #[test]
     fn ignores_plain_acks_and_garbage() {
         let m = Matcher::new(0);
-        let syn = m.syn_packet(US, THEM, 22, 0);
+        let syn = m.syn_packet(R4, 22, 0);
         assert_eq!(m.match_tcp(&answer(&syn, TcpFlags::ACK, 1)), None);
         assert_eq!(m.match_tcp(&[]), None);
         assert_eq!(m.match_tcp(&[0x45; 40]), None);
@@ -338,38 +570,38 @@ mod tests {
     #[test]
     fn icmp_unreachable_for_a_syn() {
         let m = Matcher::new(0);
-        let syn = m.syn_packet(US, THEM, 8080, 0);
+        let syn = m.syn_packet(R4, 8080, 0);
         let router = Ipv4Addr::new(10, 0, 0, 254);
         assert_eq!(
             m.match_icmp(&unreachable(13, &syn, router)),
             port(Reply::Unreachable(13), Protocol::Tcp, 8080)
         );
-        let forged = Matcher::new(0).syn_packet(US, THEM, 8080, 0);
+        let forged = Matcher::new(0).syn_packet(R4, 8080, 0);
         assert_eq!(m.match_icmp(&unreachable(13, &forged, router)), None);
     }
 
     #[test]
     fn icmp_unreachable_for_udp() {
         let m = Matcher::new(45_000);
-        let probe = m.udp_packet(US, THEM, 161, b"x");
+        let probe = m.udp_packet(R4, 161, b"x");
         assert!(Ipv4Header::checksum_valid(&probe));
         assert_eq!(
             m.match_icmp(&unreachable(CODE_PORT_UNREACHABLE, &probe, THEM)),
             port(Reply::Unreachable(3), Protocol::Udp, 161)
         );
         // Someone else's UDP traffic.
-        let theirs = Matcher::new(45_001).udp_packet(US, THEM, 161, b"x");
+        let theirs = Matcher::new(45_001).udp_packet(R4, 161, b"x");
         assert_eq!(m.match_icmp(&unreachable(3, &theirs, THEM)), None);
         // A scan with no UDP port accepts no UDP errors.
         let none = Matcher::new(0);
-        let probe = none.udp_packet(US, THEM, 161, b"");
+        let probe = none.udp_packet(R4, 161, b"");
         assert_eq!(none.match_icmp(&unreachable(3, &probe, THEM)), None);
     }
 
     #[test]
     fn echo_replies_need_our_id() {
         let m = Matcher::new(0);
-        let request = m.echo_packet(US, THEM, 3);
+        let request = m.echo_packet(R4, 3);
         let (_, body) = Ipv4Header::parse(&request).unwrap();
         assert!(IcmpMessage::checksum_valid(body));
         let reply_from = |id: u16| {
@@ -387,7 +619,7 @@ mod tests {
         };
         assert_eq!(
             m.match_icmp(&reply_from(m.icmp_id())),
-            Some(Matched::HostUp(THEM))
+            Some(Matched::HostUp(THEM.into()))
         );
         assert_eq!(m.match_icmp(&reply_from(m.icmp_id().wrapping_add(1))), None);
         assert_eq!(m.match_icmp(&request), None, "our own request");
@@ -419,7 +651,10 @@ mod tests {
         }
         .write(&mut reply);
         reply.extend_from_slice(&[0; 18]); // Ethernet minimum-size padding
-        assert_eq!(Matcher::match_arp(&reply), Some(Matched::HostUp(THEM)));
+        assert_eq!(
+            Matcher::match_arp(&reply),
+            Some(Matched::HostUp(THEM.into()))
+        );
         assert_eq!(Matcher::match_arp(&reply[..20]), None);
     }
 
@@ -433,6 +668,11 @@ mod tests {
         for code in [0, 1, 2, 9, 10, 13] {
             assert_eq!(udp_state(Reply::Unreachable(code)), PortState::Filtered);
         }
+        assert_eq!(udp_state(Reply::Unreachable6(4)), PortState::Closed);
+        for code in [0, 1, 2, 3, 5, 6] {
+            assert_eq!(udp_state(Reply::Unreachable6(code)), PortState::Filtered);
+        }
+        assert_eq!(tcp_state(Reply::Unreachable6(4)), PortState::Filtered);
     }
 
     #[test]
@@ -460,6 +700,8 @@ mod tests {
                 .collect();
             let _ = m.match_tcp(&buf);
             let _ = m.match_icmp(&buf);
+            let _ = m.match_tcp6(THEM6, &buf);
+            let _ = m.match_icmp6(THEM6, &buf);
             let _ = Matcher::match_arp(&buf);
         }
     }
