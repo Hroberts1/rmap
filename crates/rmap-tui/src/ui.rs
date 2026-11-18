@@ -317,7 +317,15 @@ fn draw_results(frame: &mut Frame, view: &mut ScanView) {
 /// The footer key strip, trimmed to fit: `? help` and `q quit` always show,
 /// the rest are dropped from the end as the terminal narrows.
 fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
-    let mut wanted = vec![("Tab", "pane"), ("↑↓", "select"), ("1-3", "tabs")];
+    if view.filtering {
+        return key_help(&[("Enter", "keep filter"), ("Esc", "clear filter")]);
+    }
+    let mut wanted = vec![
+        ("Tab", "pane"),
+        ("↑↓", "select"),
+        ("1-3", "tabs"),
+        ("/", "filter"),
+    ];
     if view.is_running() {
         wanted.push(("s", "stop"));
     }
@@ -487,11 +495,33 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
         })
     });
 
-    let title = if view.show_down {
-        " hosts (all) "
+    let mut title = String::from(if view.show_down {
+        " hosts (all)"
     } else {
-        " hosts (up) "
-    };
+        " hosts (up)"
+    });
+    if !view.filter.is_empty() {
+        let of = view
+            .hosts
+            .values()
+            .filter(|h| view.show_down || h.state != HostState::Down)
+            .count();
+        title.push_str(&format!(" {} of {of}", visible.len()));
+    }
+    title.push_str(&format!(" · by {} ", view.sort.label()));
+    let mut block = pane_block(title, focused);
+    // " filter: /" before the text, one border column on each side.
+    const FILTER_LEAD: u16 = 10;
+    let filter_w = area.width.saturating_sub(FILTER_LEAD + 3) as usize;
+    let (filter_text, filter_cursor) = view.filter.window(filter_w);
+    if view.filtering || !view.filter.is_empty() {
+        let style = if view.filtering {
+            Style::new().fg(ACCENT)
+        } else {
+            Style::new()
+        };
+        block = block.title_bottom(Line::styled(format!(" filter: /{filter_text} "), style));
+    }
     let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(addr_w as u16),
@@ -505,7 +535,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
     }
     let table = Table::new(rows, widths)
         .header(Row::new(header).bold().dim())
-        .block(pane_block(title, focused))
+        .block(block)
         .row_highlight_style(highlight(focused))
         .highlight_symbol("▌");
 
@@ -514,9 +544,15 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
             .and_then(|s| visible.iter().position(|ip| *ip == s)),
     );
     frame.render_stateful_widget(table, area, &mut state);
+    if view.filtering && area.height > 0 {
+        let x = area.x + 1 + FILTER_LEAD + filter_cursor as u16;
+        frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.bottom() - 1));
+    }
 
     if visible.is_empty() {
-        let msg = if view.is_running() {
+        let msg = if !view.filter.is_empty() {
+            "no hosts match the filter"
+        } else if view.is_running() {
             "waiting for hosts…"
         } else {
             "no hosts up"
@@ -830,6 +866,8 @@ fn draw_help(frame: &mut Frame) {
         ("Tab ← → h l", "switch between hosts and ports"),
         ("1 2 3", "hosts / services / vulns tab"),
         ("d", "show or hide down hosts"),
+        ("/", "filter by ip, name, port, service"),
+        ("o", "sort: ip, open ports, worst CVE"),
         ("s", "stop the scan"),
         ("e", "export JSON / XML"),
         ("c", "compare with a saved scan"),

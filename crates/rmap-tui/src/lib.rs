@@ -5,6 +5,7 @@
 //! network; it polls the engine's event channel between keypresses.
 
 mod app;
+mod filter;
 mod input;
 mod limits;
 mod log_view;
