@@ -25,8 +25,11 @@ rust-version = "1.88"
 rmap-core = { path = "crates/rmap-core" }
 rmap-engine = { path = "crates/rmap-engine" }
 rmap-log = { path = "crates/rmap-log" }
+rmap-packet = { path = "crates/rmap-packet" }
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync"] }
 ratatui = "0.30"
+# Raw-socket syscalls only (Linux raw backend in rmap-engine).
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 
 [profile.release]

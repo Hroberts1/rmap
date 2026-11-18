@@ -2,13 +2,13 @@
 
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
 
-rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime and [ratatui](https://ratatui.rs) for the terminal.
+rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, and [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls.
 
 > **Only scan networks you own or have written permission to test.** rmap asks for confirmation before it touches public addresses.
 
 ## Status
 
-Milestone 1 is done: unprivileged TCP connect scanning with a live TUI. See the [roadmap](#roadmap).
+Milestones 1 and 2 are done: TCP connect, SYN and UDP scans, ICMP/ARP host discovery, and a live TUI. See the [roadmap](#roadmap).
 
 ## Building on Linux
 
@@ -96,8 +96,21 @@ Fill in the setup form and press **Enter**:
 |---|---|
 | Targets | `192.168.1.0/24`, `10.0.0.1-50`, `10.0.0.5-10.0.0.40`, `10.1-2.0.1-254`, `router.lan`, `::1` |
 | Ports | `22,80,443`, `1-1024`, `common` (about 100 frequently used ports), `all` |
+| Scan type | TCP connect (no privileges), TCP SYN, UDP |
 | Timing | T0 paranoid … T3 normal … T5 insane |
 | Discovery | Probe hosts first and skip the ones that don't answer |
+
+### Privileged scans (SYN, UDP, ICMP/ARP discovery)
+
+SYN and UDP scans and ICMP/ARP discovery send hand-built packets over raw sockets. That needs Linux and either root or the `CAP_NET_RAW` capability. Granting the capability to the binary once is safer than running the whole TUI as root:
+
+```bash
+cargo build --release
+sudo setcap cap_net_raw+ep target/release/rmap
+./target/release/rmap
+```
+
+(`setcap` has to be repeated after every rebuild.) Without raw sockets, or on Windows and macOS, rmap still runs the scan and prints a warning in the log panel saying what it fell back to: a SYN scan becomes a TCP connect scan, a UDP scan uses ordinary connected UDP sockets, and discovery uses the TCP connect ping. The raw backend covers IPv4; IPv6 targets get the same fallbacks.
 
 Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` stop · `n` new scan · `q` quit.
 
@@ -108,6 +121,7 @@ crates/
 ├── rmap-core     targets, port lists, timing templates, result types
 ├── rmap-engine   async scan engine (tokio)
 ├── rmap-log      local log files and crash reports (no dependencies)
+├── rmap-packet   Ethernet/ARP/IPv4/TCP/UDP/ICMP building and parsing (no dependencies)
 └── rmap-tui      ratatui front end
 src/main.rs       starts logging, the runtime and the UI
 ```
@@ -125,6 +139,27 @@ Stopping a scan aborts the coordinator. Every level owns its children in a `Join
 | No answer after retries, or unreachable | filtered |
 
 Host discovery without root works the same way: a host counts as up if any of ports 80, 443, 22, 445 or 3389 accepts or refuses a connection.
+
+### Raw scans
+
+The raw backend (`crates/rmap-engine/src/raw`) sends packets built by `rmap-packet` over an `IP_HDRINCL` socket and reads replies on raw TCP and ICMP sockets. A SYN's sequence number is a keyed hash of the target address, target port and source port, with a random key per scan, so replies are matched without keeping state and unrelated traffic is ignored. Probes leave from the address the kernel's routing table picks for each target. A per-template packet rate limit keeps fast templates from flooding the link.
+
+| SYN scan reply | State |
+|---|---|
+| SYN-ACK (the kernel then resets the half-open connection) | open |
+| RST | closed |
+| ICMP unreachable, or nothing after retries | filtered |
+
+| UDP scan reply | State |
+|---|---|
+| Any UDP datagram | open |
+| ICMP port unreachable (type 3, code 3) | closed |
+| Other ICMP unreachable codes | filtered |
+| Nothing after retries | open\|filtered |
+
+UDP probes carry real requests for DNS, NTP, SNMPv1 (`public`), NetBIOS name service and SSDP, so those services answer instead of staying silent; other ports get an empty datagram. Linux limits how fast it sends ICMP errors, so on fast templates some closed UDP ports can show as open|filtered.
+
+Privileged discovery uses ARP for targets on a directly connected Ethernet subnet (an unanswered ARP request means the host is down) and, elsewhere, ICMP echo raced against the TCP connect ping.
 
 ## Logs and crash reports
 
@@ -158,19 +193,28 @@ The newest 20 logs and 20 crash reports are kept; older ones are deleted. Logs c
 cargo test --workspace
 ```
 
-The suite runs real scans against loopback listeners and the reserved, never-routed `192.0.2.0/24` block, so it needs no network access or privileges. It includes randomized parser tests that feed 100,000 generated strings through target and port parsing to catch inputs that could panic. If one fails, it prints the seed and the input that broke it.
+The suite runs real scans against loopback listeners and the reserved, never-routed `192.0.2.0/24` block, so it needs no network access or privileges. It includes randomized parser tests that feed 100,000 generated strings through target and port parsing, and 200,000 random and mutated packets through the packet parsers, to catch inputs that could panic. If one fails, it prints the seed and the input that broke it.
+
+SYN and UDP scan tests run everywhere and accept the unprivileged fallback. Tests that insist on raw sockets are `#[ignore]`d; on Linux, run them as root or inside a user and network namespace, which grants `CAP_NET_RAW` over its own loopback without root:
+
+```bash
+cargo test -p rmap-engine --no-run    # note the test binary path it prints
+unshare -rn sh -c 'ip link set lo up && target/debug/deps/rmap_engine-<hash> --ignored raw_'
+```
+
+`raw_veth_peer` also checks ARP and SYN over a real link when given a veth peer; its doc comment has the setup.
 
 ## Roadmap
 
 - [x] **M1: engine + TUI shell.** Target parsing, TCP connect scan, unprivileged discovery, live results.
-- [ ] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, adaptive timing. Needs root or `CAP_NET_RAW`.
+- [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. (IPv6 raw scans and RTT-adaptive timeouts are still to do.)
 - [ ] **M3: service detection.** rmap's own probe and match database, version strings, CPE identifiers.
 - [ ] **M4: vulnerability matching.** Offline CPE → CVE lookup against locally cached public feeds, flagged as *potentially* vulnerable to allow for vendor backports.
 - [ ] **M5: export and diffing.** JSON and XML export from the TUI, and comparing two saved scans.
 
 ## Platform notes
 
-rmap is developed for **Linux first**. Milestone 1 also runs on macOS and Windows because it uses only ordinary sockets. On Windows, a connection to a closed port can take about 2 seconds to be refused, so with fast timing templates closed ports may show as filtered. Raw-socket features from M2 onward target Linux.
+rmap is developed for **Linux first**. Milestone 1 also runs on macOS and Windows because it uses only ordinary sockets. On Windows, a connection to a closed port can take about 2 seconds to be refused, so with fast timing templates closed ports may show as filtered. Raw-socket features from M2 onward are Linux-only; elsewhere rmap falls back to unprivileged probes with a warning.
 
 ## License
 

@@ -9,17 +9,26 @@
 //! Stopping a scan aborts the coordinator. Each level owns its children in a
 //! `JoinSet`, so dropping it cancels everything below.
 //!
+//! Ports are probed through a backend chosen per scan (see `backend`): raw
+//! sockets for SYN and UDP scans and ICMP/ARP discovery when the platform
+//! and privileges allow, otherwise ordinary sockets with a warning.
+//!
 //! Diagnostics go to `rmap_log`: the scan's configuration and summary at
 //! `info`, per-host results at `debug`, and every probe at `trace`.
 //! Unexpected connect errors are tallied by kind so odd network behaviour
 //! shows up in the summary even when it isn't logged line by line.
 
+mod backend;
+pub mod payloads;
+pub mod rate;
+pub mod raw;
 pub mod tcp;
+pub mod udp;
 
 use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -197,6 +206,10 @@ struct Shared {
     ports: Box<[u16]>,
     timing: Timing,
     discovery: bool,
+    scan_type: ScanType,
+    prober: backend::Prober,
+    /// Set once the user has been told IPv6 targets can't use raw probes.
+    ipv6_warned: AtomicBool,
     probe_slots: Semaphore,
     tx: UnboundedSender<ScanEvent>,
     progress: Arc<Progress>,
@@ -237,15 +250,18 @@ async fn run(
     stats: Arc<Stats>,
 ) {
     let started = Instant::now();
-    // Placeholders until Milestones 2 and 3 land; replace these when they do.
-    if config.scan_type != ScanType::Connect {
-        let msg = format!(
-            "{} scans are not implemented yet; using TCP connect",
-            config.scan_type.label()
-        );
+    let (prober, downgrade) =
+        backend::Prober::select(config.scan_type, config.discovery, &config.timing);
+    rmap_log::info!(
+        "probing with {} for a {} scan",
+        prober.describe(),
+        config.scan_type.label()
+    );
+    if let Some(msg) = downgrade {
         rmap_log::warn!("{msg}");
         let _ = tx.send(ScanEvent::Warning(msg));
     }
+    // Placeholder until Milestone 3 lands; replace it when it does.
     if config.service_detection {
         let msg = "service detection is not implemented yet".to_string();
         rmap_log::warn!("{msg}");
@@ -266,6 +282,9 @@ async fn run(
         ports: config.ports.as_slice().into(),
         timing: config.timing,
         discovery: config.discovery,
+        scan_type: config.scan_type,
+        prober,
+        ipv6_warned: AtomicBool::new(false),
         probe_slots: Semaphore::new(config.timing.concurrency),
         tx,
         progress,
@@ -369,8 +388,27 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         panic!("test-only panic for {ip}");
     }
 
+    let prober = shared.prober.for_host(ip, shared.scan_type);
+    if ip.is_ipv6()
+        && shared.scan_type.needs_raw_sockets()
+        && matches!(prober, backend::HostProber::Unprivileged(_))
+        && !matches!(shared.prober, backend::Prober::Unprivileged)
+        && !shared.ipv6_warned.swap(true, Ordering::Relaxed)
+    {
+        let msg = format!(
+            "raw scans support IPv4 only so far; IPv6 targets get an unprivileged {} scan",
+            if shared.scan_type == ScanType::Udp {
+                "UDP"
+            } else {
+                "TCP connect"
+            }
+        );
+        rmap_log::warn!("{msg}");
+        shared.warn_ui(msg);
+    }
+
     let (state, rtt) = if shared.discovery {
-        match tcp::ping(ip, &shared.timing, &shared.stats).await {
+        match prober.ping(ip, &shared.timing, &shared.stats).await {
             Some(rtt) => (HostState::Up, Some(rtt)),
             None => (HostState::Down, None),
         }
@@ -412,14 +450,20 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
             .forget();
         let slot = ProbeSlot(shared.clone());
         let (sh, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
+        let prober = prober.clone();
         probes.spawn(async move {
             let _slot = slot;
-            let result = tcp::probe(ip, port, &sh.timing, &sh.stats).await;
+            let result = prober.probe(ip, port, &sh.timing, &sh.stats).await;
             sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
                 PortState::Open | PortState::OpenFiltered => {
                     sh.stats.open.fetch_add(1, Ordering::Relaxed);
-                    rmap_log::debug!("open {ip}:{port} rtt={:?}", result.rtt);
+                    rmap_log::debug!(
+                        "{} {ip}:{port}/{} rtt={:?}",
+                        result.state.as_str(),
+                        result.protocol.as_str(),
+                        result.rtt
+                    );
                     let _ = sh.tx.send(ScanEvent::Port { ip, result });
                 }
                 PortState::Closed => {

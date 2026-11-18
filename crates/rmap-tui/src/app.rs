@@ -13,6 +13,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 /// Most engine events handled per frame, so a burst can't stall input.
 const EVENTS_PER_FRAME: usize = 5_000;
 const MAX_LOG_LINES: usize = 200;
+/// Marks engine warnings in the log panel, which draws them highlighted.
+pub const WARNING_PREFIX: &str = "warning: ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
@@ -205,7 +207,7 @@ impl ScanView {
                 }
                 None => rmap_log::warn!("completion for {ip} arrived before its host"),
             },
-            ScanEvent::Warning(msg) => self.log(msg),
+            ScanEvent::Warning(msg) => self.log(format!("{WARNING_PREFIX}{msg}")),
             ScanEvent::Finished { elapsed } => {
                 self.finished = Some(elapsed);
                 let up = self.count(HostState::Up) + self.count(HostState::Assumed);
@@ -843,7 +845,7 @@ mod tests {
         assert_eq!(view.log.len(), MAX_LOG_LINES);
         assert_eq!(
             view.log.last().unwrap(),
-            &format!("w{}", MAX_LOG_LINES + 49)
+            &format!("{WARNING_PREFIX}w{}", MAX_LOG_LINES + 49)
         );
     }
 
