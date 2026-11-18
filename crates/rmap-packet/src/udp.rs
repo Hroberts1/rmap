@@ -1,8 +1,8 @@
 //! UDP headers (RFC 768).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::checksum::transport_checksum;
+use crate::checksum::{transport_checksum, transport_checksum_v6};
 use crate::ipv4::PROTO_UDP;
 use crate::{Error, Result, be16, need};
 
@@ -29,6 +29,17 @@ impl UdpHeader {
 
     /// Append the header and `payload` with length and checksum computed.
     pub fn write(&self, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8], out: &mut Vec<u8>) {
+        self.write_with(payload, out, |d| transport_checksum(src, dst, PROTO_UDP, d));
+    }
+
+    /// [`UdpHeader::write`] over the IPv6 pseudo-header.
+    pub fn write_v6(&self, src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8], out: &mut Vec<u8>) {
+        self.write_with(payload, out, |d| {
+            transport_checksum_v6(src, dst, PROTO_UDP, d)
+        });
+    }
+
+    fn write_with(&self, payload: &[u8], out: &mut Vec<u8>, checksum: impl FnOnce(&[u8]) -> u16) {
         let start = out.len();
         let len = (HEADER_LEN + payload.len()).min(usize::from(u16::MAX)) as u16;
         out.extend_from_slice(&self.src_port.to_be_bytes());
@@ -36,7 +47,7 @@ impl UdpHeader {
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&[0, 0]);
         out.extend_from_slice(payload);
-        let c = match transport_checksum(src, dst, PROTO_UDP, &out[start..]) {
+        let c = match checksum(&out[start..]) {
             0 => 0xffff, // 0 means "no checksum", so send its other form
             c => c,
         };
@@ -72,6 +83,13 @@ impl UdpHeader {
         datagram.get(6..8) == Some(&[0, 0])
             || transport_checksum(src, dst, PROTO_UDP, datagram) == 0
     }
+
+    /// Whether `datagram` carries a correct checksum over IPv6, where it is
+    /// mandatory: a zero checksum is invalid (RFC 8200 section 8.1).
+    pub fn checksum_valid_v6(src: Ipv6Addr, dst: Ipv6Addr, datagram: &[u8]) -> bool {
+        datagram.get(6..8).is_some_and(|c| c != [0, 0])
+            && transport_checksum_v6(src, dst, PROTO_UDP, datagram) == 0
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +121,21 @@ mod tests {
         assert!(UdpHeader::parse(&short).is_err());
         buf.extend_from_slice(b"trailing");
         assert_eq!(UdpHeader::parse(&buf).unwrap().1, b"abc");
+    }
+
+    #[test]
+    fn v6_checksum_is_mandatory() {
+        let (a, b) = (
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+        );
+        let mut buf = Vec::new();
+        UdpHeader::new(1, 2).write_v6(a, b, b"x", &mut buf);
+        assert!(UdpHeader::checksum_valid_v6(a, b, &buf));
+        assert!(!UdpHeader::checksum_valid_v6(a, a, &buf));
+        buf[6..8].copy_from_slice(&[0, 0]);
+        assert!(!UdpHeader::checksum_valid_v6(a, b, &buf));
+        assert!(!UdpHeader::checksum_valid_v6(a, b, &buf[..5]));
     }
 
     #[test]

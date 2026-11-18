@@ -1,7 +1,7 @@
 //! Engine tests against real sockets on the loopback interface and the
 //! reserved TEST-NET-1 block (192.0.2.0/24), which is never routed.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use rmap_core::{PortList, Target, Timing, parse_targets};
@@ -371,6 +371,7 @@ fn typed(targets: &str, ports: &str, timing: Timing, scan_type: ScanType) -> Sca
 }
 
 const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const LO6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
 impl Outcome {
     fn port_states(&self) -> Vec<(u16, rmap_core::Protocol, PortState)> {
@@ -508,6 +509,83 @@ async fn udp_scan_sorts_open_silent_and_closed() {
     assert!(out.fell_back(), "raw sockets are Linux-only");
 }
 
+/// A SYN scan of an open and a closed port on `::1`. `None` where the host
+/// has no IPv6 loopback.
+async fn check_syn_scan_v6() -> Option<Outcome> {
+    let open = TcpListener::bind("[::1]:0").await.ok()?;
+    let port = open.local_addr().ok()?.port();
+    // Released right away, so nothing listens on it.
+    let shut = TcpListener::bind("[::1]:0")
+        .await
+        .ok()?
+        .local_addr()
+        .ok()?
+        .port();
+    tokio::spawn(async move {
+        loop {
+            let _ = open.accept().await;
+        }
+    });
+    let ports = format!("{port},{shut}");
+    let out = run_scan(typed("::1", &ports, patient(), ScanType::Syn)).await;
+    assert!(out.finished());
+    assert_eq!(out.open_ports(), [(LO6, port)]);
+    assert_eq!(out.host_done(), [(LO6, 1, 0)], "the closed port is counted");
+    Some(out)
+}
+
+/// A UDP scan of an echoing, a silent and an unbound port on `::1`.
+async fn check_udp_scan_v6() -> Option<Outcome> {
+    let echo = tokio::net::UdpSocket::bind("[::1]:0").await.ok()?;
+    let silent = tokio::net::UdpSocket::bind("[::1]:0").await.ok()?;
+    let shut = tokio::net::UdpSocket::bind("[::1]:0").await.ok()?;
+    let (e, q, c) = (
+        echo.local_addr().ok()?.port(),
+        silent.local_addr().ok()?.port(),
+        shut.local_addr().ok()?.port(),
+    );
+    drop(shut);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n.max(1)], from).await;
+        }
+    });
+    let ports = format!("{e},{q},{c}");
+    let out = run_scan(typed("::1", &ports, udp_timing(), ScanType::Udp)).await;
+    drop(silent);
+    assert!(out.finished());
+    let mut expected = vec![
+        (e, rmap_core::Protocol::Udp, PortState::Open),
+        (q, rmap_core::Protocol::Udp, PortState::OpenFiltered),
+    ];
+    expected.sort_by_key(|p| p.0);
+    assert_eq!(out.port_states(), expected);
+    assert_eq!(out.host_done(), [(LO6, 1, 0)], "the unbound port is closed");
+    Some(out)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn syn_scan_of_ipv6_loopback() {
+    // Raw on Linux with privileges, otherwise the TCP connect fallback.
+    let Some(out) = check_syn_scan_v6().await else {
+        return;
+    };
+    if cfg!(not(target_os = "linux")) {
+        assert!(out.fell_back(), "raw sockets are Linux-only");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_scan_of_ipv6_loopback() {
+    let Some(out) = check_udp_scan_v6().await else {
+        return;
+    };
+    if cfg!(not(target_os = "linux")) {
+        assert!(out.fell_back(), "raw sockets are Linux-only");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_scan_never_warns_about_privileges() {
     let port = listener().await;
@@ -576,10 +654,53 @@ async fn raw_syn_scan_of_many_ports() {
 async fn raw_icmp_echo_answers_on_loopback() {
     let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient())
         .expect("raw sockets should open with CAP_NET_RAW");
-    let rtt = raw
-        .echo_ping(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, &patient())
-        .await;
+    let lo = crate::raw::Route::V4(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST);
+    let rtt = raw.echo_ping(lo, &patient()).await;
     assert!(rtt.is_some(), "loopback answers ICMP echo");
+}
+
+// IPv6 over loopback. In a fresh namespace `ip link set lo up` normally
+// brings up ::1 too; if it doesn't, add it first:
+//
+//   unshare -rn sh -c 'ip link set lo up && ip -6 addr add ::1/128 dev lo; \
+//       <test binary> --ignored raw_v6'
+//
+// These fail (rather than skip) without IPv6 loopback, since running them
+// is a request to test it.
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW and ::1 (see comment)"]
+async fn raw_v6_syn_scan_uses_raw_sockets() {
+    let out = check_syn_scan_v6().await.expect("::1 is configured");
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW and ::1 (see comment)"]
+async fn raw_v6_udp_scan_uses_raw_sockets() {
+    let out = check_udp_scan_v6().await.expect("::1 is configured");
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW and ::1 (see comment)"]
+async fn raw_v6_icmp_echo_and_routing() {
+    let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient())
+        .expect("raw sockets should open with CAP_NET_RAW");
+    let route = raw.route(LO6).expect("raw IPv6 is available");
+    assert_eq!(
+        route,
+        crate::raw::Route::V6(Ipv6Addr::LOCALHOST, Ipv6Addr::LOCALHOST)
+    );
+    assert!(raw.echo_ping(route, &patient()).await.is_some());
+    let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+    assert!(
+        raw.route(mapped.into()).is_err(),
+        "falls back, not misroutes"
+    );
 }
 
 /// SYN, UDP and ARP over a real link instead of loopback. Needs a veth
@@ -607,7 +728,9 @@ async fn raw_veth_peer() {
         .unwrap()
         .parse()
         .unwrap();
-    let src = crate::raw::route_source(peer).unwrap();
+    let crate::raw::Route::V4(src, _) = crate::raw::route(peer.into()).unwrap() else {
+        panic!("an IPv4 peer has an IPv4 route");
+    };
     let absent = Ipv4Addr::from(u32::from(peer) + 1);
 
     let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient()).unwrap();

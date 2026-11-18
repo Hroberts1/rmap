@@ -78,26 +78,25 @@ impl Prober {
     }
 
     /// Prepare to probe one host.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub(crate) fn for_host(&self, ip: IpAddr, scan_type: ScanType) -> HostProber {
-        match (self, ip) {
+        match self {
             #[cfg(target_os = "linux")]
-            (Prober::Raw(raw), IpAddr::V4(dst)) => match crate::raw::route_source(dst) {
-                Ok(src) => {
-                    rmap_log::debug!("raw probes to {dst} leave from {src}");
+            Prober::Raw(raw) => match raw.route(ip) {
+                Ok(route) => {
+                    rmap_log::debug!("raw probes to {ip} leave from {}", route.src());
                     HostProber::Raw {
                         raw: raw.clone(),
-                        src,
-                        dst,
+                        route,
                         scan_type,
                     }
                 }
                 Err(e) => {
-                    rmap_log::debug!("no route to {dst} ({e}); using unprivileged probes");
+                    rmap_log::debug!("no raw route to {ip} ({e}); using unprivileged probes");
                     HostProber::Unprivileged(scan_type)
                 }
             },
-            // IPv6 targets: the raw backend is IPv4-only so far.
-            _ => HostProber::Unprivileged(scan_type),
+            Prober::Unprivileged => HostProber::Unprivileged(scan_type),
         }
     }
 }
@@ -109,8 +108,7 @@ pub(crate) enum HostProber {
     #[cfg(target_os = "linux")]
     Raw {
         raw: Arc<crate::raw::RawScanner>,
-        src: std::net::Ipv4Addr,
-        dst: std::net::Ipv4Addr,
+        route: crate::raw::Route,
         scan_type: ScanType,
     },
 }
@@ -129,7 +127,7 @@ impl HostProber {
                 tcp::ping(ip, timing, stats).await.map(|rtt| (rtt, None))
             }
             #[cfg(target_os = "linux")]
-            HostProber::Raw { raw, src, dst, .. } => raw.ping(*src, *dst, timing, stats).await,
+            HostProber::Raw { raw, route, .. } => raw.ping(*route, timing, stats).await,
         }
     }
 
@@ -152,8 +150,8 @@ impl HostProber {
                 ..
             } => tcp::probe(ip, port, timing, stats, rtt).await,
             #[cfg(target_os = "linux")]
-            HostProber::Raw { raw, src, dst, .. } => {
-                raw.probe(*src, *dst, port, timing, stats, rtt).await
+            HostProber::Raw { raw, route, .. } => {
+                raw.probe(*route, port, timing, stats, rtt).await
             }
         }
     }

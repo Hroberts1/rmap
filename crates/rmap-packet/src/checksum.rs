@@ -1,6 +1,7 @@
-//! The internet checksum (RFC 1071) and the TCP/UDP pseudo-header.
+//! The internet checksum (RFC 1071) and the TCP/UDP pseudo-headers for
+//! IPv4 (RFC 9293) and IPv6 (RFC 8200 section 8.1).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// Add `data` to a running one's-complement sum as big-endian 16-bit words.
 /// An odd trailing byte is padded with a zero, as RFC 1071 specifies.
@@ -47,6 +48,22 @@ pub fn pseudo_header(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, length: u16) ->
 pub fn transport_checksum(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {
     let len = segment.len() as u16;
     finish(add(pseudo_header(src, dst, protocol, len), segment))
+}
+
+/// Sum of the IPv6 pseudo-header used by TCP, UDP and ICMPv6 checksums.
+/// `length` is the upper-layer packet length, 32 bits wide in IPv6.
+pub fn pseudo_header_v6(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, length: u32) -> u64 {
+    let mut sum = add(0, &src.octets());
+    sum = add(sum, &dst.octets());
+    sum = add(sum, &length.to_be_bytes());
+    sum + u64::from(next_header)
+}
+
+/// Checksum of an upper-layer `segment` (TCP, UDP or ICMPv6, header and
+/// payload) over IPv6. Same zero-field rules as [`transport_checksum`].
+pub fn transport_checksum_v6(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, segment: &[u8]) -> u16 {
+    let len = u32::try_from(segment.len()).unwrap_or(u32::MAX);
+    finish(add(pseudo_header_v6(src, dst, next_header, len), segment))
 }
 
 #[cfg(test)]

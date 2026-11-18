@@ -224,7 +224,7 @@ struct Shared {
     discovery: bool,
     scan_type: ScanType,
     prober: backend::Prober,
-    /// Set once the user has been told IPv6 targets can't use raw probes.
+    /// Set once the user has been told some IPv6 targets can't use raw probes.
     ipv6_warned: AtomicBool,
     probe_slots: Semaphore,
     /// The user's cap on probe starts per second, shared by every host.
@@ -466,7 +466,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         && !shared.ipv6_warned.swap(true, Ordering::Relaxed)
     {
         let msg = format!(
-            "raw scans support IPv4 only so far; IPv6 targets get an unprivileged {} scan",
+            "raw IPv6 probes are unavailable for some targets (see the log); they get an unprivileged {} scan",
             if shared.scan_type == ScanType::Udp {
                 "UDP"
             } else {

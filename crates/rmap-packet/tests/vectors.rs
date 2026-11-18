@@ -3,12 +3,12 @@
 //! Every parser here sees bytes straight off the network, so it must turn
 //! garbage into an error and never panic.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use rmap_packet::ipv4::{PROTO_TCP, PROTO_UDP};
 use rmap_packet::{
-    ArpPacket, EthernetHeader, IcmpMessage, Ipv4Header, MacAddr, TcpFlags, TcpHeader, TcpOption,
-    UdpHeader, internet_checksum,
+    ArpPacket, EthernetHeader, IcmpMessage, Icmpv6Message, Ipv4Header, Ipv6Header, MacAddr,
+    TcpFlags, TcpHeader, TcpOption, UdpHeader, internet_checksum,
 };
 
 /// A SYN from 192.168.0.2:12345 to 192.168.0.1:80, seq 0x01020304,
@@ -29,17 +29,29 @@ const KNOWN_SYN: [u8; 44] = [
 const SRC: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 2);
 const DST: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 1);
 
+/// The same SYN as [`KNOWN_SYN`] from 2001:db8::2 to 2001:db8::1, hop
+/// limit 64.
+///
+/// TCP checksum 0x0423, from an independent implementation and by hand:
+/// the segment words sum to 0xa049 (0xde43 complemented, less the IPv4
+/// pseudo-header's 0x8172). The IPv6 pseudo-header adds the addresses
+/// (2 * (2001 + 0db8) + 2 + 1), length 0x18 and next header 6, for 0x5b93;
+/// 0xa049 + 0x5b93 = 0xfbdc, which complements to 0x0423.
+#[rustfmt::skip]
+const KNOWN_SYN_V6: [u8; 64] = [
+    0x60, 0x00, 0x00, 0x00, 0x00, 0x18, 0x06, 0x40,
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+    0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+    0x30, 0x39, 0x00, 0x50, 0x01, 0x02, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00,
+    0x60, 0x02, 0x04, 0x00, 0x04, 0x23, 0x00, 0x00, 0x02, 0x04, 0x05, 0xb4,
+];
+
+const SRC6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+const DST6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+
 #[test]
 fn builds_the_known_syn() {
-    let tcp = TcpHeader {
-        src_port: 12345,
-        dst_port: 80,
-        seq: 0x0102_0304,
-        flags: TcpFlags::SYN,
-        window: 1024,
-        options: vec![TcpOption::Mss(1460)],
-        ..TcpHeader::default()
-    };
+    let tcp = known_tcp();
     let mut buf = Vec::new();
     Ipv4Header::new(SRC, DST, PROTO_TCP, 64, 1).write(tcp.header_len(), &mut buf);
     tcp.write(SRC, DST, &[], &mut buf);
@@ -63,6 +75,81 @@ fn parses_the_known_syn() {
     assert_eq!(tcp.flags, TcpFlags::SYN);
     assert_eq!(tcp.checksum, 0xde43);
     assert_eq!(tcp.options, vec![TcpOption::Mss(1460)]);
+}
+
+fn known_tcp() -> TcpHeader {
+    TcpHeader {
+        src_port: 12345,
+        dst_port: 80,
+        seq: 0x0102_0304,
+        flags: TcpFlags::SYN,
+        window: 1024,
+        options: vec![TcpOption::Mss(1460)],
+        ..TcpHeader::default()
+    }
+}
+
+#[test]
+fn builds_and_parses_the_known_v6_syn() {
+    let tcp = known_tcp();
+    let mut buf = Vec::new();
+    Ipv6Header::new(SRC6, DST6, PROTO_TCP, 64).write(tcp.header_len(), &mut buf);
+    tcp.write_v6(SRC6, DST6, &[], &mut buf);
+    assert_eq!(buf, KNOWN_SYN_V6);
+
+    let (ip, segment) = Ipv6Header::parse(&KNOWN_SYN_V6).unwrap();
+    assert_eq!((ip.src, ip.dst, ip.next_header), (SRC6, DST6, PROTO_TCP));
+    assert_eq!((ip.hop_limit, ip.payload_len), (64, 24));
+    assert!(TcpHeader::checksum_valid_v6(ip.src, ip.dst, segment));
+    let (back, _) = TcpHeader::parse(segment).unwrap();
+    assert_eq!(back.checksum, 0x0423);
+    assert_eq!(
+        TcpHeader {
+            checksum: 0,
+            ..back
+        },
+        tcp
+    );
+}
+
+#[test]
+fn known_v6_udp_and_icmpv6_checksums() {
+    // Both from an independent implementation.
+    let mut udp = Vec::new();
+    UdpHeader::new(40000, 53).write_v6(SRC6, DST6, b"dns?", &mut udp);
+    assert_eq!(&udp[6..8], &[0x30, 0x3e]);
+    assert!(UdpHeader::checksum_valid_v6(SRC6, DST6, &udp));
+
+    let mut icmp = Vec::new();
+    Icmpv6Message::EchoRequest {
+        id: 0x1234,
+        seq: 1,
+        data: b"rmap",
+    }
+    .write(SRC6, DST6, &mut icmp);
+    assert_eq!(
+        icmp,
+        [128, 0, 0x3e, 0x31, 0x12, 0x34, 0, 1, b'r', b'm', b'a', b'p']
+    );
+    assert!(Icmpv6Message::checksum_valid(SRC6, DST6, &icmp));
+}
+
+#[test]
+fn v6_corruption_breaks_the_checksum() {
+    for i in 0..KNOWN_SYN_V6.len() {
+        let mut bad = KNOWN_SYN_V6;
+        bad[i] ^= 0x10;
+        let ok = match Ipv6Header::parse(&bad) {
+            // Traffic class, flow label and hop limit are outside the
+            // pseudo-header. Byte 4 makes the payload length overrun the
+            // buffer, and parse clips it (as it must for ICMPv6 quotes).
+            Ok((ip, seg)) => {
+                TcpHeader::checksum_valid_v6(ip.src, ip.dst, seg) && ip.next_header == PROTO_TCP
+            }
+            Err(_) => false,
+        };
+        assert_eq!(ok, (1..=4).contains(&i) || i == 7, "flipping byte {i}");
+    }
 }
 
 #[test]
@@ -137,6 +224,14 @@ fn seeds() -> Vec<Vec<u8>> {
     }
     .write(&mut icmp);
     out.push(icmp);
+    out.push(KNOWN_SYN_V6.to_vec());
+    let mut icmp6 = Vec::new();
+    Icmpv6Message::DestUnreachable {
+        code: 4,
+        original: &KNOWN_SYN_V6[..48],
+    }
+    .write(DST6, SRC6, &mut icmp6);
+    out.push(icmp6);
     out
 }
 
@@ -156,6 +251,21 @@ fn parse_everything(buf: &[u8]) {
     }
     if let Ok(IcmpMessage::DestUnreachable { original, .. }) = IcmpMessage::parse(buf) {
         parse_everything(original);
+    }
+    let _ = Icmpv6Message::checksum_valid(SRC6, DST6, buf);
+    if let Ok(
+        Icmpv6Message::DestUnreachable { original, .. }
+        | Icmpv6Message::PacketTooBig { original, .. },
+    ) = Icmpv6Message::parse(buf)
+    {
+        parse_everything(original);
+    }
+    if let Ok((ip, payload)) = Ipv6Header::parse(buf) {
+        let _ = TcpHeader::checksum_valid_v6(ip.src, ip.dst, payload);
+        let _ = UdpHeader::checksum_valid_v6(ip.src, ip.dst, payload);
+        let _ = Icmpv6Message::parse(payload);
+        let mut out = Vec::new();
+        ip.write(payload.len(), &mut out);
     }
     if let Ok((ip, payload)) = Ipv4Header::parse(buf) {
         let _ = TcpHeader::checksum_valid(ip.src, ip.dst, payload);

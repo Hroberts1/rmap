@@ -112,7 +112,7 @@ sudo setcap cap_net_raw+ep target/release/rmap
 ./target/release/rmap
 ```
 
-(`setcap` has to be repeated after every rebuild.) Without raw sockets, or on Windows and macOS, rmap still runs the scan and prints a warning in the log panel saying what it fell back to: a SYN scan becomes a TCP connect scan, a UDP scan uses ordinary connected UDP sockets, and discovery uses the TCP connect ping. The raw backend covers IPv4; IPv6 targets get the same fallbacks.
+(`setcap` has to be repeated after every rebuild.) Without raw sockets, or on Windows and macOS, rmap still runs the scan and prints a warning in the log panel saying what it fell back to: a SYN scan becomes a TCP connect scan, a UDP scan uses ordinary connected UDP sockets, and discovery uses the TCP connect ping. The raw backend covers IPv4 and IPv6 (Linux 4.5 or later for IPv6). IPv6 packets are built by rmap but routed by the kernel, which also does neighbour discovery, so there is no IPv6 equivalent of the ARP ping: discovery uses ICMPv6 echo raced against the TCP connect ping. IPv6 targets fall back to unprivileged probes (with a warning) when the host has no IPv6, for link-local addresses (zone IDs like `fe80::1%eth0` aren't accepted yet) and for IPv4-mapped addresses.
 
 Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` stop · `e` export · `c` compare with a saved scan · `n` new scan · `q` quit.
 
@@ -156,7 +156,7 @@ crates/
 ├── rmap-engine   async scan engine (tokio)
 ├── rmap-detect   service detection: probes, matcher, TLS, CPEs
 ├── rmap-log      local log files and crash reports (no dependencies)
-├── rmap-packet   Ethernet/ARP/IPv4/TCP/UDP/ICMP building and parsing (no dependencies)
+├── rmap-packet   Ethernet/ARP/IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 building and parsing (no dependencies)
 ├── rmap-report   scan reports: JSON, Nmap XML, Markdown, CSV and HTML export, saved scans, diffs
 ├── rmap-vuln     vulnerability matching: CPE -> CVE lookup against a local database (no dependencies beyond rmap-core)
 └── rmap-tui      ratatui front end
@@ -333,7 +333,7 @@ unshare -rn sh -c 'ip link set lo up && target/debug/deps/rmap_engine-<hash> --i
 ## Roadmap
 
 - [x] **M1: engine + TUI shell.** Target parsing, TCP connect scan, unprivileged discovery, live results.
-- [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. (IPv6 raw scans and RTT-adaptive timeouts are still to do.)
+- [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. IPv6 SYN and UDP scans and ICMPv6 echo discovery too. (RTT-adaptive timeouts are still to do.)
 - [x] **M3: service detection.** rmap's own probe and match database, version strings, TLS certificate names, CPE identifiers.
 - [x] **M4: vulnerability matching.** Offline CPE → CVE lookup against a locally cached, hand-curated starter set of public CVEs, flagged as *potentially* vulnerable to allow for vendor backports.
 - [x] **M5: export and diffing.** JSON and XML export from the TUI, saved scans, and comparing two scans.

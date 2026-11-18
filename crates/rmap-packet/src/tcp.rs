@@ -1,8 +1,8 @@
 //! TCP headers and options (RFC 9293, RFC 7323, RFC 2018).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::checksum::transport_checksum;
+use crate::checksum::{transport_checksum, transport_checksum_v6};
 use crate::ipv4::PROTO_TCP;
 use crate::{Error, Result, be16, be32, need};
 
@@ -212,6 +212,19 @@ impl TcpHeader {
     /// Append the header and `payload`, with the checksum computed over the
     /// IPv4 pseudo-header for `src` and `dst`.
     pub fn write(&self, src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8], out: &mut Vec<u8>) {
+        self.write_with(payload, out, |seg| {
+            transport_checksum(src, dst, PROTO_TCP, seg)
+        });
+    }
+
+    /// [`TcpHeader::write`] over the IPv6 pseudo-header.
+    pub fn write_v6(&self, src: Ipv6Addr, dst: Ipv6Addr, payload: &[u8], out: &mut Vec<u8>) {
+        self.write_with(payload, out, |seg| {
+            transport_checksum_v6(src, dst, PROTO_TCP, seg)
+        });
+    }
+
+    fn write_with(&self, payload: &[u8], out: &mut Vec<u8>, checksum: impl FnOnce(&[u8]) -> u16) {
         let start = out.len();
         let opts = self.encoded_options();
         let offset = ((MIN_HEADER_LEN + opts.len()) / 4) as u8;
@@ -226,7 +239,7 @@ impl TcpHeader {
         out.extend_from_slice(&self.urgent.to_be_bytes());
         out.extend_from_slice(&opts);
         out.extend_from_slice(payload);
-        let c = transport_checksum(src, dst, PROTO_TCP, &out[start..]);
+        let c = checksum(&out[start..]);
         out[start + 16..start + 18].copy_from_slice(&c.to_be_bytes());
     }
 
@@ -262,6 +275,11 @@ impl TcpHeader {
     /// Whether `segment` (header and payload) carries a correct checksum.
     pub fn checksum_valid(src: Ipv4Addr, dst: Ipv4Addr, segment: &[u8]) -> bool {
         transport_checksum(src, dst, PROTO_TCP, segment) == 0
+    }
+
+    /// [`TcpHeader::checksum_valid`] over IPv6.
+    pub fn checksum_valid_v6(src: Ipv6Addr, dst: Ipv6Addr, segment: &[u8]) -> bool {
+        transport_checksum_v6(src, dst, PROTO_TCP, segment) == 0
     }
 }
 
@@ -361,6 +379,23 @@ mod tests {
         buf[12] = 0x60; // claims 24 bytes, only 20 present
         assert!(TcpHeader::parse(&buf).is_err());
         assert!(TcpHeader::parse_prefix(&buf[..7]).is_err());
+    }
+
+    #[test]
+    fn v6_checksum_uses_the_v6_pseudo_header() {
+        let (a, b) = (
+            "2001:db8::1".parse().unwrap(),
+            "2001:db8::2".parse().unwrap(),
+        );
+        let h = TcpHeader::syn(40000, 443, 7);
+        let (mut v4, mut v6) = (Vec::new(), Vec::new());
+        h.write(SRC, DST, b"x", &mut v4);
+        h.write_v6(a, b, b"x", &mut v6);
+        assert_eq!(v4[..16], v6[..16], "only the checksum differs");
+        assert_eq!(v4[18..], v6[18..]);
+        assert!(TcpHeader::checksum_valid_v6(a, b, &v6));
+        assert!(!TcpHeader::checksum_valid_v6(a, a, &v6));
+        assert_eq!(TcpHeader::parse(&v6).unwrap().1, b"x");
     }
 
     #[test]
