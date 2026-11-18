@@ -1,0 +1,15 @@
+[package]
+name = "rmap-detect"
+description = "Service and version detection for rmap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmap-core = { workspace = true }
+rmap-log = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros"] }

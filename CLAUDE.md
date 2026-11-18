@@ -15,6 +15,7 @@ A from-scratch network scanner in Rust with an interactive TUI. Read README.md f
 |---|---|
 | `rmap-core` | Shared types: `Target`, `PortList`, `Timing`, `ScanType`, `Protocol`, `PortState`, `PortResult`, `Service`, `ScanEvent`. Optional `serde` feature. |
 | `rmap-engine` | Async scan engine. `Scan::start(handle, ScanConfig)` streams `ScanEvent`s. |
+| `rmap-detect` | Service detection: probe database (`probes.txt`), pattern matcher, TLS/DER parsing, CPE table. `detect(ip, port, protocol, timing)`. |
 | `rmap-log` | Local logs and crash reports. Use `rmap_log::{error,warn,info,debug,trace}!`. |
 | `rmap-packet` | Ethernet/ARP/IPv4/TCP/UDP/ICMPv4 building and parsing, RFC 1071 checksums. No dependencies; parsers never panic. |
 | `rmap-tui` | Setup form (`app.rs` state, `ui.rs` drawing) and live results. |
@@ -29,7 +30,7 @@ These in `rmap-core` exist so parallel milestones agree on shapes. Extend them; 
 - `PortResult { port, protocol, state, rtt, service: Option<Service> }`, built with `PortResult::new`
 - `Service { name, product, version, info, os_hint, cpes, method, confidence }`
 - `ScanEvent::Service { ip, protocol, port, service }`: detection results sent after the `Port` event
-- `ScanConfig { .., scan_type, service_detection }` in `rmap-engine`. SYN/UDP are implemented (raw backend in `rmap-engine/src/raw`, chosen in `backend.rs`, with unprivileged fallbacks). Service detection still has a placeholder warning in `rmap_engine::run`; **Milestone 3 removes it**.
+- `ScanConfig { .., scan_type, service_detection }` in `rmap-engine`. SYN/UDP are implemented (raw backend in `rmap-engine/src/raw`, chosen in `backend.rs`, with unprivileged fallbacks). Service detection is implemented (`rmap-detect`, wired in via `rmap-engine/src/service.rs`). No placeholder warnings remain for either in `rmap_engine::run`.
 
 ## Conventions
 

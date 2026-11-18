@@ -23,6 +23,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 rmap-core = { path = "crates/rmap-core" }
+rmap-detect = { path = "crates/rmap-detect" }
 rmap-engine = { path = "crates/rmap-engine" }
 rmap-log = { path = "crates/rmap-log" }
 rmap-packet = { path = "crates/rmap-packet" }

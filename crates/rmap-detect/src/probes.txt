@@ -1,0 +1,376 @@
+# rmap service probe database.
+#
+# Written for rmap from protocol documentation and observed banners. The
+# format is described in crates/rmap-detect/src/db.rs and README.md.
+#
+# Probe order matters: on a port, probes that list it in `ports` run first
+# (in file order), then `generic` probes. Within a probe, the first matching
+# rule wins, so put specific rules before general ones. Every rule needs a
+# test banner in crates/rmap-detect/src/rule_tests.rs.
+
+# ----------------------------------------------------------------- banner ---
+# Many services speak first. Send nothing and read.
+probe banner
+  ports    21,22,23,25,110,143,587,2121,2222,3306,5900-5903
+  wait     3s
+  generic
+
+# --- SSH
+match ssh ^SSH-([\d.]+)-OpenSSH_for_Windows_([\w.]+)
+  product  OpenSSH
+  version  $2
+  info     protocol $1
+  os       Windows
+match ssh ^SSH-([\d.]+)-OpenSSH_([\w.]+) (Ubuntu-\S+)
+  product  OpenSSH
+  version  $2
+  info     protocol $1; $3
+  os       Ubuntu Linux
+match ssh ^SSH-([\d.]+)-OpenSSH_([\w.]+) (Debian-\S+)
+  product  OpenSSH
+  version  $2
+  info     protocol $1; $3
+  os       Debian Linux
+match ssh ^SSH-([\d.]+)-OpenSSH_([\w.]+) (Raspbian-\S+)
+  product  OpenSSH
+  version  $2
+  info     protocol $1; $3
+  os       Raspbian Linux
+match ssh ^SSH-([\d.]+)-OpenSSH_([\w.]+) (FreeBSD-\S+)
+  product  OpenSSH
+  version  $2
+  info     protocol $1; $3
+  os       FreeBSD
+match ssh ^SSH-([\d.]+)-OpenSSH_([\w.]+)(?: ([^\r\n]+))?
+  product  OpenSSH
+  version  $2
+  info     protocol $1; $3
+match ssh ^SSH-([\d.]+)-dropbear(?:_([\w.]+))?
+  product  Dropbear sshd
+  version  $2
+  info     protocol $1
+match ssh ^SSH-([\d.]+)-([^\r\n]+)
+  info     protocol $1; $2
+  confidence 7
+
+# --- FTP
+match ftp ^220[ -][^\r\n]*\(vsFTPd ([\d.]+)\)
+  product  vsftpd
+  version  $1
+match ftp ^220[ -]ProFTPD(?: ([\d.]+[a-z]*\d*))? Server \((Debian|Ubuntu)\)
+  product  ProFTPD
+  version  $1
+  os       $2 Linux
+match ftp ^220[ -]ProFTPD(?: ([\d.]+[a-z]*\d*))? Server(?: \(([^)\r\n]*)\))?
+  product  ProFTPD
+  version  $1
+  info     $2
+match ftp ^220-+ Welcome to Pure-FTPd
+  product  Pure-FTPd
+match ftp ^220[ -]FileZilla Server(?: version)? ([\w.]+(?: beta)?)
+  product  FileZilla ftpd
+  version  $1
+  os       Windows
+match ftp ^220[ -]Microsoft FTP Service
+  product  Microsoft ftpd
+  os       Windows
+match ftp (?i)^220[ -][^\r\n]*ftp
+  confidence 6
+
+# --- SMTP
+match smtp ^220[ -][^\r\n]*Microsoft ESMTP MAIL Service(?:, Version: ([\d.]+))?
+  product  Microsoft Exchange smtpd
+  version  $1
+  os       Windows
+match smtp ^220[ -](\S+) ESMTP Postfix(?: \(([^)\r\n]+)\))?
+  product  Postfix smtpd
+  info     host $1
+  os       $2
+match smtp ^220[ -](\S+) ESMTP Exim ([\d.]+)
+  product  Exim smtpd
+  version  $2
+  info     host $1
+match smtp ^220[ -](\S+) ESMTP Sendmail ([\w.]+)/([\w.]+)
+  product  Sendmail
+  version  $2
+  info     host $1; config $3
+match smtp ^220[ -](\S+) [^\r\n]*E?SMTP
+  info     host $1
+  confidence 6
+
+# --- POP3 and IMAP
+match pop3 ^\+OK Dovecot(?: \(([^)\r\n]+)\))? ready
+  product  Dovecot pop3d
+  os       $1
+match pop3 ^\+OK Hello there
+  product  Courier pop3d
+match pop3 ^\+OK[^\r\n]*\r?\n
+  confidence 6
+match imap ^\* OK [^\r\n]*Dovecot(?: \(([^)\r\n]+)\))? ready
+  product  Dovecot imapd
+  os       $1
+match imap ^\* OK [^\r\n]*Courier-IMAP ready
+  product  Courier Imapd
+match imap ^\* (?:OK|PREAUTH)[^\r\n]*\r?\n
+  confidence 6
+
+# --- MySQL and MariaDB greeting: 3-byte length, sequence 0, protocol 10,
+# then a NUL-terminated version string. MariaDB prefixes "5.5.5-".
+match mysql ^[\s\S]{3}\x00\x0a(?:5\.5\.5-)?([\d.]+)-([^\x00]*MariaDB[^\x00]*(?:ubuntu|ubu\d)[^\x00]*)\x00
+  product  MariaDB
+  version  $1
+  info     $2
+  os       Ubuntu Linux
+match mysql ^[\s\S]{3}\x00\x0a(?:5\.5\.5-)?([\d.]+)-([^\x00]*MariaDB[^\x00]*deb[^\x00]*)\x00
+  product  MariaDB
+  version  $1
+  info     $2
+  os       Debian Linux
+match mysql ^[\s\S]{3}\x00\x0a(?:5\.5\.5-)?([\d.]+)-([^\x00]*MariaDB[^\x00]*)\x00
+  product  MariaDB
+  version  $1
+  info     $2
+match mysql ^[\s\S]{3}\x00\x0a([\d.]+)(-[^\x00]*ubuntu[^\x00]*)\x00
+  product  MySQL
+  version  $1
+  info     $2
+  os       Ubuntu Linux
+match mysql ^[\s\S]{3}\x00\x0a([4-9]\.[\d.]+)([^\x00]*)\x00
+  product  MySQL
+  version  $1
+  info     $2
+match mysql ^[\s\S]{3}\x00\xff[\s\S]{2}(?:#\w{5})?Host '[^']*' is not allowed to connect to this (MySQL|MariaDB) server
+  product  $1
+  info     host not allowed to connect
+match mysql ^[\s\S]{3}\x00\xff\x10\x04Too many connections
+  info     too many connections
+  confidence 7
+
+# --- Remote consoles
+match vnc ^RFB 003\.889\n
+  product  Apple remote desktop vnc
+  os       macOS
+match vnc ^RFB (\d{3}\.\d{3})\n
+  info     RFB protocol $1
+  confidence 8
+match telnet ^\xff[\xfb-\xfe]
+  confidence 7
+
+# --------------------------------------------------------------- http-get ---
+probe http-get
+  send     "GET / HTTP/1.0\r\nUser-Agent: rmap\r\nAccept: */*\r\n\r\n"
+  ports    80,81,591,2375,3000,5000,5601,5985,8000,8008,8080,8081,8888,9000,9090,9200,10000,15672
+  wait     5s
+  generic
+  fallback banner rtsp-options sip-options
+
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?"version"\s*:\s*\{\s*"number"\s*:\s*"([\w.-]+)"[\s\S]*?"tagline"\s*:\s*"You Know, for Search"
+  product  Elasticsearch
+  version  $1
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nX-elastic-product: Elasticsearch
+  product  Elasticsearch
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer: nginx(?:/([\d.]+))?(?: \(([^)\r\n]+)\))?\r\n
+  product  nginx
+  version  $1
+  os       $2
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer: Apache-Coyote/([\d.]+)\r\n
+  product  Apache Tomcat Coyote
+  version  $1
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer: Apache(?:/([\d.]+))?(?: \(([^)\r\n]+)\))?(?: ([^\r\n]*))?\r\n
+  product  Apache httpd
+  version  $1
+  info     $3
+  os       $2
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer: Microsoft-IIS/([\d.]+)
+  product  Microsoft IIS httpd
+  version  $1
+  os       Windows
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer: Microsoft-HTTPAPI/([\d.]+)
+  product  Microsoft HTTPAPI httpd
+  version  $1
+  os       Windows
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer: lighttpd(?:/([\d.]+))?\r\n
+  product  lighttpd
+  version  $1
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer: Caddy\r\n
+  product  Caddy
+match http (?i)^HTTP/1\.[01] \d\d\d[\s\S]*?\r\nServer:[ \t]*([^\r\n/ ]+)(?:/(\S+))?([^\r\n]*)
+  product  $1
+  version  $2
+  info     $3
+  confidence 7
+match http ^HTTP/1\.[01] (\d\d\d)
+  confidence 7
+
+# -------------------------------------------------------------------- tls ---
+# The response is analysed in code (tls.rs): protocol version, and the
+# certificate's subject and names when the server sends it in the clear.
+probe tls
+  send     @tls-client-hello
+  ports    443,465,636,853,990,992,993,995,2376,4443,5061,5986,6443,8443,9443
+  wait     4s
+  generic
+  fallback banner
+
+# ---------------------------------------------------------- rtsp-options ---
+probe rtsp-options
+  send     "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: rmap\r\n\r\n"
+  ports    554,8554
+  fallback banner
+
+match rtsp (?i)^RTSP/1\.0 \d\d\d[\s\S]*?\r\nServer: ([^\r\n/]+?)(?:/([\w.-]+))?\r\n
+  product  $1
+  version  $2
+match rtsp ^RTSP/1\.0 \d\d\d
+  confidence 7
+
+# ----------------------------------------------------------- sip-options ---
+probe sip-options
+  send     "OPTIONS sip:rmap.invalid SIP/2.0\r\nVia: SIP/2.0/TCP rmap.invalid:5060;branch=z9hG4bK-rmap-1\r\nMax-Forwards: 70\r\nFrom: <sip:rmap@rmap.invalid>;tag=rmap1\r\nTo: <sip:rmap@rmap.invalid>\r\nCall-ID: rmap-probe-1@rmap.invalid\r\nCSeq: 1 OPTIONS\r\nContact: <sip:rmap@rmap.invalid>\r\nAccept: application/sdp\r\nContent-Length: 0\r\n\r\n"
+  ports    5060,5080
+  fallback banner
+
+match sip (?i)^SIP/2\.0 \d\d\d[\s\S]*?\r\n(?:Server|User-Agent): Asterisk PBX ([\w.~-]+)
+  product  Asterisk
+  version  $1
+match sip (?i)^SIP/2\.0 \d\d\d[\s\S]*?\r\n(?:Server|User-Agent): ([^\r\n]+)
+  product  $1
+  confidence 7
+match sip ^SIP/2\.0 \d\d\d
+  confidence 7
+
+# ----------------------------------------------------------------- redis ---
+# PING then INFO, pipelined.
+probe redis
+  send     "*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nINFO\r\n"
+  ports    6379,6380
+  fallback banner
+
+match redis ^\+PONG\r\n\$\d+\r\n# Server\r\nredis_version:[\d.]+\r\n(?:[^\r\n]*\r\n)*?valkey_version:([\d.]+)\r\n[\s\S]*?\r\nos:(\w+)
+  product  Valkey
+  version  $1
+  os       $2
+match redis ^\+PONG\r\n\$\d+\r\n# Server\r\nredis_version:([\d.]+)\r\n[\s\S]*?\r\nos:(\w+)
+  product  Redis
+  version  $1
+  os       $2
+match redis ^\+PONG\r\n\$\d+\r\n# Server\r\nredis_version:([\d.]+)
+  product  Redis
+  version  $1
+match redis ^-NOAUTH
+  product  Redis
+  info     authentication required
+match redis ^-DENIED Redis is running in protected mode
+  product  Redis
+  info     protected mode
+match redis ^\+PONG\r\n
+  product  Redis
+
+# ------------------------------------------------------------- memcached ---
+probe memcached
+  send     "version\r\n"
+  ports    11211
+  fallback banner
+
+match memcached ^VERSION ([\d.]+)\r\n
+  product  Memcached
+  version  $1
+
+# --------------------------------------------------------------- mongodb ---
+probe mongodb
+  send     @mongodb-buildinfo
+  ports    27017-27019
+  fallback banner
+
+match mongodb \x02version\x00[\s\S]{4}(\d+\.[\w.-]+)\x00
+  product  MongoDB
+  version  $1
+match mongodb ^[\s\S]{12}\xdd\x07\x00\x00
+  product  MongoDB
+  confidence 7
+
+# -------------------------------------------------------------- postgres ---
+# StartupMessage for user "rmap", database "rmap", protocol 3.0.
+probe postgres
+  send     "\x00\x00\x00\x21\x00\x03\x00\x00user\x00rmap\x00database\x00rmap\x00\x00"
+  ports    5432,5433
+  fallback banner
+
+match postgresql ^R\x00\x00\x00\x08\x00\x00\x00\x00[\s\S]*?S[\s\S]{4}server_version\x00([\d.]+)(?: \(([^)\x00]+)\))?
+  product  PostgreSQL
+  version  $1
+  info     $2; no authentication required
+match postgresql ^R\x00\x00\x00[\x08-\x7f]\x00\x00\x00[\x03\x05\x0a]
+  product  PostgreSQL
+  info     authentication required
+match postgresql ^E[\s\S]{4}S(?:FATAL|ERROR|PANIC)\x00[\s\S]*?M([^\x00]+)\x00
+  product  PostgreSQL
+  info     error: $1
+
+# ------------------------------------------------------------------- smb ---
+probe smb
+  send     @smb-negotiate
+  ports    139,445
+  fallback banner
+
+match smb ^\x00[\s\S]{3}\xfeSMB
+  info     SMB2 or later
+  confidence 8
+match smb ^\x00[\s\S]{3}\xffSMBr\x00\x00\x00\x00
+  info     SMB1 only
+  confidence 8
+match netbios-ssn ^\x83\x00\x00\x01
+  info     session request refused
+  confidence 7
+
+# ------------------------------------------------------------------- rdp ---
+# X.224 Connection Request with an RDP negotiation request (TLS + CredSSP).
+probe rdp
+  send     "\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x03\x00\x00\x00"
+  ports    3389
+  fallback banner
+
+match rdp ^\x03\x00\x00[\s\S]\x0e\xd0
+  info     X.224 connection confirm
+  confidence 8
+
+# ------------------------------------------------------------------ amqp ---
+probe amqp
+  send     "AMQP\x00\x00\x09\x01"
+  ports    5672
+  fallback banner
+
+match amqp ^\x01\x00\x00[\s\S]{4}\x00\x0a\x00\x0a\x00\x09[\s\S]*?\x07productS[\s\S]{4}RabbitMQ[\s\S]*?\x07versionS[\s\S]{4}([\d.]+)
+  product  RabbitMQ
+  version  $1
+  info     AMQP 0-9-1
+match amqp ^\x01\x00\x00[\s\S]{4}\x00\x0a\x00\x0a
+  info     AMQP 0-9-1
+  confidence 8
+match amqp ^AMQP\x00[\s\S]{3}
+  info     protocol header only
+  confidence 7
+
+# ------------------------------------------------------------------ mqtt ---
+# CONNECT, protocol level 4 (3.1.1), clean session, client id "rmap".
+probe mqtt
+  send     "\x10\x10\x00\x04MQTT\x04\x02\x00\x3c\x00\x04rmap"
+  ports    1883
+  fallback banner
+
+match mqtt ^\x20\x02[\x00\x01]\x00
+  info     connection accepted without credentials
+  confidence 8
+match mqtt ^\x20\x02\x00[\x04\x05]
+  info     authentication required
+  confidence 8
+match mqtt ^\x20\x02\x00[\x01-\x03]
+  confidence 7
+
+# --------------------------------------------------------- generic-lines ---
+# Blank lines provoke an error message from many line-based protocols.
+probe generic-lines
+  send     "\r\n\r\n"
+  wait     3s
+  generic
+  fallback banner http-get rtsp-options sip-options

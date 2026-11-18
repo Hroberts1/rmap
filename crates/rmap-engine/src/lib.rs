@@ -22,6 +22,7 @@ mod backend;
 pub mod payloads;
 pub mod rate;
 pub mod raw;
+mod service;
 pub mod tcp;
 pub mod udp;
 
@@ -32,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rmap_core::{HostState, PortList, PortState, ScanEvent, ScanType, Target, Timing};
+use rmap_core::{HostState, PortList, PortState, Protocol, ScanEvent, ScanType, Target, Timing};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -51,7 +52,7 @@ pub struct ScanConfig {
     pub discovery: bool,
     /// Technique used to probe ports.
     pub scan_type: ScanType,
-    /// Identify the software behind open ports (Milestone 3).
+    /// Identify the software behind open ports.
     pub service_detection: bool,
 }
 
@@ -211,6 +212,8 @@ struct Shared {
     /// Set once the user has been told IPv6 targets can't use raw probes.
     ipv6_warned: AtomicBool,
     probe_slots: Semaphore,
+    /// Present when service detection is on.
+    services: Option<service::Detection>,
     tx: UnboundedSender<ScanEvent>,
     progress: Arc<Progress>,
     stats: Arc<Stats>,
@@ -261,12 +264,6 @@ async fn run(
         rmap_log::warn!("{msg}");
         let _ = tx.send(ScanEvent::Warning(msg));
     }
-    // Placeholder until Milestone 3 lands; replace it when it does.
-    if config.service_detection {
-        let msg = "service detection is not implemented yet".to_string();
-        rmap_log::warn!("{msg}");
-        let _ = tx.send(ScanEvent::Warning(msg));
-    }
     let hosts: u64 = config.targets.iter().map(Target::count).sum();
     let per_host = config.ports.len();
     progress
@@ -286,6 +283,9 @@ async fn run(
         prober,
         ipv6_warned: AtomicBool::new(false),
         probe_slots: Semaphore::new(config.timing.concurrency),
+        services: config
+            .service_detection
+            .then(|| service::Detection::new(config.timing)),
         tx,
         progress,
         stats,
@@ -354,6 +354,13 @@ async fn run(
         load(&s.socket_backoffs),
         load(&s.task_panics),
     );
+    if let Some(d) = &shared.services {
+        rmap_log::info!(
+            "service detection: {} of {} open ports identified",
+            load(&d.identified),
+            load(&d.attempted)
+        );
+    }
     if load(&s.unexpected_errors) > 0 {
         rmap_log::info!("connect errors by kind: {}", s.error_summary());
     }
@@ -452,7 +459,6 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         let (sh, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
         let prober = prober.clone();
         probes.spawn(async move {
-            let _slot = slot;
             let result = prober.probe(ip, port, &sh.timing, &sh.stats).await;
             sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
@@ -464,7 +470,14 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                         result.protocol.as_str(),
                         result.rtt
                     );
+                    let open = result.state == PortState::Open;
                     let _ = sh.tx.send(ScanEvent::Port { ip, result });
+                    if let Some(services) = sh.services.as_ref().filter(|_| open) {
+                        // Free the probe slot first so detection can't
+                        // hold up the port scan.
+                        drop(slot);
+                        services.identify(ip, port, Protocol::Tcp, &sh.tx).await;
+                    }
                 }
                 PortState::Closed => {
                     sh.stats.closed.fetch_add(1, Ordering::Relaxed);

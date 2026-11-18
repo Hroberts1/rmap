@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
-use rmap_core::{HostState, PortState, Timing, service_name};
+use rmap_core::{HostState, PortState, Service, Timing, service_name};
 
 use crate::app::{App, Field, HostRow, ScanView, Screen};
 
@@ -390,7 +390,7 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &ScanView) {
     .areas(inner);
     frame.render_widget(Paragraph::new(host_info(host)), info);
 
-    let rows = host.open.iter().map(|p| {
+    let rows = host.open.iter().flat_map(|p| {
         let state_color = match p.state {
             PortState::Open => Color::Green,
             _ => Color::Yellow,
@@ -402,13 +402,23 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &ScanView) {
                 String::new(),
             ),
         };
-        Row::new(vec![
+        let main = Row::new(vec![
             Cell::from(format!("{}/{}", p.port, p.protocol.as_str())),
             Cell::from(p.state.as_str()).fg(state_color),
             Cell::from(name),
             Cell::from(version),
             Cell::from(p.rtt.map(fmt_rtt).unwrap_or_default()).dim(),
-        ])
+        ]);
+        let detail = p.service.as_ref().and_then(service_detail).map(|d| {
+            Row::new(vec![
+                Cell::default(),
+                Cell::default(),
+                Cell::default(),
+                Cell::from(d),
+            ])
+            .dim()
+        });
+        std::iter::once(main).chain(detail)
     });
     let table = Table::new(
         rows,
@@ -438,6 +448,22 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &ScanView) {
         "scanning…".into()
     };
     frame.render_widget(Paragraph::new(not_shown).dim(), footer);
+}
+
+/// Extra detection results for a port, on one line: info, OS hint and the
+/// CPE (without its trailing wildcards).
+fn service_detail(s: &Service) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(info) = &s.info {
+        parts.push(info.clone());
+    }
+    if let Some(os) = &s.os_hint {
+        parts.push(format!("os: {os}"));
+    }
+    if let Some(cpe) = s.cpes.first() {
+        parts.push(cpe.trim_end_matches(":*").to_string());
+    }
+    (!parts.is_empty()).then(|| format!("└ {}", parts.join(" · ")))
 }
 
 fn host_info(h: &HostRow) -> Vec<Line<'static>> {
@@ -529,5 +555,26 @@ fn fmt_elapsed(d: Duration) -> String {
         format!("{}m{:02}s", s / 60, s % 60)
     } else {
         format!("{:.1}s", d.as_secs_f64())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_detail_line() {
+        let mut s = Service {
+            name: "ssh".into(),
+            ..Default::default()
+        };
+        assert_eq!(service_detail(&s), None);
+        s.info = Some("protocol 2.0".into());
+        s.os_hint = Some("Ubuntu Linux".into());
+        s.cpes = vec!["cpe:2.3:a:openbsd:openssh:8.9:p1:*:*:*:*:*:*".into()];
+        assert_eq!(
+            service_detail(&s).as_deref(),
+            Some("└ protocol 2.0 · os: Ubuntu Linux · cpe:2.3:a:openbsd:openssh:8.9:p1")
+        );
     }
 }
