@@ -36,7 +36,9 @@ impl Detection {
         }
     }
 
-    /// Detect the service on an open port and report it. UDP plugs in here
+    /// Detect the service on an open port and report it, returning it so
+    /// the caller can feed its CPEs into vulnerability matching (M4)
+    /// without this module needing to know that exists. UDP plugs in here
     /// once `rmap_detect` has UDP probes; it already accepts the protocol.
     pub async fn identify(
         &self,
@@ -44,14 +46,12 @@ impl Detection {
         port: u16,
         protocol: Protocol,
         tx: &UnboundedSender<ScanEvent>,
-    ) {
+    ) -> Option<rmap_core::Service> {
         let Ok(_permit) = self.slots.acquire().await else {
-            return;
+            return None;
         };
         self.attempted.fetch_add(1, Ordering::Relaxed);
-        let Some(service) = rmap_detect::detect(ip, port, protocol, &self.timing).await else {
-            return;
-        };
+        let service = rmap_detect::detect(ip, port, protocol, &self.timing).await?;
         if service.method != rmap_core::DetectMethod::PortTable {
             self.identified.fetch_add(1, Ordering::Relaxed);
         }
@@ -67,8 +67,9 @@ impl Detection {
             ip,
             protocol,
             port,
-            service,
+            service: service.clone(),
         });
+        Some(service)
     }
 }
 

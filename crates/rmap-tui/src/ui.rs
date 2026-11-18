@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
-use rmap_core::{HostState, PortState, Service, Timing, service_name};
+use rmap_core::{HostState, PortResult, PortState, Service, Timing, VulnSeverity, service_name};
 
 use crate::app::{App, Field, HostRow, ScanView, Screen};
 
@@ -64,7 +64,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     let area = centered(
         frame.area(),
         76.min(frame.area().width),
-        21.min(frame.area().height),
+        22.min(frame.area().height),
     );
     let block = Block::bordered()
         .title(Line::from(" rmap · new scan ").bold().fg(ACCENT))
@@ -82,6 +82,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         timing_hint,
         discovery,
         services,
+        vulns,
         _,
         error,
         log_line,
@@ -93,6 +94,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
@@ -200,6 +202,19 @@ fn draw_setup(frame: &mut Frame, app: &App) {
             Span::raw(services_check),
         ])),
         services,
+    );
+
+    let vulns_check = if form.vuln_matching {
+        "[x] flag potential CVEs for identified services (needs Services on)"
+    } else {
+        "[ ] don't check for known vulnerabilities"
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            label(Field::Vulns, "Vulns"),
+            Span::raw(vulns_check),
+        ])),
+        vulns,
     );
 
     if let Some(err) = &form.error {
@@ -423,15 +438,19 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &ScanView) {
             Cell::from(p.rtt.map(fmt_rtt).unwrap_or_default()).dim(),
         ]);
         let detail = p.service.as_ref().and_then(service_detail).map(|d| {
+            // Cell::default() has column_span 0 (a span-continuation
+            // marker), not a real empty column - it would collapse these
+            // placeholders and put `d` in column 0 instead of the wide
+            // VERSION column. Cell::from("") is a real empty cell.
             Row::new(vec![
-                Cell::default(),
-                Cell::default(),
-                Cell::default(),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
                 Cell::from(d),
             ])
             .dim()
         });
-        std::iter::once(main).chain(detail)
+        std::iter::once(main).chain(detail).chain(vuln_rows(p))
     });
     let table = Table::new(
         rows,
@@ -461,6 +480,31 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &ScanView) {
         "scanning…".into()
     };
     frame.render_widget(Paragraph::new(not_shown).dim(), footer);
+}
+
+/// One row per potential CVE on a port (M4), colored by severity.
+fn vuln_rows(p: &PortResult) -> impl Iterator<Item = Row<'static>> {
+    p.vulnerabilities.iter().map(|v| {
+        let color = match v.severity {
+            VulnSeverity::Critical | VulnSeverity::High => Color::Red,
+            VulnSeverity::Medium => Color::Yellow,
+            VulnSeverity::Low => Color::Gray,
+        };
+        let score = v.score.map(|s| format!(" {s}")).unwrap_or_default();
+        Row::new(vec![
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(format!(
+                "└ {} ({}{}): {}",
+                v.id,
+                v.severity.as_str(),
+                score,
+                v.summary
+            )),
+        ])
+        .fg(color)
+    })
 }
 
 /// Extra detection results for a port, on one line: info, OS hint and the

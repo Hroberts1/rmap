@@ -31,7 +31,7 @@ fn data_dir() -> PathBuf {
 }
 
 /// A saved scan, as listed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SavedScan {
     pub path: PathBuf,
     pub report: ScanReport,

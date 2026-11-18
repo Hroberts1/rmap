@@ -7,6 +7,7 @@ pub mod scan;
 pub mod service;
 pub mod target;
 pub mod timing;
+pub mod vuln;
 
 pub use ports::{PortList, service_name};
 pub use result::{HostState, PortResult, PortState, Protocol, ScanEvent};
@@ -14,6 +15,7 @@ pub use scan::ScanType;
 pub use service::{DetectMethod, Service};
 pub use target::{Target, parse_targets};
 pub use timing::Timing;
+pub use vuln::{VulnSeverity, Vulnerability};
 
 /// Error returned when user input cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]

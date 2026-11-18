@@ -57,7 +57,7 @@ pub struct ConfigSummary {
 }
 
 /// One host's results.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HostReport {
     pub ip: IpAddr,
     #[serde(default)]
@@ -105,7 +105,7 @@ impl HostReport {
 }
 
 /// A complete record of one scan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanReport {
     pub format_version: u32,
     pub rmap_version: String,

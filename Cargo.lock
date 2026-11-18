@@ -1165,6 +1165,7 @@ dependencies = [
  "rmap-detect",
  "rmap-log",
  "rmap-packet",
+ "rmap-vuln",
  "tokio",
 ]
 
@@ -1196,6 +1197,13 @@ dependencies = [
  "rmap-log",
  "rmap-report",
  "tokio",
+]
+
+[[package]]
+name = "rmap-vuln"
+version = "0.1.0"
+dependencies = [
+ "rmap-core",
 ]
 
 [[package]]

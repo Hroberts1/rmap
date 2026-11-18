@@ -28,16 +28,18 @@ pub enum Field {
     Timing,
     Discovery,
     Services,
+    Vulns,
 }
 
 impl Field {
-    const ALL: [Field; 6] = [
+    const ALL: [Field; 7] = [
         Field::Targets,
         Field::Ports,
         Field::ScanType,
         Field::Timing,
         Field::Discovery,
         Field::Services,
+        Field::Vulns,
     ];
 
     fn step(self, forward: bool) -> Field {
@@ -58,6 +60,10 @@ pub struct Form {
     pub timing: u8,
     pub discovery: bool,
     pub service_detection: bool,
+    /// Look up detected services' CPEs in the local CVE database (M4).
+    /// Only takes effect with `service_detection` also on - there is
+    /// nothing to look up otherwise.
+    pub vuln_matching: bool,
     pub focus: Field,
     pub error: Option<String>,
 }
@@ -71,6 +77,7 @@ impl Default for Form {
             timing: 3,
             discovery: true,
             service_detection: false,
+            vuln_matching: false,
             focus: Field::Targets,
             error: None,
         }
@@ -200,6 +207,25 @@ impl ScanView {
                     Some(p) => p.service = Some(service),
                     None => rmap_log::warn!(
                         "service for {ip} {port}/{} arrived before its port",
+                        protocol.as_str()
+                    ),
+                }
+            }
+            ScanEvent::Vulnerabilities {
+                ip,
+                protocol,
+                port,
+                findings,
+            } => {
+                let found = self.hosts.get_mut(&ip).and_then(|h| {
+                    h.open
+                        .iter_mut()
+                        .find(|p| p.port == port && p.protocol == protocol)
+                });
+                match found {
+                    Some(p) => p.vulnerabilities = findings,
+                    None => rmap_log::warn!(
+                        "vulnerabilities for {ip} {port}/{} arrived before its port",
                         protocol.as_str()
                     ),
                 }
@@ -396,6 +422,11 @@ impl App {
                         form.service_detection = !form.service_detection;
                     }
                 }
+                Field::Vulns => {
+                    if matches!(code, KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')) {
+                        form.vuln_matching = !form.vuln_matching;
+                    }
+                }
             },
         }
     }
@@ -469,6 +500,7 @@ impl App {
             discovery: form.discovery,
             scan_type: form.scan_type,
             service_detection: form.service_detection,
+            vuln_matching: form.vuln_matching,
         };
         if public.is_empty() {
             self.launch(config);
@@ -649,13 +681,14 @@ mod tests {
             Field::Timing,
             Field::Discovery,
             Field::Services,
+            Field::Vulns,
             Field::Targets,
         ] {
             press(&mut app, KeyCode::Tab);
             assert_eq!(app.form.focus, expected);
         }
         press(&mut app, KeyCode::BackTab);
-        assert_eq!(app.form.focus, Field::Services);
+        assert_eq!(app.form.focus, Field::Vulns);
     }
 
     #[test]
@@ -822,6 +855,7 @@ mod tests {
             name: "domain".into(),
             product: Some("ISC BIND".into()),
             version: Some("9.18".into()),
+            info: Some("protocol 2.0".into()),
             ..Default::default()
         };
         view.apply(ScanEvent::Service {
@@ -840,6 +874,64 @@ mod tests {
             screen.contains("53/udp") && screen.contains("ISC BIND 9.18"),
             "{screen}"
         );
+        // Regression: the detail row's leading placeholder cells must be
+        // real empty cells (Cell::from("")), not Cell::default() (column
+        // span 0), or this line collapses into column 0 and gets cut to
+        // ~10 characters.
+        assert!(screen.contains("protocol 2.0"), "{screen}");
+    }
+
+    #[test]
+    fn vulnerability_events_attach_to_their_port() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        view.apply(ScanEvent::Port {
+            ip,
+            result: PortResult::new(22, Protocol::Tcp, rmap_core::PortState::Open, None),
+        });
+        view.apply(ScanEvent::Vulnerabilities {
+            ip,
+            protocol: Protocol::Tcp,
+            port: 22,
+            findings: vec![rmap_core::Vulnerability {
+                id: "CVE-2024-6387".into(),
+                summary: "regreSSHion".into(),
+                severity: rmap_core::VulnSeverity::High,
+                score: Some(8.1),
+                published: None,
+            }],
+        });
+        let host = &view.hosts[&ip];
+        assert_eq!(host.open[0].vulnerabilities.len(), 1);
+        app.scan.as_mut().unwrap().selected = Some(ip);
+        let screen = render(&mut app, 160, 30);
+        assert!(
+            screen.contains("CVE-2024-6387") && screen.contains("regreSSHion"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn vulnerabilities_for_an_unknown_port_are_logged_not_lost() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        // No matching Port event first - this should warn, not panic.
+        view.apply(ScanEvent::Vulnerabilities {
+            ip,
+            protocol: Protocol::Tcp,
+            port: 9999,
+            findings: vec![rmap_core::Vulnerability {
+                id: "CVE-0000-0000".into(),
+                summary: "test".into(),
+                severity: rmap_core::VulnSeverity::Low,
+                score: None,
+                published: None,
+            }],
+        });
     }
 
     #[test]
@@ -854,6 +946,9 @@ mod tests {
         app.form.focus = Field::Services;
         press(&mut app, KeyCode::Char(' '));
         assert!(app.form.service_detection);
+        app.form.focus = Field::Vulns;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.form.vuln_matching);
     }
 
     #[test]
