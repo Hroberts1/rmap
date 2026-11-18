@@ -210,7 +210,7 @@ probe tls
   ports    443,465,636,853,990,992,993,995,2376,4443,5061,5986,6443,8443,9443
   wait     4s
   generic
-  fallback banner
+  fallback banner http-get
 
 # ---------------------------------------------------------- rtsp-options ---
 probe rtsp-options
