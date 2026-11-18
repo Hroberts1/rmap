@@ -198,7 +198,7 @@ pub fn to_string(r: &ScanReport) -> String {
     let end_ms = r.finished_ms.unwrap_or(r.started_ms);
     let end = end_ms.div_euclid(1000).to_string();
     let c = &r.config;
-    let args = format!(
+    let mut args = format!(
         "rmap targets={} ports={} scan={} timing=T{} discovery={} service_detection={}",
         c.targets,
         c.ports,
@@ -207,6 +207,12 @@ pub fn to_string(r: &ScanReport) -> String {
         c.discovery,
         c.service_detection
     );
+    if !c.exclude.is_empty() {
+        args += &format!(" exclude={}", c.exclude);
+    }
+    if let Some(rate) = c.max_rate {
+        args += &format!(" max_rate={rate}");
+    }
 
     let mut w = XmlWriter::new();
     w.raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE nmaprun>\n");
@@ -295,6 +301,15 @@ fn write_host(w: &mut XmlWriter, h: &HostReport, start: &str, end: &str) {
         "address",
         &[("addr", &h.ip.to_string()), ("addrtype", addrtype)],
     );
+    if let Some(mac) = h.mac {
+        // Nmap writes MACs in upper case.
+        let addr = mac.to_string().to_ascii_uppercase();
+        let mut attrs = vec![("addr", addr.as_str()), ("addrtype", "mac")];
+        if let Some(vendor) = &h.vendor {
+            attrs.push(("vendor", vendor));
+        }
+        w.empty("address", &attrs);
+    }
     match &h.hostname {
         Some(name) => {
             w.start("hostnames", &[]);
@@ -445,6 +460,8 @@ mod tests {
     fn hostile_strings_stay_well_formed() {
         let mut r = sample();
         r.config.targets = "\"><script>&".into();
+        r.config.exclude = "<plc>&".into();
+        r.config.max_rate = Some(10);
         r.hosts[0].hostname = Some("evil\"<host>&'\n".into());
         let s = r.hosts[0].ports[0].service.as_mut().unwrap();
         s.product = Some("Open<SSH>".into());
@@ -452,6 +469,10 @@ mod tests {
         let xml = to_string(&r);
         assert!(
             xml.contains("targets=&quot;&gt;&lt;script&gt;&amp;"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("exclude=&lt;plc&gt;&amp; max_rate=10"),
             "{xml}"
         );
         assert!(xml.contains("name=\"evil&quot;&lt;host&gt;&amp;&apos;&#10;\""));
@@ -503,6 +524,24 @@ mod tests {
         }
         let expected = std::fs::read_to_string(path).unwrap();
         assert_eq!(xml, expected.replace("\r\n", "\n"));
+    }
+
+    #[test]
+    fn mac_address_and_vendor() {
+        let mut r = sample();
+        r.hosts[0].mac = Some("00:11:32:aa:bb:cc".parse().unwrap());
+        r.hosts[0].vendor = Some("Synology".into());
+        r.hosts[1].mac = Some("da:00:00:00:00:01".parse().unwrap());
+        let xml = to_string(&r);
+        assert!(
+            xml.contains(concat!(
+                "<address addr=\"10.0.0.2\" addrtype=\"ipv4\"/>\n",
+                "    <address addr=\"00:11:32:AA:BB:CC\" addrtype=\"mac\" vendor=\"Synology\"/>"
+            )),
+            "{xml}"
+        );
+        assert!(xml.contains("<address addr=\"DA:00:00:00:00:01\" addrtype=\"mac\"/>"));
+        assert_balanced(&xml);
     }
 
     #[test]

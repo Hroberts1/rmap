@@ -17,18 +17,6 @@ pub fn draw_dialog(frame: &mut Frame, dialog: &Dialog) {
     }
 }
 
-/// The last `width` characters of `s`, with a leading ellipsis if cut.
-pub(crate) fn tail(s: &str, width: usize) -> String {
-    let n = s.chars().count();
-    if n <= width {
-        return s.to_string();
-    }
-    let keep = width.saturating_sub(1);
-    let mut out = String::from("…");
-    out.extend(s.chars().skip(n - keep));
-    out
-}
-
 fn draw_export(frame: &mut Frame, d: &ExportDialog) {
     let area = centered(
         frame.area(),
@@ -54,7 +42,7 @@ fn draw_export(frame: &mut Frame, d: &ExportDialog) {
     .vertical_margin(u16::from(inner.height > 5))
     .areas(inner);
 
-    let formats: Vec<Span> = [ExportFormat::Json, ExportFormat::Xml]
+    let formats: Vec<Span> = ExportFormat::ALL
         .into_iter()
         .flat_map(|f| {
             let s = format!(" {} ", f.label());
@@ -70,17 +58,18 @@ fn draw_export(frame: &mut Frame, d: &ExportDialog) {
     line.extend(formats);
     frame.render_widget(Paragraph::new(Line::from(line)), format);
 
-    let room = path.width.saturating_sub(9) as usize;
-    let shown = tail(&d.path, room.max(1));
+    // Long paths scroll sideways so the cursor stays on screen.
+    const LABEL_W: u16 = 8;
+    let (shown, cursor) = d.path.window(path.width.saturating_sub(LABEL_W) as usize);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw("Path    ").dim(),
-            Span::raw(shown.clone()),
+            Span::raw(shown),
         ])),
         path,
     );
     if path.height > 0 && path.width > 0 {
-        let x = path.x + 8 + shown.chars().count() as u16;
+        let x = path.x + LABEL_W + cursor as u16;
         frame.set_cursor_position((x.min(path.right().saturating_sub(1)), path.y));
     }
 

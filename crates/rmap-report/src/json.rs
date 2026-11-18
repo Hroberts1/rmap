@@ -113,8 +113,28 @@ pub(crate) mod tests {
         let host = &mut v["hosts"][0];
         host.as_object_mut().unwrap().remove("ports");
         host.as_object_mut().unwrap().remove("hostname");
+        // Reports saved before exclusions and the rate cap existed.
+        let config = v["config"].as_object_mut().unwrap();
+        config.remove("exclude");
+        config.remove("max_rate");
         let r = from_str(&v.to_string()).unwrap();
         assert!(r.hosts[0].ports.is_empty() && r.hosts[0].hostname.is_none());
+        assert!(r.config.exclude.is_empty() && r.config.max_rate.is_none());
+    }
+
+    #[test]
+    fn mac_round_trips_and_old_files_still_load() {
+        let mut report = sample();
+        let text = to_string(&report).unwrap();
+        assert!(!text.contains("\"mac\""), "absent MACs aren't written");
+        report.hosts[0].mac = Some("00:11:32:aa:bb:cc".parse().unwrap());
+        report.hosts[0].vendor = Some("Synology".into());
+        let text = to_string(&report).unwrap();
+        assert!(text.contains("\"mac\": \"00:11:32:aa:bb:cc\""), "{text}");
+        assert_eq!(from_str(&text).unwrap(), report);
+
+        let bad = text.replace("00:11:32:aa:bb:cc", "00:11:32:aa:bb");
+        assert!(from_str(&bad).unwrap_err().contains("invalid MAC"));
     }
 
     #[test]

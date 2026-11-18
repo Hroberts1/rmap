@@ -1,6 +1,6 @@
 [package]
 name = "rmap-report"
-description = "Scan reports for rmap: JSON and Nmap-compatible XML export, saved scans, and diffing"
+description = "Scan reports for rmap: JSON, Nmap-compatible XML, Markdown, CSV and HTML export, saved scans, and diffing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,5 +9,6 @@ rust-version.workspace = true
 [dependencies]
 rmap-core = { workspace = true, features = ["serde"] }
 rmap-log = { workspace = true }
+rmap-oui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

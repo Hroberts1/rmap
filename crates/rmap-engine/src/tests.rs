@@ -1,7 +1,7 @@
 //! Engine tests against real sockets on the loopback interface and the
 //! reserved TEST-NET-1 block (192.0.2.0/24), which is never routed.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use rmap_core::{PortList, Target, Timing, parse_targets};
@@ -32,6 +32,8 @@ fn config(targets: &str, ports: &str, timing: Timing, discovery: bool) -> ScanCo
         scan_type: ScanType::Connect,
         service_detection: false,
         vuln_matching: false,
+        exclude: Vec::new(),
+        max_rate: None,
     }
 }
 
@@ -232,6 +234,12 @@ async fn discovery_finds_loopback_up() {
     let out = run_scan(config("127.0.0.1", &port.to_string(), patient(), true)).await;
     assert_eq!(out.hosts()[0].2, HostState::Up);
     assert_eq!(out.open_ports().len(), 1);
+    assert!(
+        !out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Mac { .. })),
+        "loopback has no ARP, so no MAC"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -363,6 +371,7 @@ fn typed(targets: &str, ports: &str, timing: Timing, scan_type: ScanType) -> Sca
 }
 
 const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const LO6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
 impl Outcome {
     fn port_states(&self) -> Vec<(u16, rmap_core::Protocol, PortState)> {
@@ -500,6 +509,83 @@ async fn udp_scan_sorts_open_silent_and_closed() {
     assert!(out.fell_back(), "raw sockets are Linux-only");
 }
 
+/// A SYN scan of an open and a closed port on `::1`. `None` where the host
+/// has no IPv6 loopback.
+async fn check_syn_scan_v6() -> Option<Outcome> {
+    let open = TcpListener::bind("[::1]:0").await.ok()?;
+    let port = open.local_addr().ok()?.port();
+    // Released right away, so nothing listens on it.
+    let shut = TcpListener::bind("[::1]:0")
+        .await
+        .ok()?
+        .local_addr()
+        .ok()?
+        .port();
+    tokio::spawn(async move {
+        loop {
+            let _ = open.accept().await;
+        }
+    });
+    let ports = format!("{port},{shut}");
+    let out = run_scan(typed("::1", &ports, patient(), ScanType::Syn)).await;
+    assert!(out.finished());
+    assert_eq!(out.open_ports(), [(LO6, port)]);
+    assert_eq!(out.host_done(), [(LO6, 1, 0)], "the closed port is counted");
+    Some(out)
+}
+
+/// A UDP scan of an echoing, a silent and an unbound port on `::1`.
+async fn check_udp_scan_v6() -> Option<Outcome> {
+    let echo = tokio::net::UdpSocket::bind("[::1]:0").await.ok()?;
+    let silent = tokio::net::UdpSocket::bind("[::1]:0").await.ok()?;
+    let shut = tokio::net::UdpSocket::bind("[::1]:0").await.ok()?;
+    let (e, q, c) = (
+        echo.local_addr().ok()?.port(),
+        silent.local_addr().ok()?.port(),
+        shut.local_addr().ok()?.port(),
+    );
+    drop(shut);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n.max(1)], from).await;
+        }
+    });
+    let ports = format!("{e},{q},{c}");
+    let out = run_scan(typed("::1", &ports, udp_timing(), ScanType::Udp)).await;
+    drop(silent);
+    assert!(out.finished());
+    let mut expected = vec![
+        (e, rmap_core::Protocol::Udp, PortState::Open),
+        (q, rmap_core::Protocol::Udp, PortState::OpenFiltered),
+    ];
+    expected.sort_by_key(|p| p.0);
+    assert_eq!(out.port_states(), expected);
+    assert_eq!(out.host_done(), [(LO6, 1, 0)], "the unbound port is closed");
+    Some(out)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn syn_scan_of_ipv6_loopback() {
+    // Raw on Linux with privileges, otherwise the TCP connect fallback.
+    let Some(out) = check_syn_scan_v6().await else {
+        return;
+    };
+    if cfg!(not(target_os = "linux")) {
+        assert!(out.fell_back(), "raw sockets are Linux-only");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_scan_of_ipv6_loopback() {
+    let Some(out) = check_udp_scan_v6().await else {
+        return;
+    };
+    if cfg!(not(target_os = "linux")) {
+        assert!(out.fell_back(), "raw sockets are Linux-only");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn connect_scan_never_warns_about_privileges() {
     let port = listener().await;
@@ -568,10 +654,53 @@ async fn raw_syn_scan_of_many_ports() {
 async fn raw_icmp_echo_answers_on_loopback() {
     let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient())
         .expect("raw sockets should open with CAP_NET_RAW");
-    let rtt = raw
-        .echo_ping(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST, &patient())
-        .await;
+    let lo = crate::raw::Route::V4(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST);
+    let rtt = raw.echo_ping(lo, &patient()).await;
     assert!(rtt.is_some(), "loopback answers ICMP echo");
+}
+
+// IPv6 over loopback. In a fresh namespace `ip link set lo up` normally
+// brings up ::1 too; if it doesn't, add it first:
+//
+//   unshare -rn sh -c 'ip link set lo up && ip -6 addr add ::1/128 dev lo; \
+//       <test binary> --ignored raw_v6'
+//
+// These fail (rather than skip) without IPv6 loopback, since running them
+// is a request to test it.
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW and ::1 (see comment)"]
+async fn raw_v6_syn_scan_uses_raw_sockets() {
+    let out = check_syn_scan_v6().await.expect("::1 is configured");
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW and ::1 (see comment)"]
+async fn raw_v6_udp_scan_uses_raw_sockets() {
+    let out = check_udp_scan_v6().await.expect("::1 is configured");
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs root or CAP_NET_RAW and ::1 (see comment)"]
+async fn raw_v6_icmp_echo_and_routing() {
+    let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient())
+        .expect("raw sockets should open with CAP_NET_RAW");
+    let route = raw.route(LO6).expect("raw IPv6 is available");
+    assert_eq!(
+        route,
+        crate::raw::Route::V6(Ipv6Addr::LOCALHOST, Ipv6Addr::LOCALHOST)
+    );
+    assert!(raw.echo_ping(route, &patient()).await.is_some());
+    let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+    assert!(
+        raw.route(mapped.into()).is_err(),
+        "falls back, not misroutes"
+    );
 }
 
 /// SYN, UDP and ARP over a real link instead of loopback. Needs a veth
@@ -599,7 +728,9 @@ async fn raw_veth_peer() {
         .unwrap()
         .parse()
         .unwrap();
-    let src = crate::raw::route_source(peer).unwrap();
+    let crate::raw::Route::V4(src, _) = crate::raw::route(peer.into()).unwrap() else {
+        panic!("an IPv4 peer has an IPv4 route");
+    };
     let absent = Ipv4Addr::from(u32::from(peer) + 1);
 
     let raw = crate::raw::RawScanner::open(ScanType::Connect, &patient()).unwrap();
@@ -610,8 +741,8 @@ async fn raw_veth_peer() {
     };
     let up = raw.arp_ping(src, peer, &quick).await;
     assert!(
-        matches!(up, Some(Some(_))),
-        "ARP answer from {peer}: {up:?}"
+        matches!(up, Some(Some((_, Some(_))))),
+        "ARP answer with a MAC from {peer}: {up:?}"
     );
     let down = raw.arp_ping(src, absent, &quick).await;
     assert_eq!(down, Some(None), "no ARP answer from {absent}");
@@ -626,6 +757,16 @@ async fn raw_veth_peer() {
     let out = run_scan(syn).await;
     assert!(out.warnings().is_empty(), "{:?}", out.warnings());
     assert_eq!(out.hosts()[0].2, HostState::Up);
+    let host_at = out
+        .events
+        .iter()
+        .position(|e| matches!(e, ScanEvent::Host { .. }))
+        .unwrap();
+    assert!(
+        matches!(out.events[host_at + 1], ScanEvent::Mac { ip, .. } if ip == IpAddr::V4(peer)),
+        "MAC event right after the host: {:?}",
+        out.events
+    );
     assert_eq!(out.open_ports(), [(IpAddr::V4(peer), open)]);
     assert_eq!(out.host_done()[0].1, 1, "port 1 answers RST");
 
@@ -786,4 +927,280 @@ async fn stop_cancels_service_detection() {
             .any(|e| matches!(e, ScanEvent::Service { .. } | ScanEvent::Finished { .. })),
         "{rest:?}"
     );
+}
+
+// ------------------------------------------------- exclusions and rate cap
+
+fn excluding(targets: &str, exclude: &str, discovery: bool) -> ScanConfig {
+    let timing = Timing {
+        connect_timeout: Duration::from_millis(200),
+        retries: 0,
+        ..Timing::template(4)
+    };
+    ScanConfig {
+        exclude: parse_targets(exclude).unwrap(),
+        ..config(targets, "80", timing, discovery)
+    }
+}
+
+fn started_hosts(out: &Outcome) -> u64 {
+    match out.events.first() {
+        Some(ScanEvent::Started { hosts, .. }) => *hosts,
+        other => panic!("first event was {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn excluded_addresses_are_never_probed() {
+    // Single address, a range, and an overlapping block, with discovery on
+    // so pings are covered too.
+    let out = run_scan(excluding(
+        "192.0.2.0/29",
+        "192.0.2.2, 192.0.2.4-192.0.2.5, 192.0.2.5/32",
+        true,
+    ))
+    .await;
+    assert!(out.finished());
+    assert_eq!(started_hosts(&out), 5);
+    let mut seen: Vec<IpAddr> = out.hosts().into_iter().map(|h| h.0).collect();
+    seen.sort();
+    let want: Vec<IpAddr> = [
+        "192.0.2.0",
+        "192.0.2.1",
+        "192.0.2.3",
+        "192.0.2.6",
+        "192.0.2.7",
+    ]
+    .iter()
+    .map(|s| s.parse().unwrap())
+    .collect();
+    assert_eq!(seen, want);
+    assert_eq!(out.scan.progress.ratio(), 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn excluding_everything_finishes_with_a_clear_warning() {
+    let out = run_scan(excluding("192.0.2.0/30, 192.0.2.9", "192.0.2.0/24", false)).await;
+    assert!(out.finished());
+    assert_eq!(started_hosts(&out), 0);
+    assert!(out.hosts().is_empty());
+    assert!(
+        out.warnings().iter().any(|w| w.contains("exclude list")),
+        "{:?}",
+        out.warnings()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unresolvable_exclusion_stops_before_probing() {
+    let out = run_scan(excluding("192.0.2.1", "no-such-host.invalid", false)).await;
+    assert!(out.finished());
+    assert!(out.hosts().is_empty());
+    assert!(
+        out.warnings()
+            .iter()
+            .any(|w| w.contains("no-such-host.invalid") && w.contains("nothing was scanned"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hostname_target_resolving_to_an_excluded_address_is_skipped() {
+    let out = run_scan(excluding("localhost", "127.0.0.0/8, ::1", false)).await;
+    assert!(out.finished());
+    assert!(out.hosts().is_empty());
+    assert!(
+        out.warnings()
+            .iter()
+            .any(|w| w.contains("skipped localhost"))
+    );
+    assert_eq!(out.scan.progress.ratio(), 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_rate_caps_probe_starts() {
+    // Open loopback ports answer at once, so without the cap these 20
+    // probes finish in milliseconds. At 40/s the 20th can't start before
+    // 19/40 s = 475 ms; only a lower bound is checked, so a slow machine
+    // can't make this flaky.
+    let mut ports = Vec::new();
+    for _ in 0..20 {
+        ports.push(listener().await.to_string());
+    }
+    let c = ScanConfig {
+        max_rate: Some(40),
+        ..config("127.0.0.1", &ports.join(","), patient(), false)
+    };
+    let started = Instant::now();
+    let out = run_scan(c).await;
+    let elapsed = started.elapsed();
+    assert_eq!(out.open_ports().len(), 20);
+    assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+}
+
+#[test]
+fn describe_includes_scope_and_rate() {
+    let c = ScanConfig {
+        max_rate: Some(25),
+        ..excluding("192.0.2.0/24", "192.0.2.7, plc.lan", false)
+    };
+    let d = c.describe();
+    assert!(d.contains("exclude=[192.0.2.7,plc.lan]"), "{d}");
+    assert!(d.contains("max_rate=25/s"), "{d}");
+    assert!(
+        config("192.0.2.1", "80", patient(), false)
+            .describe()
+            .contains("max_rate=unlimited")
+    );
+}
+
+// ---------------------------------------------------- adaptive timeouts ---
+
+/// A 1 s template timeout with one retry, and a 100 ms floor once the
+/// host's RTT is known.
+fn adaptive_timing() -> Timing {
+    Timing {
+        connect_timeout: Duration::from_secs(1),
+        min_rtt_timeout: Duration::from_millis(100),
+        max_rtt_timeout: Duration::from_secs(2),
+        retries: 1,
+        ..Timing::template(4)
+    }
+}
+
+/// Probe 16 ports of an unroutable address at once, sharing `host_rtt`,
+/// and time how long until all are given up on.
+async fn time_unanswered(udp: bool, host_rtt: Arc<rtt::HostRtt>) -> Duration {
+    let ip: IpAddr = "192.0.2.1".parse().unwrap();
+    let started = Instant::now();
+    let mut probes = JoinSet::new();
+    for port in 1..=16 {
+        let host_rtt = host_rtt.clone();
+        probes.spawn(async move {
+            let (t, s) = (adaptive_timing(), Stats::default());
+            let result = if udp {
+                udp::probe(ip, port, &t, &s, &host_rtt).await
+            } else {
+                tcp::probe(ip, port, &t, &s, &host_rtt).await
+            };
+            assert_ne!(result.state, PortState::Open);
+        });
+    }
+    while let Some(r) = probes.join_next().await {
+        r.unwrap();
+    }
+    started.elapsed()
+}
+
+/// Times unanswered probes with no RTT estimate (the fixed template
+/// timeout: 1 s + 1 s) and with one warmed up on loopback (100 + 200 ms).
+async fn check_adaptive_is_faster(udp: bool, warmed: rtt::HostRtt) {
+    assert!(
+        warmed.snapshot().srtt().is_some(),
+        "warm-up measured nothing"
+    );
+    let (fixed, adaptive) = tokio::join!(
+        time_unanswered(udp, Arc::new(rtt::HostRtt::default())),
+        time_unanswered(udp, Arc::new(warmed)),
+    );
+    if fixed < Duration::from_millis(1500) {
+        // This machine fails 192.0.2.1 fast (no route), so nothing waits.
+        eprintln!("skipping: unroutable probes failed fast ({fixed:?})");
+        return;
+    }
+    assert!(
+        adaptive * 3 < fixed,
+        "adaptive {adaptive:?} should be well under fixed {fixed:?}"
+    );
+}
+
+// Windows reports connect results after OS-internal retries, so the connect
+// backend keeps fixed timeouts there (see `tcp::ADAPTIVE_CONNECT`).
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_timeouts_give_up_on_silent_tcp_ports_sooner() {
+    let port = listener().await;
+    let warmed = rtt::HostRtt::default();
+    for _ in 0..10 {
+        let r = tcp::probe(LO, port, &patient(), &Stats::default(), &warmed).await;
+        assert_eq!(r.state, PortState::Open);
+    }
+    check_adaptive_is_faster(false, warmed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_timeouts_give_up_on_silent_udp_ports_sooner() {
+    let port = udp_echo().await;
+    let warmed = rtt::HostRtt::default();
+    for _ in 0..10 {
+        let r = udp::probe(LO, port, &udp_timing(), &Stats::default(), &warmed).await;
+        assert_eq!(r.state, PortState::Open);
+    }
+    check_adaptive_is_faster(true, warmed).await;
+}
+
+/// A fake UDP service on a well-known port that ignores the port scan's
+/// payload but answers detection's first probe there, so only detection
+/// can see it is open. UDP probes are chosen by port number, so it must
+/// sit on the real port: the first of these that is free on 127.0.0.1.
+async fn udp_detection_only_server() -> Option<(u16, &'static str)> {
+    // (port, bytes only the detection probe contains, service name)
+    let candidates: [(u16, &'static [u8], &'static str); 3] = [
+        (5353, b"_services", "mdns"),
+        (53, b"version", "dns"),
+        (161, b"\x02\x01\x01\x04\x06public", "snmp"), // v2c, not the scan's v1
+    ];
+    for (port, needle, name) in candidates {
+        let Ok(s) = tokio::net::UdpSocket::bind(("127.0.0.1", port)).await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = s.recv_from(&mut buf).await {
+                let query = &buf[..n];
+                if !query.windows(needle.len()).any(|w| w == needle) {
+                    continue;
+                }
+                let mut reply = query.to_vec();
+                if port == 161 {
+                    reply[13] = 0xa2; // GetRequest -> GetResponse
+                } else {
+                    reply[2] |= 0x80; // DNS QR: a response with no answers
+                }
+                let _ = s.send_to(&reply, from).await;
+            }
+        });
+        return Some((port, name));
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_detection_upgrades_open_filtered_to_open() {
+    use rmap_core::Protocol::Udp;
+    let Some((port, name)) = udp_detection_only_server().await else {
+        // Linux without root can't bind 53 or 161, and 5353 is often taken.
+        eprintln!("skipped: no free well-known UDP port on 127.0.0.1");
+        return;
+    };
+    let (_keep, silent) = udp_silent().await;
+    let ports = format!("{port},{silent}");
+    let mut cfg = typed("127.0.0.1", &ports, udp_timing(), ScanType::Udp);
+    cfg.service_detection = true;
+    let out = run_scan(cfg).await;
+    assert!(out.finished());
+    // One Port event per port, the answering one upgraded.
+    let mut expected = vec![
+        (port, Udp, PortState::Open),
+        (silent, Udp, PortState::OpenFiltered),
+    ];
+    expected.sort_by_key(|p| p.0);
+    assert_eq!(out.port_states(), expected);
+    let port_at = out
+        .events
+        .iter()
+        .position(|e| matches!(e, ScanEvent::Port { result, .. } if result.port == port));
+    let service_at = out.events.iter().position(|e| {
+        matches!(e, ScanEvent::Service { port: p, service, .. } if *p == port && service.name == name)
+    });
+    assert!(port_at.unwrap() < service_at.expect("service event"));
 }

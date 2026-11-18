@@ -4,7 +4,7 @@
 
 use rmap_detect::db::{BUILTIN, Database};
 use rmap_detect::pattern::Pattern;
-use rmap_detect::{Detector, der, tls};
+use rmap_detect::{Detector, der, tls, udp};
 
 /// xorshift64*: small, deterministic, no dependencies.
 struct Rng(u64);
@@ -164,6 +164,80 @@ fn database_parser_survives_garbage() {
             if let Ok(db) = Database::parse(&src) {
                 for i in 0..db.probes.len() {
                     let _ = db.identify(i, b"SSH-2.0-x\r\nHTTP/1.1 200 OK\r\n");
+                }
+            }
+        });
+    }
+}
+
+/// Plausible replies for each UDP probe, for the mutation test below.
+fn udp_bases() -> Vec<(&'static str, Vec<u8>)> {
+    // A DNS-shaped reply: our query, QR set, plus one answer record.
+    let dns = |query: Vec<u8>, kind: u16, rdata: &[u8]| {
+        let mut r = query;
+        r[2] |= 0x80;
+        r[7] = 1;
+        r.extend_from_slice(&[0xc0, 12]);
+        r.extend_from_slice(&kind.to_be_bytes());
+        r.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+        r.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        r.extend_from_slice(rdata);
+        r
+    };
+    let mut nbstat = vec![2];
+    nbstat.extend_from_slice(b"HOST           \x00\x04\x00GROUP          \x00\x84\x00");
+    nbstat.extend_from_slice(&[0x02, 0, 0, 0, 0, 1]);
+    let mut ntp = vec![0x24, 2];
+    ntp.extend_from_slice(&[0; 46]);
+    let mut vars = vec![0x16, 0x82, 0, 1, 0, 0, 0, 0, 0, 0, 0, 23];
+    vars.extend_from_slice(b"version=\"ntpd 4.2.8p15\"");
+    let mut snmp = udp::snmp_v2c_get();
+    snmp[13] = 0xa2; // GetResponse
+    vec![
+        (
+            "dns-version",
+            dns(udp::dns_version_bind(), 16, b"\x0c9.18.24-Ubun"),
+        ),
+        ("mdns", dns(udp::mdns_services(), 12, &[0xc0, 12])),
+        ("netbios-status", dns(udp::netbios_status(), 0x21, &nbstat)),
+        ("ntp-client", ntp),
+        ("ntp-readvar", vars),
+        ("snmp-v2c", snmp.clone()),
+        ("snmp-v1", snmp),
+        (
+            "ssdp",
+            b"HTTP/1.1 200 OK\r\nSERVER: x MiniUPnPd/2.1\r\n\r\n".to_vec(),
+        ),
+    ]
+}
+
+#[test]
+fn udp_decoders_survive_mutated_replies() {
+    let seed = seed();
+    let mut rng = Rng::new(seed ^ 0x0d9);
+    let detector = Detector::builtin();
+    let bases = udp_bases();
+    for (name, base) in &bases {
+        let probe = detector.database().probe(name).unwrap();
+        assert!(
+            detector.analyze(probe, base, 0).is_some(),
+            "{name}: base reply should decode"
+        );
+    }
+    for iter in 0..30_000 {
+        let (name, base) = &bases[iter % bases.len()];
+        let probe = detector.database().probe(name).unwrap();
+        let input = if iter % 7 == 0 {
+            rng.bytes(300)
+        } else {
+            rng.mutate(base)
+        };
+        guard("Detector::analyze (udp)", seed, iter, &input, || {
+            if let Some(s) = detector.analyze(probe, &input, 0) {
+                // Scanned text reaches the terminal: no control bytes.
+                let fields = [&s.info, &s.product, &s.version, &s.os_hint];
+                for f in fields.into_iter().flatten() {
+                    assert!(!f.chars().any(char::is_control), "{f:?}");
                 }
             }
         });

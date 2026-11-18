@@ -6,20 +6,26 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, LineGauge, Paragraph, Row, Table, TableState, Wrap};
 use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, Vulnerability, service_name};
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
 use crate::input::TextInput;
+use crate::mouse::{HitMap, ListHit};
+use crate::rate;
 
 pub(crate) const ACCENT: Color = Color::Cyan;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let mut hits = HitMap::default();
     match app.screen {
-        Screen::Setup => draw_setup(frame, app),
+        Screen::Setup => {
+            draw_setup(frame, app, &mut hits);
+            crate::profiles::draw(frame, &app.profiles);
+        }
         Screen::Results => {
             if let Some(view) = app.scan.as_mut() {
-                draw_results(frame, view);
+                draw_results(frame, view, &mut hits);
             }
             if app.help {
                 draw_help(frame);
@@ -40,6 +46,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(confirm) = app.confirm {
         draw_yes_no(frame, confirm);
     }
+    if crate::theme::no_color() {
+        crate::theme::strip_colors(frame.buffer_mut());
+    }
+    app.hits = hits;
 }
 
 pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -66,12 +76,12 @@ pub(crate) fn key_help(pairs: &[(&str, &str)]) -> Line<'static> {
 
 // ---------------------------------------------------------------- setup ---
 
-fn draw_setup(frame: &mut Frame, app: &App) {
+fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     let form = &app.form;
     let area = centered(
         frame.area(),
         76.min(frame.area().width),
-        22.min(frame.area().height),
+        24.min(frame.area().height),
     );
     let block = Block::bordered()
         .title(Line::from(" rmap · new scan ").bold().fg(ACCENT))
@@ -82,23 +92,27 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     let [
         targets,
         targets_hint,
+        exclude,
         ports,
         ports_hint,
         scan_type,
         timing,
         timing_hint,
+        max_rate,
         discovery,
         services,
         vulns,
-        _,
+        shortcuts,
         error,
         log_line,
     ] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(1),
@@ -110,6 +124,15 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     ])
     .margin(1)
     .areas(inner);
+    hits.fields = vec![
+        (Field::Targets, targets),
+        (Field::Ports, ports),
+        (Field::ScanType, scan_type),
+        (Field::Timing, timing),
+        (Field::Discovery, discovery),
+        (Field::Services, services),
+        (Field::Vulns, vulns),
+    ];
 
     let label = |field: Field, text: &'static str| {
         let style = if form.focus == field {
@@ -152,6 +175,14 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         hint("CIDR, ranges (10.0.0.1-50), hostnames; comma separated"),
         targets_hint,
     );
+    text_field(
+        frame,
+        exclude,
+        Field::Exclude,
+        "Exclude",
+        &form.exclude,
+        "never probe these, e.g. fragile PLCs (same syntax)",
+    );
     text_field(frame, ports, Field::Ports, "Ports", &form.ports, "common");
     frame.render_widget(hint("22,80,443 · 1-1024 · common · all"), ports_hint);
 
@@ -186,6 +217,14 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         if t.retries == 1 { "y" } else { "ies" }
     );
     frame.render_widget(Paragraph::new(Line::from(timing_desc).dim()), timing_hint);
+    text_field(
+        frame,
+        max_rate,
+        Field::MaxRate,
+        "Max rate",
+        &form.max_rate,
+        "unlimited (probes per second across all hosts)",
+    );
 
     let check = if form.discovery {
         "[x] ping hosts first, skip ones that don't answer"
@@ -227,6 +266,14 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         vulns,
     );
 
+    let mut keys = key_help(&[
+        ("^P", "profiles"),
+        ("^R", "recent targets"),
+        ("^S", "save profile"),
+    ]);
+    keys.spans.insert(0, Span::raw(" ".repeat(12)));
+    frame.render_widget(Paragraph::new(keys).dim(), shortcuts);
+
     if let Some(err) = &form.error {
         frame.render_widget(
             Paragraph::new(Line::from(format!("✗ {err}")).fg(Color::Red)).wrap(Wrap { trim: true }),
@@ -248,11 +295,15 @@ fn draw_setup(frame: &mut Frame, app: &App) {
 
 /// Below this width the host list and details stack vertically, so the
 /// host table gets the full width instead of a third of it.
-const STACK_BELOW: u16 = 100;
+pub(crate) const STACK_BELOW: u16 = 100;
 /// Most log lines shown under the results; the panel shrinks to fit fewer.
 const LOG_ROWS: usize = 3;
 
-fn draw_results(frame: &mut Frame, view: &mut ScanView) {
+fn draw_results(frame: &mut Frame, view: &mut ScanView, hits: &mut HitMap) {
+    if view.log_view.is_some() {
+        crate::log_view::draw(frame, view);
+        return;
+    }
     let log_height = match view.log.len().min(LOG_ROWS) {
         0 => 0,
         n => n as u16 + 2,
@@ -266,6 +317,15 @@ fn draw_results(frame: &mut Frame, view: &mut ScanView) {
     .areas(frame.area());
 
     draw_header(frame, header, view);
+    if log_height > 0 {
+        draw_log(frame, log, view);
+    }
+    frame.render_widget(Paragraph::new(footer_help(view, footer.width)), footer);
+    let [strip, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+    crate::tabs::draw_strip(frame, strip, view);
+    if crate::tabs::draw(frame, body, view) {
+        return;
+    }
     let [hosts, detail] = if body.width < STACK_BELOW {
         // Hosts on top, sized to the list but never more than ~40%.
         let max = (body.height * 2 / 5).max(3);
@@ -274,27 +334,30 @@ fn draw_results(frame: &mut Frame, view: &mut ScanView) {
     } else {
         Layout::horizontal([Constraint::Percentage(36), Constraint::Percentage(64)]).areas(body)
     };
-    draw_host_table(frame, hosts, view);
-    draw_host_detail(frame, detail, view);
-    if log_height > 0 {
-        draw_log(frame, log, view);
-    }
-    frame.render_widget(Paragraph::new(footer_help(view, footer.width)), footer);
+    draw_host_table(frame, hosts, view, hits);
+    draw_host_detail(frame, detail, view, hits);
 }
 
 /// The footer key strip, trimmed to fit: `? help` and `q quit` always show,
 /// the rest are dropped from the end as the terminal narrows.
 fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
-    let mut wanted = vec![("Tab", "pane"), ("↑↓", "select")];
-    if view.is_running() {
+    if view.filtering {
+        return key_help(&[("Enter", "keep filter"), ("Esc", "clear filter")]);
+    }
+    let mut wanted = vec![
+        ("Tab", "pane"),
+        ("↑↓", "select"),
+        ("1-3", "tabs"),
+        ("/", "filter"),
+    ];
+    if view.is_running() || view.rescan.is_some() {
         wanted.push(("s", "stop"));
     }
-    wanted.extend([
-        ("e", "export"),
-        ("n", "new scan"),
-        ("c", "compare"),
-        ("d", "down hosts"),
-    ]);
+    wanted.extend([("e", "export"), ("n", "new scan"), ("c", "compare")]);
+    if !view.is_running() {
+        wanted.push(("r", "rescan"));
+    }
+    wanted.push(("d", "down hosts"));
     let always = [("?", "help"), ("q", "quit")];
     // key_help draws each pair as " key " + " what  ".
     let cost = |(k, w): &(&str, &str)| k.chars().count() + w.chars().count() + 5;
@@ -311,8 +374,10 @@ fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
     key_help(&shown)
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
-    let (status, color) = if view.failed {
+pub(crate) fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
+    let (status, color) = if view.rescan.is_some() {
+        ("rescanning", ACCENT)
+    } else if view.failed {
         ("failed", Color::Red)
     } else if view.stopped {
         ("stopped", Color::Yellow)
@@ -354,26 +419,63 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
     if cves > 0 {
         spans.push(Span::raw(format!(" · {cves} potential CVEs")).fg(Color::Red));
     }
-    spans.push(Span::raw(format!(" · {}", fmt_elapsed(view.elapsed()))));
-    frame.render_widget(Paragraph::new(Line::from(spans)), stats);
 
-    let progress = &view.scan.progress;
+    let progress = view
+        .rescan
+        .as_ref()
+        .map_or(&view.scan.progress, |r| &r.scan.progress);
     let done = progress
         .completed
         .load(std::sync::atomic::Ordering::Relaxed);
     let total = progress.total.load(std::sync::atomic::Ordering::Relaxed);
+    // Live rate while running, the whole-scan average once finished, and
+    // none after a stop or failure (their elapsed time keeps ticking).
+    let rate = if view.is_running() {
+        view.rate.rate()
+    } else {
+        view.finished
+            .map(|d| done as f64 / d.as_secs_f64())
+            .filter(|r| r.is_finite())
+    };
+    let mut timing = format!(" · {}", fmt_elapsed(view.elapsed()));
+    if view.is_running()
+        && let Some(eta) = rate::eta(done, total, rate)
+    {
+        timing.push_str(&format!(" · ETA {}", rate::clock(eta)));
+    }
+    // Timing gets its own area so a long stats line truncates before it.
+    let spans = Line::from(spans);
+    let [stats, clock] = Layout::horizontal([
+        Constraint::Max(spans.width() as u16),
+        Constraint::Length(timing.chars().count() as u16),
+    ])
+    .flex(Flex::Start)
+    .areas(stats);
+    frame.render_widget(Paragraph::new(spans), stats);
+    frame.render_widget(Paragraph::new(timing), clock);
+
+    let text = rate::progress_text(done, total, rate, &view.rate, gauge.width as usize);
+    let [bar, label] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(text.chars().count() as u16 + 1),
+    ])
+    .areas(gauge);
     frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::new().fg(color).bg(Color::DarkGray))
+        LineGauge::default()
+            .filled_symbol("█")
+            .unfilled_symbol("░")
+            .filled_style(Style::new().fg(color))
+            .unfilled_style(Style::new().fg(Color::DarkGray))
             .ratio(progress.ratio())
-            .label(format!("{done} / {total} probes")),
-        gauge,
+            .label(""),
+        bar,
     );
+    frame.render_widget(Paragraph::new(format!(" {text}")), label);
 }
 
 /// Highlight for the selected row. REVERSED works on light and dark
 /// themes alike; a hardcoded background colour doesn't.
-fn highlight(focused: bool) -> Style {
+pub(crate) fn highlight(focused: bool) -> Style {
     if focused {
         Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
@@ -381,7 +483,7 @@ fn highlight(focused: bool) -> Style {
     }
 }
 
-fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
+pub(crate) fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
     let block = Block::bordered().title(title);
     if focused {
         block.border_style(Style::new().fg(ACCENT))
@@ -390,7 +492,7 @@ fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> 
     }
 }
 
-fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
+fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut HitMap) {
     let visible = view.visible();
     let focused = view.focus == Pane::Hosts;
 
@@ -414,7 +516,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
     // No wider than the longest name, so OPEN stays next to it.
     let longest = visible
         .iter()
-        .filter_map(|ip| view.hosts[ip].hostname.as_deref())
+        .filter_map(|ip| crate::mac::host_name(&view.hosts[ip]))
         .map(|n| n.chars().count())
         .max()
         .unwrap_or(0)
@@ -424,6 +526,9 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
     let rows = visible.iter().map(|ip| {
         let h = &view.hosts[ip];
         let (mark, style) = match h.state {
+            _ if view.rescan.as_ref().is_some_and(|r| r.ip == *ip) => {
+                ("↻", Style::new().fg(ACCENT))
+            }
             HostState::Up | HostState::Assumed if !h.open.is_empty() => {
                 ("●", Style::new().fg(Color::Green))
             }
@@ -438,7 +543,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
         if h.open.iter().any(|p| !p.vulnerabilities.is_empty()) {
             open.push(Span::raw(" !").fg(Color::Red).bold());
         }
-        let name = h.hostname.as_deref().unwrap_or_default();
+        let name = crate::mac::host_name(h).unwrap_or_default();
         let mut cells = vec![
             Cell::from(mark).style(style),
             Cell::from(ip.to_string()),
@@ -455,11 +560,33 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
         })
     });
 
-    let title = if view.show_down {
-        " hosts (all) "
+    let mut title = String::from(if view.show_down {
+        " hosts (all)"
     } else {
-        " hosts (up) "
-    };
+        " hosts (up)"
+    });
+    if !view.filter.is_empty() {
+        let of = view
+            .hosts
+            .values()
+            .filter(|h| view.show_down || h.state != HostState::Down)
+            .count();
+        title.push_str(&format!(" {} of {of}", visible.len()));
+    }
+    title.push_str(&format!(" · by {} ", view.sort.label()));
+    let mut block = pane_block(title, focused);
+    // " filter: /" before the text, one border column on each side.
+    const FILTER_LEAD: u16 = 10;
+    let filter_w = area.width.saturating_sub(FILTER_LEAD + 3) as usize;
+    let (filter_text, filter_cursor) = view.filter.window(filter_w);
+    if view.filtering || !view.filter.is_empty() {
+        let style = if view.filtering {
+            Style::new().fg(ACCENT)
+        } else {
+            Style::new()
+        };
+        block = block.title_bottom(Line::styled(format!(" filter: /{filter_text} "), style));
+    }
     let mut widths = vec![
         Constraint::Length(1),
         Constraint::Length(addr_w as u16),
@@ -473,7 +600,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
     }
     let table = Table::new(rows, widths)
         .header(Row::new(header).bold().dim())
-        .block(pane_block(title, focused))
+        .block(block)
         .row_highlight_style(highlight(focused))
         .highlight_symbol("▌");
 
@@ -482,9 +609,24 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
             .and_then(|s| visible.iter().position(|ip| *ip == s)),
     );
     frame.render_stateful_widget(table, area, &mut state);
+    if view.filtering && area.height > 0 {
+        let x = area.x + 1 + FILTER_LEAD + filter_cursor as u16;
+        frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.bottom() - 1));
+    }
+    // Rows start under the top border and header; one line per host.
+    let rows = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(2),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(3),
+    };
+    let shown = visible.iter().skip(state.offset()).copied().collect();
+    hits.hosts = Some(ListHit::new(area, rows, shown));
 
     if visible.is_empty() {
-        let msg = if view.is_running() {
+        let msg = if !view.filter.is_empty() {
+            "no hosts match the filter"
+        } else if view.is_running() {
             "waiting for hosts…"
         } else {
             "no hosts up"
@@ -503,7 +645,7 @@ fn state_label(state: PortState) -> &'static str {
     }
 }
 
-fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView) {
+fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &mut HitMap) {
     let focused = view.focus == Pane::Ports;
     let Some((ip, host)) = view
         .selected
@@ -524,13 +666,15 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let mut info_lines = vec![host_info(host)];
+    info_lines.extend(crate::mac::detail_line(host));
     let [info, ports, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(info_lines.len() as u16),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .areas(inner);
-    frame.render_widget(Paragraph::new(host_info(host)), info);
+    frame.render_widget(Paragraph::new(info_lines), info);
 
     // Column plan. Detail and CVE lines span from SERVICE to the right
     // edge (Cell::column_span) and wrap, instead of being squeezed into
@@ -624,6 +768,20 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView) {
         .with_offset(view.port_offset)
         .with_selected(selected_row.filter(|_| focused));
     frame.render_stateful_widget(table, ports, &mut state);
+    // Map each drawn line (under the header) back to its port.
+    let lines = groups
+        .iter()
+        .enumerate()
+        .flat_map(|(i, &(first, last))| (first..=last).map(move |row| (i, row)))
+        .skip(state.offset())
+        .flat_map(|(i, row)| std::iter::repeat_n(i, heights[row]))
+        .collect();
+    let rows = Rect {
+        y: ports.y.saturating_add(1),
+        height: ports.height.saturating_sub(1),
+        ..ports
+    };
+    hits.ports = Some(ListHit::new(area, rows, lines));
 
     let mut notes: Vec<String> = Vec::new();
     match (above, below) {
@@ -660,7 +818,7 @@ fn spanning_row(text: Text<'static>, ncols: u16) -> Row<'static> {
 
 /// A potential CVE: a severity label (text, not just colour, so it reads
 /// without colour too), the score, then the ID and wrapped summary.
-fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
+pub(crate) fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
     let (label, color) = match v.severity {
         VulnSeverity::Critical => ("CRIT", Color::Red),
         VulnSeverity::High => ("HIGH", Color::Red),
@@ -730,7 +888,7 @@ fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
     lines
 }
 
-fn ellipsize(s: &str, width: usize) -> String {
+pub(crate) fn ellipsize(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         s.to_string()
     } else if width == 0 {
@@ -769,26 +927,23 @@ fn host_info(h: &HostRow) -> Line<'static> {
     Line::from(spans)
 }
 
+/// One log line, with engine warnings highlighted.
+pub(crate) fn log_line(l: &str) -> Line<'static> {
+    if l.starts_with(crate::app::WARNING_PREFIX) {
+        Line::from(l.to_string()).fg(Color::Yellow)
+    } else {
+        Line::from(l.to_string()).dim()
+    }
+}
+
 fn draw_log(frame: &mut Frame, area: Rect, view: &ScanView) {
     let height = area.height.saturating_sub(2) as usize;
-    let lines: Vec<Line> = view
-        .log
-        .iter()
-        .rev()
-        .take(height)
-        .rev()
-        .map(|l| {
-            if l.starts_with(crate::app::WARNING_PREFIX) {
-                Line::from(l.clone()).fg(Color::Yellow)
-            } else {
-                Line::from(l.clone()).dim()
-            }
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" log ")),
-        area,
-    );
+    let skip = view.log.len().saturating_sub(height);
+    let lines: Vec<Line> = view.log.iter().skip(skip).map(|l| log_line(l)).collect();
+    let block = Block::bordered()
+        .title(" log ")
+        .title(Line::from(" L full log ").dim().right_aligned());
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_help(frame: &mut Frame) {
@@ -797,13 +952,19 @@ fn draw_help(frame: &mut Frame) {
         ("PgUp PgDn", "move by 10"),
         ("Home End g G", "first / last"),
         ("Tab ← → h l", "switch between hosts and ports"),
+        ("1 2 3", "hosts / services / vulns tab"),
         ("d", "show or hide down hosts"),
-        ("s", "stop the scan"),
-        ("e", "export JSON / XML"),
+        ("/", "filter by ip, name, port, service"),
+        ("o", "sort: ip, open ports, worst CVE"),
+        ("s", "stop the scan or rescan"),
+        ("r", "rescan host: all ports, CVEs"),
+        ("e", "export JSON/XML/MD/CSV/HTML"),
         ("c", "compare with a saved scan"),
+        ("L", "full log (scrollable)"),
+        ("y Y", "copy IP or ip:port / CVE IDs"),
+        ("m", "mouse on/off (off = select text)"),
         ("n Esc", "new scan"),
-        ("q", "quit"),
-        ("Ctrl-C", "quit immediately"),
+        ("q Ctrl-C", "quit / quit immediately"),
     ];
     let mut lines: Vec<Line> = KEYS
         .iter()
@@ -817,6 +978,7 @@ fn draw_help(frame: &mut Frame) {
     lines.push(Line::default());
     lines.push(Line::from(" open? = open|filtered: no reply, may be open").dim());
     lines.push(Line::from(" !     = host has potential CVEs").dim());
+    lines.push(Line::from(" Shift-drag selects text while the mouse is on").dim());
     let area = centered(
         frame.area(),
         52.min(frame.area().width),

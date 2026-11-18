@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use rmap_core::{HostState, PortResult, PortState, Protocol, Service};
+use rmap_core::{HostState, MacAddr, PortResult, PortState, Protocol, Service};
 
 use crate::model::{HostReport, ScanReport};
 
@@ -53,6 +53,15 @@ pub struct ServiceChange {
     pub new: String,
 }
 
+/// A host whose hardware address changed: a different device now has
+/// the address (or a spoofed one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacChange {
+    pub ip: IpAddr,
+    pub old: MacAddr,
+    pub new: MacAddr,
+}
+
 /// Everything that differs between two scans, each list sorted by address
 /// then port.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -65,6 +74,8 @@ pub struct ScanDiff {
     /// Same port reported in both, different state (open ↔ open|filtered).
     pub port_states: Vec<PortChange>,
     pub services: Vec<ServiceChange>,
+    /// Only when both scans learned a MAC for the host.
+    pub macs: Vec<MacChange>,
 }
 
 impl ScanDiff {
@@ -76,6 +87,7 @@ impl ScanDiff {
             && self.closed.is_empty()
             && self.port_states.is_empty()
             && self.services.is_empty()
+            && self.macs.is_empty()
     }
 
     /// Total number of changes.
@@ -87,6 +99,7 @@ impl ScanDiff {
             + self.closed.len()
             + self.port_states.len()
             + self.services.len()
+            + self.macs.len()
     }
 }
 
@@ -143,7 +156,14 @@ pub fn diff(old: &ScanReport, new: &ScanReport) -> ScanDiff {
                 old: o.state,
                 new: n.state,
             }),
-            Some(o) if o.is_up() => compare_ports(*ip, o, n, &mut d),
+            Some(o) if o.is_up() => {
+                if let (Some(old), Some(new)) = (o.mac, n.mac)
+                    && old != new
+                {
+                    d.macs.push(MacChange { ip: *ip, old, new });
+                }
+                compare_ports(*ip, o, n, &mut d)
+            }
             Some(_) => {}
         }
     }
@@ -389,7 +409,32 @@ impl ScanDiff {
                 })
                 .collect(),
         );
+        section(
+            "Hardware changed",
+            self.macs.len(),
+            self.macs
+                .iter()
+                .map(|c| {
+                    line(
+                        DiffKind::Changed,
+                        format!(
+                            "~ {}  MAC {} → {}",
+                            c.ip,
+                            mac_label(c.old),
+                            mac_label(c.new)
+                        ),
+                    )
+                })
+                .collect(),
+        );
         out
+    }
+}
+
+fn mac_label(mac: MacAddr) -> String {
+    match rmap_oui::lookup(mac).label() {
+        Some(v) => format!("{mac} ({v})"),
+        None => mac.to_string(),
     }
 }
 
@@ -448,6 +493,26 @@ mod tests {
         let d = diff(&full, &e);
         assert_eq!(d.gone_hosts.len(), 1);
         assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn mac_changes_only_when_both_sides_know() {
+        let mac = |s: &str| Some(s.parse::<MacAddr>().unwrap());
+        let mut a = host("10.0.0.1", UP, &[]);
+        let mut b = host("10.0.0.1", UP, &[]);
+        a.mac = mac("00:11:32:00:00:01");
+        let d = diff(&report(vec![a.clone()]), &report(vec![b.clone()]));
+        assert!(d.is_empty(), "one side without a MAC is not a change");
+        b.mac = mac("b8:27:eb:00:00:02");
+        let d = diff(&report(vec![a.clone()]), &report(vec![b.clone()]));
+        assert_eq!(d.len(), 1);
+        assert_eq!(d.macs[0].new, b.mac.unwrap());
+        assert_eq!(
+            d.lines().last().unwrap().text,
+            "~ 10.0.0.1  MAC 00:11:32:00:00:01 (Synology) → b8:27:eb:00:00:02 (Raspberry Pi)"
+        );
+        b.mac = a.mac;
+        assert!(diff(&report(vec![a]), &report(vec![b])).is_empty());
     }
 
     #[test]

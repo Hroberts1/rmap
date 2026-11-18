@@ -1,5 +1,7 @@
 # rmap
 
+[![CI](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml/badge.svg)](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml)
+
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
 
 rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, and [serde](https://serde.rs)/serde_json for the JSON report format.
@@ -112,7 +114,7 @@ sudo setcap cap_net_raw+ep target/release/rmap
 ./target/release/rmap
 ```
 
-(`setcap` has to be repeated after every rebuild.) Without raw sockets, or on Windows and macOS, rmap still runs the scan and prints a warning in the log panel saying what it fell back to: a SYN scan becomes a TCP connect scan, a UDP scan uses ordinary connected UDP sockets, and discovery uses the TCP connect ping. The raw backend covers IPv4; IPv6 targets get the same fallbacks.
+(`setcap` has to be repeated after every rebuild.) Without raw sockets, or on Windows and macOS, rmap still runs the scan and prints a warning in the log panel saying what it fell back to: a SYN scan becomes a TCP connect scan, a UDP scan uses ordinary connected UDP sockets, and discovery uses the TCP connect ping. The raw backend covers IPv4 and IPv6 (Linux 4.5 or later for IPv6). IPv6 packets are built by rmap but routed by the kernel, which also does neighbour discovery, so there is no IPv6 equivalent of the ARP ping: discovery uses ICMPv6 echo raced against the TCP connect ping. IPv6 targets fall back to unprivileged probes (with a warning) when the host has no IPv6, for link-local addresses (zone IDs like `fe80::1%eth0` aren't accepted yet) and for IPv4-mapped addresses.
 
 Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` stop · `e` export · `c` compare with a saved scan · `n` new scan · `q` quit.
 
@@ -132,6 +134,11 @@ Set `RMAP_SCAN_DIR` to keep scans somewhere else; exports then default to `$RMAP
 
 - **JSON:** rmap's own report format, the same one used for saved scans. It carries a `format_version` so later versions of rmap can keep reading old files. It records the rmap version, start and end times, how the scan ended (`completed`, `stopped`, `failed`), the configuration, and every host with its open and open|filtered ports, detected services and CPEs, and closed/filtered counts.
 - **Nmap XML:** the commonly used subset of Nmap's documented XML output (`nmaprun`, `scaninfo`, `host`, `status`, `address`, `hostnames`, `ports`, `extraports`, `port`, `state`, `service` with product/version/extrainfo/CPE, `times`, `runstats`), so tools that import Nmap results can read rmap scans. It's written by rmap's own small XML writer; times are in UTC, and CPEs are converted to the `cpe:/` form Nmap uses.
+- **Markdown:** a readable summary for pasting into a ticket: scope, times, hosts up, open ports and potential CVE counts by severity, then a ports table and findings per host, then all findings by severity.
+- **CSV:** one row per open or open|filtered port (`ip, hostname, port, protocol, state, service, product, version, cves, worst_severity`). Every field is quoted per RFC 4180, and fields a spreadsheet would treat as a formula (starting with `=`, `+`, `-`, `@`, tab or CR) get a leading `'`, since banners and hostnames come from the scanned devices.
+- **HTML:** one self-contained, printable page for handing to a client: inline CSS only, no JavaScript or external requests (a Content-Security-Policy blocks them), light and dark friendly.
+
+Every scanned string is escaped for its format, and control characters (terminal escape sequences) and bidirectional overrides are replaced with `�`. CVE matches are version-based, so the Markdown and HTML reports call them *potential* findings to verify before acting.
 
 **Compare (`c`).** Once a scan has finished or been stopped, press `c` to pick a saved scan to compare against. The list is newest first, with the most recent earlier scan of the same targets selected. The diff screen lists, color-coded:
 
@@ -151,8 +158,8 @@ crates/
 ├── rmap-engine   async scan engine (tokio)
 ├── rmap-detect   service detection: probes, matcher, TLS, CPEs
 ├── rmap-log      local log files and crash reports (no dependencies)
-├── rmap-packet   Ethernet/ARP/IPv4/TCP/UDP/ICMP building and parsing (no dependencies)
-├── rmap-report   scan reports: JSON and Nmap XML export, saved scans, diffs
+├── rmap-packet   Ethernet/ARP/IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 building and parsing (no dependencies)
+├── rmap-report   scan reports: JSON, Nmap XML, Markdown, CSV and HTML export, saved scans, diffs
 ├── rmap-vuln     vulnerability matching: CPE -> CVE lookup against a local database (no dependencies beyond rmap-core)
 └── rmap-tui      ratatui front end
 src/main.rs       starts logging, the runtime and the UI
@@ -189,13 +196,13 @@ The raw backend (`crates/rmap-engine/src/raw`) sends packets built by `rmap-pack
 | Other ICMP unreachable codes | filtered |
 | Nothing after retries | open\|filtered |
 
-UDP probes carry real requests for DNS, NTP, SNMPv1 (`public`), NetBIOS name service and SSDP, so those services answer instead of staying silent; other ports get an empty datagram. Linux limits how fast it sends ICMP errors, so on fast templates some closed UDP ports can show as open|filtered.
+UDP probes carry real requests for DNS, NTP, SNMPv1 (`public`, see [UDP detection](#udp-detection)), NetBIOS name service and SSDP, so those services answer instead of staying silent; other ports get an empty datagram. Linux limits how fast it sends ICMP errors, so on fast templates some closed UDP ports can show as open|filtered.
 
 Privileged discovery uses ARP for targets on a directly connected Ethernet subnet (an unanswered ARP request means the host is down) and, elsewhere, ICMP echo raced against the TCP connect ping.
 
 ## Service detection
 
-Tick **Services** on the setup form and rmap identifies the software behind each open TCP port. The port table shows the service and version, and the details pane adds a line per port with extra information, the OS the service revealed, and a [CPE 2.3](https://nvd.nist.gov/products/cpe) name:
+Tick **Services** on the setup form and rmap identifies the software behind each open TCP port, and each open or open|filtered UDP port. The port table shows the service and version, and the details pane adds a line per port with extra information, the OS the service revealed, and a [CPE 2.3](https://nvd.nist.gov/products/cpe) name:
 
 ```
 22/tcp  open  ssh   OpenSSH 8.9p1
@@ -211,7 +218,15 @@ How it works (`crates/rmap-detect`):
 
 `Service::method` says how the result was reached (`banner`, `probe`, or `port_table`), and `confidence` runs from 0 (guess) to 10.
 
-Covered today: OpenSSH, Dropbear, nginx, Apache httpd, Microsoft IIS and HTTPAPI, lighttpd, Caddy, Tomcat Coyote, Elasticsearch, Postfix, Exim, Sendmail, Microsoft Exchange, vsftpd, ProFTPD, Pure-FTPd, FileZilla Server, Microsoft FTP, Dovecot, Courier, MySQL, MariaDB, PostgreSQL, Redis, Valkey, MongoDB, Memcached, RabbitMQ, Asterisk and Apple Remote Desktop, plus the protocols SSH, HTTP (any `Server:` header), FTP, SMTP, POP3, IMAP, TLS, SMB, RDP, VNC, telnet, SIP, RTSP, AMQP and MQTT. UDP detection isn't done yet; the database and API already take a protocol.
+Covered today: OpenSSH, Dropbear, nginx, Apache httpd, Microsoft IIS and HTTPAPI, lighttpd, Caddy, Tomcat Coyote, Elasticsearch, Postfix, Exim, Sendmail, Microsoft Exchange, vsftpd, ProFTPD, Pure-FTPd, FileZilla Server, Microsoft FTP, Dovecot, Courier, MySQL, MariaDB, PostgreSQL, Redis, Valkey, MongoDB, Memcached, RabbitMQ, Asterisk and Apple Remote Desktop, plus the protocols SSH, HTTP (any `Server:` header), FTP, SMTP, POP3, IMAP, TLS, SMB, RDP, VNC, telnet, SIP, RTSP, AMQP and MQTT. Over UDP: DNS (`version.bind`: BIND, dnsmasq, Unbound, PowerDNS, Knot, Microsoft DNS), NTP (ntpd and NTPsec versions over mode 6 control queries, otherwise stratum and reference from a mode 3 request), SNMP v2c and v1 (the sysDescr: Cisco IOS version, Windows, Linux or FreeBSD), NetBIOS name service (host name, workgroup, MAC), mDNS / DNS-SD (the advertised service types) and SSDP / UPnP (MiniUPnPd, libupnp, any `SERVER:` header).
+
+### UDP detection
+
+UDP probes are `protocol udp` blocks in `probes.txt`, tried only on the ports they list; there are no generic UDP probes, so unknown UDP ports cost nothing. Each probe sends one datagram on a connected socket and reads the first reply. DNS, NTP, SNMP, NetBIOS and mDNS replies are binary and decoded in code (`crates/rmap-detect/src/udp.rs`), which checks that the reply really answers rmap's request; the probe's match rules then read the text the decoder pulled out (the `version.bind` string, NTP system variables, the SNMP sysDescr) to name the product and version, so vulnerability matching works for them too. All text taken from a reply is escaped before it is shown.
+
+A port the UDP scan left as open|filtered is reported as **open** if any detection probe gets a reply. For UDP ports, detection therefore runs before the `Port` event is sent, which carries the final state; the `Service` event still follows it.
+
+**SNMP community guessing.** Both the UDP port scan (SNMPv1) and detection (SNMPv2c, then v1) send a GetRequest for sysDescr with the community string `public`. A reply means the agent accepts that community, which is reported in the port's info. Some intrusion detection systems and SNMP agents log or alert on requests with a guessed community, and a few lock out the source after failed attempts. Only scan UDP 161 on networks you are authorised to test, or leave 161 out of the port list.
 
 ### Adding a probe or match rule
 
@@ -320,7 +335,7 @@ unshare -rn sh -c 'ip link set lo up && target/debug/deps/rmap_engine-<hash> --i
 ## Roadmap
 
 - [x] **M1: engine + TUI shell.** Target parsing, TCP connect scan, unprivileged discovery, live results.
-- [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. (IPv6 raw scans and RTT-adaptive timeouts are still to do.)
+- [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. IPv6 SYN and UDP scans and ICMPv6 echo discovery too. (RTT-adaptive timeouts are still to do.)
 - [x] **M3: service detection.** rmap's own probe and match database, version strings, TLS certificate names, CPE identifiers.
 - [x] **M4: vulnerability matching.** Offline CPE → CVE lookup against a locally cached, hand-curated starter set of public CVEs, flagged as *potentially* vulnerable to allow for vendor backports.
 - [x] **M5: export and diffing.** JSON and XML export from the TUI, saved scans, and comparing two scans.

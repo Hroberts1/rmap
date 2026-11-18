@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use rmap_engine::ScanConfig;
 use rmap_report::{
     ConfigSummary, DiffLine, ExportFormat, SavedScan, ScanReport, ScanStore, diff, port_ranges,
@@ -15,27 +15,25 @@ use rmap_report::{
 };
 
 use crate::app::{App, Screen};
+use crate::input::TextInput;
 
 /// The export dialog on the results screen.
 pub struct ExportDialog {
     pub format: ExportFormat,
-    pub path: String,
+    pub path: TextInput,
     /// Outcome of the last attempt: `Ok(path)` or `Err(message)`.
     pub status: Option<Result<String, String>>,
 }
 
 impl ExportDialog {
     fn toggle_format(&mut self) {
-        let next = match self.format {
-            ExportFormat::Json => ExportFormat::Xml,
-            ExportFormat::Xml => ExportFormat::Json,
-        };
+        let next = self.format.next();
         // Swap the extension if the path still has the old one.
         let old = format!(".{}", self.format.extension());
         if self.path.to_ascii_lowercase().ends_with(&old) {
-            self.path.truncate(self.path.len() - old.len());
-            self.path.push('.');
-            self.path.push_str(next.extension());
+            // `old` is ASCII, so this byte offset is a char boundary.
+            let stem = &self.path[..self.path.len() - old.len()];
+            self.path = format!("{stem}.{}", next.extension()).into();
         }
         self.format = next;
     }
@@ -73,7 +71,7 @@ pub fn default_store() -> Option<ScanStore> {
 }
 
 /// The report's description of the scan the user asked for.
-pub fn config_summary(targets: &str, config: &ScanConfig) -> ConfigSummary {
+pub fn config_summary(targets: &str, exclude: &str, config: &ScanConfig) -> ConfigSummary {
     ConfigSummary {
         targets: targets.trim().to_string(),
         ports: port_ranges(config.ports.as_slice()),
@@ -83,17 +81,8 @@ pub fn config_summary(targets: &str, config: &ScanConfig) -> ConfigSummary {
         timing_name: config.timing.name.to_string(),
         discovery: config.discovery,
         service_detection: config.service_detection,
-    }
-}
-
-fn edit_text(text: &mut String, key: &KeyEvent) {
-    match key.code {
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => text.clear(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => text.push(c),
-        KeyCode::Backspace => {
-            text.pop();
-        }
-        _ => {}
+        exclude: exclude.trim().to_string(),
+        max_rate: config.max_rate,
     }
 }
 
@@ -162,7 +151,7 @@ impl App {
         rmap_log::debug!("export dialog opened");
         self.dialog = Some(Dialog::Export(ExportDialog {
             format,
-            path: path.display().to_string(),
+            path: path.display().to_string().into(),
             status: None,
         }));
     }
@@ -215,14 +204,15 @@ impl App {
             Some(Dialog::Export(mut d)) => {
                 match key.code {
                     KeyCode::Esc => return,
-                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                    KeyCode::Tab | KeyCode::BackTab => {
                         d.toggle_format();
                         d.status = None;
                     }
                     KeyCode::Enter => self.run_export(&mut d),
                     _ => {
-                        edit_text(&mut d.path, &key);
-                        d.status = None;
+                        if d.path.handle_key(&key) {
+                            d.status = None;
+                        }
                     }
                 }
                 self.dialog = Some(Dialog::Export(d));

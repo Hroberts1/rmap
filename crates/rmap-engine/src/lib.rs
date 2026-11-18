@@ -19,9 +19,10 @@
 //! shows up in the summary even when it isn't logged line by line.
 
 mod backend;
-pub mod payloads;
+pub mod exclude;
 pub mod rate;
 pub mod raw;
+pub mod rtt;
 mod service;
 pub mod tcp;
 pub mod udp;
@@ -59,26 +60,34 @@ pub struct ScanConfig {
     /// Has no effect without `service_detection`: there is nothing to
     /// look up yet.
     pub vuln_matching: bool,
+    /// Addresses never to probe, in target syntax. Hostnames are resolved at
+    /// scan start; if one doesn't resolve the scan stops before sending
+    /// anything. Empty means no exclusions.
+    pub exclude: Vec<Target>,
+    /// Most probes started per second across all hosts (discovery pings,
+    /// port probes and service detection each count as one). `None` means
+    /// no cap beyond the timing template.
+    pub max_rate: Option<u32>,
 }
 
 impl ScanConfig {
     /// One-line description for logs.
     pub fn describe(&self) -> String {
-        let shown: Vec<String> = self
-            .targets
-            .iter()
-            .take(10)
-            .map(ToString::to_string)
-            .collect();
-        let more = self.targets.len().saturating_sub(shown.len());
-        format!(
-            "targets=[{}{}] ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={} vuln_matching={}",
-            shown.join(","),
+        let list = |targets: &[Target]| {
+            let shown: Vec<String> = targets.iter().take(10).map(ToString::to_string).collect();
+            let more = targets.len().saturating_sub(shown.len());
             if more > 0 {
-                format!(",+{more} more")
+                format!("{},+{more} more", shown.join(","))
             } else {
-                String::new()
-            },
+                shown.join(",")
+            }
+        };
+        format!(
+            "targets=[{}] exclude=[{}] max_rate={} ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={} vuln_matching={}",
+            list(&self.targets),
+            list(&self.exclude),
+            self.max_rate
+                .map_or("unlimited".to_string(), |r| format!("{r}/s")),
             self.ports.len(),
             self.scan_type,
             self.timing.level,
@@ -215,9 +224,11 @@ struct Shared {
     discovery: bool,
     scan_type: ScanType,
     prober: backend::Prober,
-    /// Set once the user has been told IPv6 targets can't use raw probes.
+    /// Set once the user has been told some IPv6 targets can't use raw probes.
     ipv6_warned: AtomicBool,
     probe_slots: Semaphore,
+    /// The user's cap on probe starts per second, shared by every host.
+    max_rate: Option<rate::RateLimiter>,
     /// Present when service detection is on.
     services: Option<service::Detection>,
     /// Present when vulnerability matching is on and there is a service
@@ -231,6 +242,13 @@ struct Shared {
 impl Shared {
     fn warn_ui(&self, msg: String) {
         let _ = self.tx.send(ScanEvent::Warning(msg));
+    }
+
+    /// Wait for a turn under the user's rate cap before starting a probe.
+    async fn pace(&self) {
+        if let Some(limit) = &self.max_rate {
+            limit.wait().await;
+        }
     }
 }
 
@@ -273,8 +291,24 @@ async fn run(
         rmap_log::warn!("{msg}");
         let _ = tx.send(ScanEvent::Warning(msg));
     }
-    let hosts: u64 = config.targets.iter().map(Target::count).sum();
     let per_host = config.ports.len();
+    let exclude = match exclude::resolve(&config.exclude).await {
+        Ok(list) => list,
+        Err(msg) => {
+            let msg = format!("{msg}; nothing was scanned");
+            rmap_log::warn!("{msg}");
+            let _ = tx.send(ScanEvent::Started {
+                hosts: 0,
+                ports_per_host: per_host,
+            });
+            let _ = tx.send(ScanEvent::Warning(msg));
+            let _ = tx.send(ScanEvent::Finished {
+                elapsed: started.elapsed(),
+            });
+            return;
+        }
+    };
+    let hosts = exclude::count_hosts(&config.targets, &exclude);
     progress
         .total
         .store(hosts * per_host as u64, Ordering::Relaxed);
@@ -299,7 +333,13 @@ async fn run(
         tx,
         progress,
         stats,
+        max_rate: config.max_rate.map(rate::RateLimiter::per_second),
     });
+    if hosts == 0 && !config.targets.is_empty() {
+        let msg = "every target address is in the exclude list; nothing to scan".to_string();
+        rmap_log::warn!("{msg}");
+        shared.warn_ui(msg);
+    }
 
     let mut host_tasks: JoinSet<IpAddr> = JoinSet::new();
     let reap = |r: Result<IpAddr, JoinError>, shared: &Shared| {
@@ -327,6 +367,19 @@ async fn run(
             _ => Box::new(target.addrs().map(|ip| (ip, None))),
         };
         for (ip, hostname) in addrs {
+            if exclude::is_excluded(&exclude, ip) {
+                rmap_log::trace!("skipping excluded {ip}");
+                if let Some(name) = hostname {
+                    let msg = format!("skipped {name} ({ip}): it is in the exclude list");
+                    rmap_log::info!("{msg}");
+                    shared.warn_ui(msg);
+                    shared
+                        .progress
+                        .completed
+                        .fetch_add(per_host as u64, Ordering::Relaxed);
+                }
+                continue;
+            }
             let slot = host_slots
                 .clone()
                 .acquire_owned()
@@ -413,7 +466,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         && !shared.ipv6_warned.swap(true, Ordering::Relaxed)
     {
         let msg = format!(
-            "raw scans support IPv4 only so far; IPv6 targets get an unprivileged {} scan",
+            "raw IPv6 probes are unavailable for some targets (see the log); they get an unprivileged {} scan",
             if shared.scan_type == ScanType::Udp {
                 "UDP"
             } else {
@@ -424,13 +477,14 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         shared.warn_ui(msg);
     }
 
-    let (state, rtt) = if shared.discovery {
+    let (state, rtt, mac) = if shared.discovery {
+        shared.pace().await;
         match prober.ping(ip, &shared.timing, &shared.stats).await {
-            Some(rtt) => (HostState::Up, Some(rtt)),
-            None => (HostState::Down, None),
+            Some((rtt, mac)) => (HostState::Up, Some(rtt), mac),
+            None => (HostState::Down, None, None),
         }
     } else {
-        (HostState::Assumed, None)
+        (HostState::Assumed, None, None)
     };
     let counter = if state == HostState::Down {
         &shared.stats.hosts_down
@@ -438,13 +492,16 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         &shared.stats.hosts_up
     };
     counter.fetch_add(1, Ordering::Relaxed);
-    rmap_log::debug!("host {ip} {state:?} rtt={rtt:?}");
+    rmap_log::debug!("host {ip} {state:?} rtt={rtt:?} mac={mac:?}");
     let _ = shared.tx.send(ScanEvent::Host {
         ip,
         hostname,
         state,
         rtt,
     });
+    if let Some(mac) = mac {
+        let _ = shared.tx.send(ScanEvent::Mac { ip, mac });
+    }
     if state == HostState::Down {
         shared
             .progress
@@ -453,6 +510,11 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         return;
     }
 
+    let host_rtt = Arc::new(rtt::HostRtt::seeded(rtt));
+    rmap_log::debug!(
+        "host {ip} probe timeout starts at {:?}",
+        host_rtt.timeout(&shared.timing, 0)
+    );
     let closed = Arc::new(AtomicU32::new(0));
     let filtered = Arc::new(AtomicU32::new(0));
     let mut probes = JoinSet::new();
@@ -467,9 +529,12 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
             .forget();
         let slot = ProbeSlot(shared.clone());
         let (sh, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
-        let prober = prober.clone();
+        let (prober, host_rtt) = (prober.clone(), host_rtt.clone());
         probes.spawn(async move {
-            let result = prober.probe(ip, port, &sh.timing, &sh.stats).await;
+            sh.pace().await;
+            let result = prober
+                .probe(ip, port, &sh.timing, &sh.stats, &host_rtt)
+                .await;
             sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
                 PortState::Open | PortState::OpenFiltered => {
@@ -481,17 +546,32 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                         result.rtt
                     );
                     let open = result.state == PortState::Open;
-                    let _ = sh.tx.send(ScanEvent::Port { ip, result });
-                    if let Some(services) = sh.services.as_ref().filter(|_| open) {
-                        // Free the probe slot first so detection (and any
-                        // vuln lookup after it) can't hold up the port scan.
-                        drop(slot);
-                        if let Some(service) =
-                            services.identify(ip, port, Protocol::Tcp, &sh.tx).await
-                            && let Some(vulns) = sh.vulns.as_ref()
-                        {
-                            vulns.check(ip, Protocol::Tcp, port, &service.cpes, &sh.tx);
+                    let protocol = result.protocol;
+                    // Free the probe slot before detection so it (and any
+                    // vuln lookup after it) can't hold up the port scan.
+                    let service = match sh.services.as_ref() {
+                        // A UDP reply can upgrade open|filtered to open, so
+                        // detection runs first and sends the Port event.
+                        Some(services) if protocol == Protocol::Udp => {
+                            drop(slot);
+                            sh.pace().await;
+                            services.identify_udp(ip, result, &sh.tx).await
                         }
+                        Some(services) if open => {
+                            let _ = sh.tx.send(ScanEvent::Port { ip, result });
+                            drop(slot);
+                            sh.pace().await;
+                            services.identify(ip, port, protocol, &sh.tx).await
+                        }
+                        _ => {
+                            let _ = sh.tx.send(ScanEvent::Port { ip, result });
+                            None
+                        }
+                    };
+                    if let Some(service) = service
+                        && let Some(vulns) = sh.vulns.as_ref()
+                    {
+                        vulns.check(ip, protocol, port, &service.cpes, &sh.tx);
                     }
                 }
                 PortState::Closed => {
@@ -521,7 +601,12 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         filtered.load(Ordering::Relaxed),
     );
     let elapsed = started.elapsed();
-    rmap_log::debug!("host {ip} done in {elapsed:?}: closed={closed} filtered={filtered}");
+    let est = host_rtt.snapshot();
+    rmap_log::debug!(
+        "host {ip} done in {elapsed:?}: closed={closed} filtered={filtered} srtt={:?} timeout={:?}",
+        est.srtt(),
+        est.timeout(&shared.timing, 0)
+    );
     let _ = shared.tx.send(ScanEvent::HostDone {
         ip,
         closed,

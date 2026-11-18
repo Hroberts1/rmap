@@ -7,7 +7,7 @@
 use std::ffi::CStr;
 use std::io;
 use std::mem::{size_of, zeroed};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use rmap_packet::MacAddr;
@@ -45,9 +45,14 @@ fn socket(domain: libc::c_int, kind: libc::c_int, protocol: libc::c_int) -> io::
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn set_int_option(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) {
+fn setsockopt_int(
+    fd: RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> io::Result<()> {
     // SAFETY: the option value points at a live c_int of the stated size.
-    let ret = unsafe {
+    check(unsafe {
         libc::setsockopt(
             fd,
             level,
@@ -55,14 +60,15 @@ fn set_int_option(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc:
             (&value as *const libc::c_int).cast(),
             size_of::<libc::c_int>() as libc::socklen_t,
         )
-    };
-    if ret < 0 {
+    })
+    .map(drop)
+}
+
+fn set_int_option(fd: RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) {
+    if let Err(e) = setsockopt_int(fd, level, name, value) {
         // Only used for buffer sizes and IP_HDRINCL on IPPROTO_RAW, where
         // failure costs performance, not correctness.
-        rmap_log::debug!(
-            "setsockopt({level}, {name}) failed: {}",
-            io::Error::last_os_error()
-        );
+        rmap_log::debug!("setsockopt({level}, {name}) failed: {e}");
     }
 }
 
@@ -88,6 +94,47 @@ pub fn ipv4_recv_socket(protocol: libc::c_int) -> io::Result<OwnedFd> {
     let fd = socket(libc::AF_INET, libc::SOCK_RAW, protocol)?;
     set_int_option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 8 << 20);
     Ok(fd)
+}
+
+/// A raw IPv6 socket for sending packets whose IPv6 header we build.
+///
+/// `IPPROTO_RAW` implies `IPV6_HDRINCL` on Linux 4.5 and later; setting it
+/// explicitly makes older kernels fail here instead of sending our header
+/// as payload. The kernel still routes the packet and resolves neighbours.
+pub fn ipv6_send_socket() -> io::Result<OwnedFd> {
+    let fd = socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_RAW)?;
+    setsockopt_int(fd.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_HDRINCL, 1)?;
+    set_int_option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, 4 << 20);
+    Ok(fd)
+}
+
+/// A raw IPv6 socket that receives a copy of every incoming packet of
+/// `protocol` (`IPPROTO_TCP` or `IPPROTO_ICMPV6`). IPv6 raw sockets never
+/// pass the IPv6 header up; read with [`recv_from_v6`] to learn the sender.
+pub fn ipv6_recv_socket(protocol: libc::c_int) -> io::Result<OwnedFd> {
+    let fd = socket(libc::AF_INET6, libc::SOCK_RAW, protocol)?;
+    set_int_option(fd.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, 8 << 20);
+    Ok(fd)
+}
+
+/// An IPv6-only UDP socket bound to `port` on every address. IPv6-only so
+/// it can share the port number of the scan's IPv4 UDP socket.
+pub fn udp6_socket(port: u16) -> io::Result<std::net::UdpSocket> {
+    let fd = socket(libc::AF_INET6, libc::SOCK_DGRAM, 0)?;
+    setsockopt_int(fd.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
+    // SAFETY: sockaddr_in6 is plain data; all-zero is the unspecified address.
+    let mut addr: libc::sockaddr_in6 = unsafe { zeroed() };
+    addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    addr.sin6_port = port.to_be();
+    // SAFETY: addr is a fully initialised sockaddr_in6 and the length matches.
+    check(unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&addr as *const libc::sockaddr_in6).cast(),
+            size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    })?;
+    Ok(fd.into())
 }
 
 /// An `AF_PACKET` socket bound to one interface that sends and receives
@@ -129,6 +176,26 @@ fn sendto_v4(fd: RawFd, packet: &[u8], dst: Ipv4Addr) -> io::Result<usize> {
     })
 }
 
+fn sendto_v6(fd: RawFd, packet: &[u8], dst: Ipv6Addr) -> io::Result<usize> {
+    // SAFETY: sockaddr_in6 is plain data; all-zero is a valid starting value.
+    // The port stays 0, as raw sockets require; no scope ID, so link-local
+    // targets are not routable here (the engine falls back for them).
+    let mut addr: libc::sockaddr_in6 = unsafe { zeroed() };
+    addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    addr.sin6_addr.s6_addr = dst.octets();
+    // SAFETY: packet is a live slice and addr is a sockaddr_in6 of the given length.
+    check_size(unsafe {
+        libc::sendto(
+            fd,
+            packet.as_ptr().cast(),
+            packet.len(),
+            0,
+            (&addr as *const libc::sockaddr_in6).cast(),
+            size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    })
+}
+
 fn send(fd: RawFd, frame: &[u8]) -> io::Result<usize> {
     // SAFETY: frame is a live slice of the stated length.
     check_size(unsafe { libc::send(fd, frame.as_ptr().cast(), frame.len(), 0) })
@@ -139,11 +206,16 @@ fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     check_size(unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) })
 }
 
-/// Send a whole IPv4 packet to `dst`, waiting while the socket buffer is full.
-pub async fn send_ipv4(fd: &AsyncFd<OwnedFd>, packet: &[u8], dst: Ipv4Addr) -> io::Result<()> {
+/// Send a whole IP packet to `dst` on a raw socket of the same family,
+/// waiting while the socket buffer is full.
+pub async fn send_ip(fd: &AsyncFd<OwnedFd>, packet: &[u8], dst: IpAddr) -> io::Result<()> {
     loop {
         let mut guard = fd.writable().await?;
-        match guard.try_io(|inner| sendto_v4(inner.as_raw_fd(), packet, dst)) {
+        let sent = guard.try_io(|inner| match dst {
+            IpAddr::V4(dst) => sendto_v4(inner.as_raw_fd(), packet, dst),
+            IpAddr::V6(dst) => sendto_v6(inner.as_raw_fd(), packet, dst),
+        });
+        match sent {
             Ok(r) => return r.map(drop),
             Err(_would_block) => continue,
         }
@@ -156,6 +228,36 @@ pub async fn send_frame(fd: &AsyncFd<OwnedFd>, frame: &[u8]) -> io::Result<()> {
         let mut guard = fd.writable().await?;
         match guard.try_io(|inner| send(inner.as_raw_fd(), frame)) {
             Ok(r) => return r.map(drop),
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+fn recvfrom_v6(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Ipv6Addr)> {
+    // SAFETY: sockaddr_in6 is plain data; all-zero is a valid starting value.
+    let mut addr: libc::sockaddr_in6 = unsafe { zeroed() };
+    let mut len = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
+    // SAFETY: buf is a live, writable slice of the stated length, and addr
+    // and len describe a writable sockaddr_in6.
+    let n = check_size(unsafe {
+        libc::recvfrom(
+            fd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            0,
+            (&mut addr as *mut libc::sockaddr_in6).cast(),
+            &mut len,
+        )
+    })?;
+    Ok((n, Ipv6Addr::from(addr.sin6_addr.s6_addr)))
+}
+
+/// Receive one packet from a raw IPv6 socket, with its sender.
+pub async fn recv_from_v6(fd: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> io::Result<(usize, Ipv6Addr)> {
+    loop {
+        let mut guard = fd.readable().await?;
+        match guard.try_io(|inner| recvfrom_v6(inner.as_raw_fd(), buf)) {
+            Ok(r) => return r,
             Err(_would_block) => continue,
         }
     }

@@ -1,22 +1,26 @@
 //! Application state and input handling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rmap_core::{HostState, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets};
+use rmap_core::{
+    HostState, MacAddr, PortList, PortResult, ScanEvent, ScanType, Timing, parse_targets,
+};
 use rmap_engine::{Scan, ScanConfig};
 use rmap_report::{ReportBuilder, ScanStore, unix_millis_now};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::filter::SortOrder;
 use crate::input::{TextInput, paste_as_list};
+use crate::mouse::HitMap;
 use crate::report::{Dialog, DiffView};
 
 /// Most engine events handled per frame, so a burst can't stall input.
-const EVENTS_PER_FRAME: usize = 5_000;
+pub(crate) const EVENTS_PER_FRAME: usize = 5_000;
 const MAX_LOG_LINES: usize = 200;
 /// Marks engine warnings in the log panel, which draws them highlighted.
 pub const WARNING_PREFIX: &str = "warning: ";
@@ -24,20 +28,24 @@ pub const WARNING_PREFIX: &str = "warning: ";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Targets,
+    Exclude,
     Ports,
     ScanType,
     Timing,
+    MaxRate,
     Discovery,
     Services,
     Vulns,
 }
 
 impl Field {
-    const ALL: [Field; 7] = [
+    const ALL: [Field; 9] = [
         Field::Targets,
+        Field::Exclude,
         Field::Ports,
         Field::ScanType,
         Field::Timing,
+        Field::MaxRate,
         Field::Discovery,
         Field::Services,
         Field::Vulns,
@@ -56,7 +64,11 @@ impl Field {
 
 pub struct Form {
     pub targets: TextInput,
+    /// Addresses never to probe, in target syntax.
+    pub exclude: TextInput,
     pub ports: TextInput,
+    /// Probes per second across the whole scan; empty means unlimited.
+    pub max_rate: TextInput,
     pub scan_type: ScanType,
     pub timing: u8,
     pub discovery: bool,
@@ -73,7 +85,9 @@ impl Default for Form {
     fn default() -> Self {
         Form {
             targets: TextInput::default(),
+            exclude: TextInput::default(),
             ports: "common".into(),
+            max_rate: TextInput::default(),
             scan_type: ScanType::Connect,
             timing: 3,
             discovery: true,
@@ -93,6 +107,8 @@ pub struct HostRow {
     pub closed: u32,
     pub filtered: u32,
     pub done: bool,
+    /// Learned over ARP; only on the local subnet with raw sockets.
+    pub mac: Option<MacAddr>,
 }
 
 /// Which results pane the arrow keys move through.
@@ -111,6 +127,8 @@ pub enum Confirm {
     QuitRunning,
     /// Quit from the setup form.
     Quit,
+    /// Delete the profile highlighted in the profile picker.
+    DeleteProfile,
 }
 
 impl Confirm {
@@ -119,6 +137,7 @@ impl Confirm {
             Confirm::StopAndLeave => "Stop the running scan and start a new one?",
             Confirm::QuitRunning => "A scan is still running. Stop it and quit?",
             Confirm::Quit => "Quit rmap?",
+            Confirm::DeleteProfile => "Delete the selected profile?",
         }
     }
 }
@@ -135,7 +154,10 @@ pub struct ScanView {
     pub stopped: bool,
     /// The engine went away without finishing, most likely a panic.
     pub failed: bool,
-    pub log: Vec<String>,
+    pub log: VecDeque<String>,
+    /// The full-height log view (`L`): lines scrolled back from the newest,
+    /// or `None` when closed. See `log_view.rs`.
+    pub log_view: Option<usize>,
     /// Everything the engine reported, for export and saving.
     pub report: ReportBuilder,
     /// Where the scan was auto-saved, once it ended.
@@ -147,6 +169,16 @@ pub struct ScanView {
     /// First table row drawn in the port pane; kept by the renderer so the
     /// view only scrolls when the selection would leave it.
     pub port_offset: usize,
+    /// Which results tab is shown, and the Services/Vulns tabs' selection.
+    pub tabs: crate::tabs::Tabs,
+    /// Host list filter text (`/`), and whether it has keyboard focus.
+    pub filter: TextInput,
+    pub filtering: bool,
+    pub sort: SortOrder,
+    /// Re-scan of one host (`r`), run after the main scan ends.
+    pub rescan: Option<crate::rescan::Rescan>,
+    /// Progress samples for the header's rate, ETA and sparkline.
+    pub rate: crate::rate::RateMeter,
 }
 
 impl ScanView {
@@ -158,20 +190,39 @@ impl ScanView {
         self.finished.unwrap_or_else(|| self.started.elapsed())
     }
 
-    /// Hosts shown in the list, in address order.
+    /// Hosts shown in the list, filtered and in the chosen sort order.
     pub fn visible(&self) -> Vec<IpAddr> {
-        self.hosts
+        let mut ips: Vec<IpAddr> = self
+            .hosts
             .iter()
             .filter(|(_, h)| self.show_down || h.state != HostState::Down)
+            .filter(|(ip, h)| crate::filter::matches(**ip, h, &self.filter))
             .map(|(ip, _)| *ip)
-            .collect()
+            .collect();
+        crate::filter::sort(&mut ips, &self.hosts, self.sort);
+        ips
+    }
+
+    /// After the filter or sort changes: keep the selected host if it is
+    /// still listed, else select the first row (or nothing).
+    pub(crate) fn keep_selection(&mut self) {
+        let visible = self.visible();
+        let keep = self
+            .selected
+            .filter(|s| visible.contains(s))
+            .or(visible.first().copied());
+        if keep != self.selected {
+            self.selected = keep;
+            self.port_selected = 0;
+            self.port_offset = 0;
+        }
     }
 
     pub fn count(&self, state: HostState) -> usize {
         self.hosts.values().filter(|h| h.state == state).count()
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    pub(crate) fn move_selection(&mut self, delta: isize) {
         let visible = self.visible();
         if visible.is_empty() {
             return;
@@ -197,7 +248,7 @@ impl ScanView {
             .map_or(&[], |h| h.open.as_slice())
     }
 
-    fn move_port_selection(&mut self, delta: isize) {
+    pub(crate) fn move_port_selection(&mut self, delta: isize) {
         let n = self.selected_ports().len();
         if n == 0 {
             return;
@@ -214,9 +265,9 @@ impl ScanView {
     }
 
     pub(crate) fn log(&mut self, line: String) {
-        self.log.push(line);
+        self.log.push_back(line);
         if self.log.len() > MAX_LOG_LINES {
-            self.log.remove(0);
+            self.log.pop_front();
         }
     }
 
@@ -240,12 +291,18 @@ impl ScanView {
                         closed: 0,
                         filtered: 0,
                         done: state == HostState::Down,
+                        mac: None,
                     },
                 );
-                if self.selected.is_none() && state != HostState::Down {
+                // With a filter on, drain_events picks the first match instead.
+                if self.selected.is_none() && state != HostState::Down && self.filter.is_empty() {
                     self.selected = Some(ip);
                 }
             }
+            ScanEvent::Mac { ip, mac } => match self.hosts.get_mut(&ip) {
+                Some(host) => host.mac = Some(mac),
+                None => rmap_log::warn!("MAC for {ip} arrived before its host"),
+            },
             ScanEvent::Port { ip, result } => match self.hosts.get_mut(&ip) {
                 Some(host) => {
                     let key = (result.port, result.protocol);
@@ -327,7 +384,7 @@ pub enum Screen {
 }
 
 pub struct App {
-    rt: Handle,
+    pub(crate) rt: Handle,
     pub screen: Screen,
     pub form: Form,
     pub scan: Option<ScanView>,
@@ -342,22 +399,36 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// The key help overlay on the results screen.
     pub help: bool,
+    /// Scan profiles, recent targets, and their pickers on the setup form.
+    pub profiles: crate::profiles::Profiles,
+    /// Text for the event loop to send to the clipboard (OSC 52).
+    pub clipboard: Option<String>,
+    /// Whether the terminal should report mouse events; `m` toggles it.
+    pub mouse_capture: bool,
+    /// Clickable areas of the last frame, written by the renderer.
+    pub hits: HitMap,
     quit: bool,
 }
 
 impl App {
     pub fn new(rt: Handle) -> Self {
+        let store = crate::report::default_store();
+        let profiles = crate::profiles::Profiles::load(store.as_ref().map(ScanStore::dir));
         App {
             rt,
             screen: Screen::Setup,
             form: Form::default(),
             scan: None,
             pending: None,
-            store: crate::report::default_store(),
+            store,
             dialog: None,
             diff: None,
             confirm: None,
             help: false,
+            profiles,
+            clipboard: None,
+            mouse_capture: true,
+            hits: HitMap::default(),
             quit: false,
         }
     }
@@ -395,6 +466,18 @@ impl App {
                 }
             }
         }
+        if view.selected.is_none() {
+            view.keep_selection();
+        }
+        view.drain_rescan();
+        if view.is_running() {
+            let done = view
+                .scan
+                .progress
+                .completed
+                .load(std::sync::atomic::Ordering::Relaxed);
+            view.rate.sample(view.started.elapsed(), done);
+        }
         self.autosave_if_done();
     }
 
@@ -418,6 +501,10 @@ impl App {
             self.help = false;
             return;
         }
+        if self.profiles.picker.is_some() {
+            self.on_picker_key(key);
+            return;
+        }
         if self.dialog.is_some() {
             self.on_dialog_key(key);
             return;
@@ -436,9 +523,23 @@ impl App {
         if self.confirm.is_some() || self.pending.is_some() || self.help {
             return;
         }
+        if self.profiles.picker.is_some() {
+            self.profiles.paste(pasted);
+            return;
+        }
         if let Some(Dialog::Export(d)) = self.dialog.as_mut() {
-            d.path.push_str(pasted.lines().next().unwrap_or("").trim());
+            d.path
+                .insert_str(pasted.lines().next().unwrap_or("").trim());
             d.status = None;
+            return;
+        }
+        if let Some(view) = self.scan.as_mut()
+            && view.filtering
+            && matches!(self.screen, Screen::Results)
+        {
+            view.filter
+                .insert_str(pasted.lines().next().unwrap_or("").trim());
+            view.keep_selection();
             return;
         }
         if !matches!(self.screen, Screen::Setup) || self.dialog.is_some() {
@@ -447,7 +548,11 @@ impl App {
         let form = &mut self.form;
         match form.focus {
             Field::Targets => form.targets.insert_str(&paste_as_list(pasted)),
+            Field::Exclude => form.exclude.insert_str(&paste_as_list(pasted)),
             Field::Ports => form.ports.insert_str(&paste_as_list(pasted)),
+            Field::MaxRate => form
+                .max_rate
+                .insert_str(pasted.lines().next().unwrap_or("").trim()),
             _ => {}
         }
     }
@@ -459,6 +564,7 @@ impl App {
                 rmap_log::info!("user confirmed: {confirm:?}");
                 match confirm {
                     Confirm::Quit | Confirm::QuitRunning => self.quit = true,
+                    Confirm::DeleteProfile => self.delete_selected_profile(),
                     Confirm::StopAndLeave => {
                         if let Some(view) = self.scan.as_mut()
                             && view.is_running()
@@ -480,7 +586,12 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some((config, _)) = self.pending.take() {
                     rmap_log::info!("user confirmed scanning public addresses");
-                    self.launch(config);
+                    // Only a rescan asks from the results screen.
+                    if matches!(self.screen, Screen::Results) {
+                        self.start_rescan(config);
+                    } else {
+                        self.launch(config);
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -492,6 +603,9 @@ impl App {
     }
 
     fn on_setup_key(&mut self, key: KeyEvent) {
+        if self.on_profiles_shortcut(&key) {
+            return;
+        }
         let form = &mut self.form;
         match key.code {
             KeyCode::Esc => self.confirm = Some(Confirm::Quit),
@@ -504,6 +618,12 @@ impl App {
                 }
                 Field::Ports => {
                     form.ports.handle_key(&key);
+                }
+                Field::Exclude => {
+                    form.exclude.handle_key(&key);
+                }
+                Field::MaxRate => {
+                    form.max_rate.handle_key(&key);
                 }
                 Field::Timing => match code {
                     KeyCode::Left | KeyCode::Char('-') => {
@@ -559,7 +679,37 @@ impl App {
             self.screen = Screen::Setup;
             return;
         };
+        if view.filtering {
+            match key.code {
+                KeyCode::Enter => view.filtering = false,
+                KeyCode::Esc => {
+                    view.filter.clear();
+                    view.filtering = false;
+                }
+                _ => {
+                    view.filter.handle_key(&key);
+                }
+            }
+            view.keep_selection();
+            return;
+        }
+        if crate::log_view::on_key(view, &key) || crate::tabs::on_key(view, key.code) {
+            return;
+        }
         match key.code {
+            KeyCode::Char('/') => {
+                view.filtering = true;
+                view.focus = Pane::Hosts;
+            }
+            KeyCode::Char('o') => {
+                view.sort = view.sort.next();
+                view.keep_selection();
+            }
+            // Esc clears an active filter before it means "new scan".
+            KeyCode::Esc if !view.filter.is_empty() => {
+                view.filter.clear();
+                view.keep_selection();
+            }
             KeyCode::Char('q') => {
                 if view.is_running() {
                     self.confirm = Some(Confirm::QuitRunning);
@@ -584,15 +734,24 @@ impl App {
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => view.focus = Pane::Ports,
+            KeyCode::Char('L') => view.log_view = Some(0),
             KeyCode::Left | KeyCode::Char('h') => view.focus = Pane::Hosts,
             KeyCode::Char('s') if view.is_running() => {
                 view.scan.stop();
                 view.stopped = true;
                 view.log("scan stopped".into());
             }
-            KeyCode::Char('d') => view.show_down = !view.show_down,
+            KeyCode::Char('d') => {
+                view.show_down = !view.show_down;
+                view.keep_selection();
+            }
+            KeyCode::Char('s') if view.rescan.is_some() => view.stop_rescan(),
+            KeyCode::Char('r') => self.request_rescan(),
             KeyCode::Char('e') => self.open_export(),
             KeyCode::Char('c') => self.open_compare(),
+            KeyCode::Char('y') => self.clipboard = crate::clipboard::copy_selection(view, false),
+            KeyCode::Char('Y') => self.clipboard = crate::clipboard::copy_selection(view, true),
+            KeyCode::Char('m') => self.toggle_mouse_capture(),
             KeyCode::Down | KeyCode::Char('j') => view.move_focused(1),
             KeyCode::Up | KeyCode::Char('k') => view.move_focused(-1),
             KeyCode::PageDown => view.move_focused(10),
@@ -623,6 +782,30 @@ impl App {
                 return;
             }
         };
+        let exclude = match crate::limits::parse_exclude(&form.exclude) {
+            Ok(e) => e,
+            Err(e) => {
+                rmap_log::info!("rejected exclude {:?}: {e}", form.exclude);
+                form.error = Some(format!("Exclude: {e}"));
+                form.focus = Field::Exclude;
+                return;
+            }
+        };
+        if !exclude.is_empty() && rmap_engine::exclude::count_hosts(&targets, &exclude) == 0 {
+            rmap_log::info!("rejected scan: every target is excluded");
+            form.error = Some("Exclude: every target address is excluded; nothing to scan".into());
+            form.focus = Field::Exclude;
+            return;
+        }
+        let max_rate = match crate::limits::parse_max_rate(&form.max_rate) {
+            Ok(r) => r,
+            Err(e) => {
+                rmap_log::info!("rejected max rate {:?}: {e}", form.max_rate);
+                form.error = Some(format!("Max rate: {e}"));
+                form.focus = Field::MaxRate;
+                return;
+            }
+        };
         form.error = None;
         let public: Vec<String> = targets
             .iter()
@@ -637,6 +820,8 @@ impl App {
             scan_type: form.scan_type,
             service_detection: form.service_detection,
             vuln_matching: form.vuln_matching,
+            exclude,
+            max_rate,
         };
         if public.is_empty() {
             self.launch(config);
@@ -649,11 +834,12 @@ impl App {
     fn launch(&mut self, config: ScanConfig) {
         // Save the previous scan before it's replaced.
         self.autosave_if_done();
+        self.profiles.remember_targets(&self.form.targets);
         let report = ReportBuilder::new(
-            crate::report::config_summary(&self.form.targets, &config),
+            crate::report::config_summary(&self.form.targets, &self.form.exclude, &config),
             unix_millis_now(),
         );
-        let summary = format!(
+        let mut summary = format!(
             "{} · {} · {} port{} · T{} {}{}",
             self.form.targets.trim(),
             config.scan_type.label(),
@@ -667,6 +853,13 @@ impl App {
                 " · no discovery"
             },
         );
+        // Rate first: the exclude list can be long and the title truncates.
+        if let Some(rate) = config.max_rate {
+            summary += &format!(" · max {rate}/s");
+        }
+        if !config.exclude.is_empty() {
+            summary += &format!(" · excluding {}", self.form.exclude.trim());
+        }
         let scan = Scan::start(&self.rt, config);
         self.scan = Some(ScanView {
             scan,
@@ -679,13 +872,20 @@ impl App {
             finished: None,
             stopped: false,
             failed: false,
-            log: Vec::new(),
+            log: VecDeque::new(),
+            log_view: None,
             report,
             saved: None,
             save_attempted: false,
             focus: Pane::Hosts,
             port_selected: 0,
             port_offset: 0,
+            tabs: Default::default(),
+            filter: TextInput::default(),
+            filtering: false,
+            sort: SortOrder::default(),
+            rescan: None,
+            rate: Default::default(),
         });
         self.screen = Screen::Results;
     }
@@ -815,9 +1015,11 @@ mod tests {
         let (_rt, mut app) = app();
         assert_eq!(app.form.focus, Field::Targets);
         for expected in [
+            Field::Exclude,
             Field::Ports,
             Field::ScanType,
             Field::Timing,
+            Field::MaxRate,
             Field::Discovery,
             Field::Services,
             Field::Vulns,
@@ -836,7 +1038,7 @@ mod tests {
         type_text(&mut app, "10.0.0.1x");
         press(&mut app, KeyCode::Backspace);
         assert_eq!(app.form.targets, "10.0.0.1");
-        press(&mut app, KeyCode::Tab);
+        app.form.focus = Field::Ports;
         for _ in 0..10 {
             press(&mut app, KeyCode::Backspace); // extra presses on empty text are harmless
         }
@@ -1125,7 +1327,7 @@ mod tests {
         }
         assert_eq!(view.log.len(), MAX_LOG_LINES);
         assert_eq!(
-            view.log.last().unwrap(),
+            view.log.back().unwrap(),
             &format!("{WARNING_PREFIX}w{}", MAX_LOG_LINES + 49)
         );
     }
@@ -1295,6 +1497,59 @@ mod tests {
     }
 
     #[test]
+    fn header_shows_rate_eta_and_sparkline() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_rt, mut app) = app();
+        nas_host(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        // Pretend it's still running: 380 probes/s for six seconds.
+        view.stopped = false;
+        for s in 0..=6 {
+            view.rate
+                .sample(Duration::from_secs(s), 15_840 - (6 - s) * 380);
+        }
+        view.scan.progress.total.store(25_400, Relaxed);
+        view.scan.progress.completed.store(15_840, Relaxed);
+        for (w, h) in [(120, 32), (80, 24)] {
+            let screen = render(&mut app, w, h);
+            let header: String = screen.lines().take(4).collect::<Vec<_>>().join("\n");
+            for needle in ["ETA 0:25", "15,840 / 25,400 probes · 380/s ██████"] {
+                assert!(header.contains(needle), "{needle} at {w}x{h}:\n{header}");
+            }
+            if std::env::var_os("RMAP_SHOW_RENDER").is_some() {
+                println!("{screen}");
+            }
+        }
+        // Narrow: the sparkline goes, then the rate; nothing panics.
+        let header = render(&mut app, 59, 24);
+        assert!(
+            header.contains("380/s") && !header.contains("380/s █"),
+            "{header}"
+        );
+        let header = render(&mut app, 52, 24);
+        assert!(header.contains("25,400 probes") && !header.contains("380/s"));
+        assert!(!render(&mut app, 44, 24).contains("probes"));
+        for (w, h) in [(20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+        // Stopped: no ETA and no rate.
+        app.scan.as_mut().unwrap().stopped = true;
+        let screen = render(&mut app, 120, 32);
+        assert!(!screen.contains("ETA"), "{screen}");
+        assert!(screen.contains("25,400 probes│"), "{screen}");
+        // Finished: the whole-scan average and the final duration.
+        let view = app.scan.as_mut().unwrap();
+        view.stopped = false;
+        view.finished = Some(Duration::from_secs(40));
+        let screen = render(&mut app, 120, 32);
+        assert!(!screen.contains("ETA"), "{screen}");
+        assert!(
+            screen.contains("· 396/s") && screen.contains("· 40.0s"),
+            "{screen}"
+        );
+    }
+
+    #[test]
     fn port_pane_scrolls_to_the_last_port() {
         let (_rt, mut app) = app();
         nas_host(&mut app);
@@ -1358,6 +1613,87 @@ mod tests {
     }
 
     #[test]
+    fn y_copies_the_selection() {
+        let (_rt, mut app) = app();
+        let ip = nas_host(&mut app);
+        let last_log = |app: &App| app.scan.as_ref().unwrap().log.back().cloned().unwrap();
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("192.168.1.20"));
+        assert_eq!(last_log(&app), "copied 192.168.1.20");
+        // Host pane: every CVE on the host, deduplicated.
+        let view = app.scan.as_mut().unwrap();
+        let dup = view.hosts[&ip].open[0].vulnerabilities[0].clone();
+        view.hosts.get_mut(&ip).unwrap().open[2]
+            .vulnerabilities
+            .push(dup);
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(
+            app.clipboard.take().as_deref(),
+            Some("CVE-2024-6387,CVE-2023-48795")
+        );
+        assert_eq!(last_log(&app), "copied 2 CVE IDs from 192.168.1.20");
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("192.168.1.20:22"));
+        assert_eq!(last_log(&app), "copied 192.168.1.20:22");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.clipboard.take(), None);
+        assert_eq!(last_log(&app), "nothing to copy: no CVEs on this port");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("CVE-2024-6387"));
+        for (w, h) in [(80, 24), (120, 32)] {
+            assert!(render(&mut app, w, h).contains("copied 1 CVE ID from"));
+        }
+        press(&mut app, KeyCode::Char('?'));
+        assert!(render(&mut app, 80, 24).contains("ip:port / CVE IDs"));
+        press(&mut app, KeyCode::Esc);
+
+        // IPv6 gets brackets; a host with no open ports has nothing to copy.
+        let view = app.scan.as_mut().unwrap();
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        view.apply(ScanEvent::Host {
+            ip: v6,
+            hostname: None,
+            state: HostState::Up,
+            rtt: None,
+        });
+        view.selected = Some(v6);
+        view.port_selected = 0;
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take(), None);
+        assert_eq!(last_log(&app), "nothing to copy: no open port selected");
+        app.scan.as_mut().unwrap().apply(ScanEvent::Port {
+            ip: v6,
+            result: PortResult::new(22, Protocol::Tcp, rmap_core::PortState::Open, None),
+        });
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("[fe80::1]:22"));
+    }
+
+    #[test]
+    fn oversized_copies_are_refused() {
+        let (_rt, mut app) = app();
+        let ip = nas_host(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        let mut cve = view.hosts[&ip].open[0].vulnerabilities[0].clone();
+        let ports = &mut view.hosts.get_mut(&ip).unwrap().open;
+        for i in 0..1000 {
+            cve.id = format!("CVE-2099-{i:05}");
+            ports[1].vulnerabilities.push(cve.clone());
+        }
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.clipboard, None);
+        let log = app.scan.as_ref().unwrap().log.back().unwrap();
+        assert!(
+            log.starts_with("nothing copied:") && log.contains("limit"),
+            "{log}"
+        );
+    }
+
+    #[test]
     fn multi_line_paste_does_not_submit() {
         let (_rt, mut app) = app();
         app.on_paste("10.0.0.1\r\n10.0.0.2\n\n10.0.0.3\n");
@@ -1399,6 +1735,86 @@ mod tests {
         app.form.focus = Field::Services;
         press(&mut app, KeyCode::Char(' '));
         assert!(!app.form.vuln_matching && !app.form.service_detection);
+    }
+
+    #[test]
+    fn filter_narrows_hosts_and_keeps_selection_valid() {
+        let (_rt, mut app) = app();
+        let nas = nas_host(&mut app);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        press(&mut app, KeyCode::Tab); // focus ports, select the last one
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "SMB");
+        let view = app.scan.as_ref().unwrap();
+        assert_eq!(view.visible(), [nas], "only the host with 445 open");
+        assert_eq!((view.focus, view.selected), (Pane::Hosts, Some(nas)));
+        assert_eq!(view.port_selected, 4, "same host, port selection kept");
+        for (w, h) in [(80, 24), (120, 32)] {
+            let screen = render(&mut app, w, h);
+            assert!(screen.contains("filter: /SMB"), "{w}x{h}:\n{screen}");
+            assert!(screen.contains("1 of 3"), "{w}x{h}:\n{screen}");
+            if std::env::var_os("RMAP_SHOW_RENDER").is_some() {
+                println!("{screen}");
+            }
+        }
+        // Keys type into the filter while it has focus, even q and n.
+        type_text(&mut app, "qn");
+        assert!(!app.should_quit() && matches!(app.screen, Screen::Results));
+        let view = app.scan.as_ref().unwrap();
+        assert!(view.visible().is_empty());
+        assert_eq!(view.selected, None, "nothing listed, nothing selected");
+        assert!(render(&mut app, 80, 24).contains("no hosts match"));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_paste("10.0.0.3\nignored");
+        press(&mut app, KeyCode::Enter);
+        let view = app.scan.as_ref().unwrap();
+        assert!(!view.filtering && view.filter == "10.0.0.3");
+        assert_eq!(view.visible(), [ip("10.0.0.3")]);
+        assert_eq!(
+            (view.selected, view.port_selected),
+            (Some(ip("10.0.0.3")), 0)
+        );
+        // Esc on the list clears the filter instead of leaving the results.
+        press(&mut app, KeyCode::Esc);
+        let view = app.scan.as_ref().unwrap();
+        assert!(view.filter.is_empty() && matches!(app.screen, Screen::Results));
+        assert_eq!(view.visible().len(), 3);
+        assert_eq!(
+            view.selected,
+            Some(ip("10.0.0.3")),
+            "kept when still listed"
+        );
+        // Esc while typing clears too.
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "nas");
+        press(&mut app, KeyCode::Esc);
+        let view = app.scan.as_ref().unwrap();
+        assert!(!view.filtering && view.filter.is_empty());
+        for (w, h) in [(20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn o_cycles_sort_and_shows_it() {
+        let (_rt, mut app) = app();
+        let nas = nas_host(&mut app);
+        assert!(render(&mut app, 80, 24).contains("by ip"));
+        press(&mut app, KeyCode::Char('o'));
+        let view = app.scan.as_ref().unwrap();
+        assert_eq!(view.visible()[0], nas, "most open ports first");
+        assert_eq!(view.selected, Some(nas));
+        assert!(render(&mut app, 120, 32).contains("by ports"));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            app.scan.as_ref().unwrap().visible()[0],
+            nas,
+            "worst CVE first"
+        );
+        assert!(render(&mut app, 80, 24).contains("by cves"));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.scan.as_ref().unwrap().sort, SortOrder::Ip);
     }
 
     #[test]

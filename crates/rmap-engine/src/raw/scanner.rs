@@ -4,26 +4,27 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use rmap_core::{PortResult, PortState, Protocol, ScanType, Timing};
+use rmap_core::{MacAddr, PortResult, PortState, Protocol, ScanType, Timing};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
-use super::matcher::{Matched, Matcher, Reply, tcp_state, udp_state};
+use super::matcher::{Matched, Matcher, Reply, Route, tcp_state, udp_state};
 use super::sys::{self, Interface};
 use crate::Stats;
-use crate::payloads::udp_payload;
 use crate::rate::RateLimiter;
+use crate::rtt::HostRtt;
+use rmap_detect::udp::udp_payload;
 
-type PortKey = (Ipv4Addr, u16, Protocol);
+type PortKey = (IpAddr, u16, Protocol);
 
 /// Probes waiting for a reply, keyed by what the reply will be about.
 struct Waiters<K, V> {
@@ -88,9 +89,13 @@ impl<K: Eq + Hash + Copy, V> Drop for Registration<'_, K, V> {
 struct Inner {
     matcher: Matcher,
     send: AsyncFd<OwnedFd>,
+    /// `None` when raw IPv6 sockets couldn't be opened (for example, IPv6
+    /// is disabled); IPv6 targets then get unprivileged probes.
+    send6: Option<AsyncFd<OwnedFd>>,
     rate: RateLimiter,
     ports: Waiters<PortKey, Reply>,
-    pings: Waiters<Ipv4Addr, ()>,
+    /// Host replies; ARP replies carry the sender's hardware address.
+    pings: Waiters<IpAddr, Option<MacAddr>>,
 }
 
 impl Inner {
@@ -109,17 +114,72 @@ impl Inner {
                 );
             }
             Matched::HostUp(ip) => {
-                let taken = self.pings.deliver(ip, ());
+                let taken = self.pings.deliver(ip, None);
                 rmap_log::trace!("host reply from {ip} wanted={taken}");
+            }
+            Matched::ArpReply { ip, mac } => {
+                let taken = self.pings.deliver(ip.into(), Some(MacAddr(mac.0)));
+                rmap_log::trace!("ARP reply from {ip} is-at {mac} wanted={taken}");
             }
         }
     }
 
-    async fn send(&self, packet: &[u8], dst: Ipv4Addr) -> io::Result<Instant> {
+    async fn send(&self, packet: &[u8], dst: IpAddr) -> io::Result<Instant> {
+        let fd = match dst {
+            IpAddr::V4(_) => &self.send,
+            IpAddr::V6(_) => self.send6.as_ref().ok_or_else(no_ipv6)?,
+        };
         self.rate.wait().await;
         let sent = Instant::now();
-        sys::send_ipv4(&self.send, packet, dst).await?;
+        sys::send_ip(fd, packet, dst).await?;
         Ok(sent)
+    }
+}
+
+fn no_ipv6() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "raw IPv6 sockets unavailable")
+}
+
+/// How a listener reads its socket and matches what it reads.
+#[derive(Clone, Copy)]
+enum Handler {
+    /// IPv4 raw sockets deliver the IP header with each packet.
+    V4(fn(&Matcher, &[u8]) -> Option<Matched>),
+    /// IPv6 raw sockets don't; the sender comes from `recvfrom`.
+    V6(fn(&Matcher, Ipv6Addr, &[u8]) -> Option<Matched>),
+}
+
+/// The IPv6 sockets, opened apart from the IPv4 ones so that a host
+/// without IPv6 still gets raw IPv4 scans.
+struct V6Sockets {
+    send: AsyncFd<OwnedFd>,
+    icmp: AsyncFd<OwnedFd>,
+    tcp: Option<AsyncFd<OwnedFd>>,
+    udp: Option<UdpSocket>,
+}
+
+impl V6Sockets {
+    fn open(scan_type: ScanType, udp_port: u16) -> io::Result<V6Sockets> {
+        let send = sys::register(sys::ipv6_send_socket()?)?;
+        let icmp = sys::register(sys::ipv6_recv_socket(libc::IPPROTO_ICMPV6)?)?;
+        let tcp = match scan_type {
+            ScanType::Syn => Some(sys::register(sys::ipv6_recv_socket(libc::IPPROTO_TCP)?)?),
+            _ => None,
+        };
+        // Same port as the IPv4 UDP socket, so one Matcher recognises both.
+        let udp = match scan_type {
+            ScanType::Udp => {
+                let s = sys::udp6_socket(udp_port)?;
+                Some(UdpSocket::from_std(s)?)
+            }
+            _ => None,
+        };
+        Ok(V6Sockets {
+            send,
+            icmp,
+            tcp,
+            udp,
+        })
     }
 }
 
@@ -147,19 +207,22 @@ impl Drop for RawScanner {
 }
 
 /// Read packets from `fd` forever, passing each to `handle`.
-async fn listen(
-    what: &'static str,
-    fd: AsyncFd<OwnedFd>,
-    inner: Arc<Inner>,
-    handle: fn(&Matcher, &[u8]) -> Option<Matched>,
-) {
+async fn listen(what: &'static str, fd: AsyncFd<OwnedFd>, inner: Arc<Inner>, handle: Handler) {
     let mut buf = vec![0u8; 65_536];
     let mut errors = 0u32;
     loop {
-        match sys::recv_packet(&fd, &mut buf).await {
-            Ok(n) => {
+        let matched = match handle {
+            Handler::V4(f) => sys::recv_packet(&fd, &mut buf)
+                .await
+                .map(|n| f(&inner.matcher, &buf[..n])),
+            Handler::V6(f) => sys::recv_from_v6(&fd, &mut buf)
+                .await
+                .map(|(n, src)| f(&inner.matcher, src, &buf[..n])),
+        };
+        match matched {
+            Ok(m) => {
                 errors = 0;
-                if let Some(m) = handle(&inner.matcher, &buf[..n]) {
+                if let Some(m) = m {
                     inner.dispatch(m);
                 }
             }
@@ -179,13 +242,12 @@ async fn listen_udp(socket: UdpSocket, inner: Arc<Inner>) {
     let mut buf = vec![0u8; 65_536];
     loop {
         match socket.recv_from(&mut buf).await {
-            Ok((_, std::net::SocketAddr::V4(from))) => inner.dispatch(Matched::Port {
-                ip: *from.ip(),
+            Ok((_, from)) => inner.dispatch(Matched::Port {
+                ip: from.ip(),
                 port: from.port(),
                 protocol: Protocol::Udp,
                 reply: Reply::Data,
             }),
-            Ok(_) => {}
             Err(e) => {
                 // ICMP errors can surface here on some kernels; the raw ICMP
                 // listener handles them, so just keep reading.
@@ -225,32 +287,49 @@ impl RawScanner {
             rmap_log::warn!("could not list interfaces, ARP discovery disabled: {e}");
             Vec::new()
         });
+        let v6 = V6Sockets::open(scan_type, udp_port)
+            .inspect_err(|e| {
+                rmap_log::info!("raw IPv6 unavailable ({e}); IPv6 targets get unprivileged probes")
+            })
+            .ok();
         let rate = RateLimiter::for_timing(timing);
         rmap_log::info!(
-            "raw backend ready: scan={scan_type:?} rate={}pps udp_port={udp_port} interfaces={:?}",
+            "raw backend ready: scan={scan_type:?} rate={}pps udp_port={udp_port} ipv6={} interfaces={:?}",
             crate::rate::packet_rate(timing),
+            v6.is_some(),
             interfaces
                 .iter()
                 .map(|i| format!("{}={}/{}", i.name, i.addr, i.netmask))
                 .collect::<Vec<_>>()
         );
+        let (send6, v6_listeners) = match v6 {
+            Some(v6) => (Some(v6.send), Some((v6.icmp, v6.tcp, v6.udp))),
+            None => (None, None),
+        };
         let inner = Arc::new(Inner {
             matcher: Matcher::new(udp_port),
             send,
+            send6,
             rate,
             ports: Waiters::new(),
             pings: Waiters::new(),
         });
-        let mut tasks = vec![
-            tokio::spawn(listen("ICMP", icmp, inner.clone(), Matcher::match_icmp)).abort_handle(),
-        ];
+        let spawn = |what, fd, handle| tokio::spawn(listen(what, fd, inner.clone(), handle));
+        let mut tasks = vec![spawn("ICMP", icmp, Handler::V4(Matcher::match_icmp)).abort_handle()];
         if let Some(tcp) = tcp {
-            tasks.push(
-                tokio::spawn(listen("TCP", tcp, inner.clone(), Matcher::match_tcp)).abort_handle(),
-            );
+            tasks.push(spawn("TCP", tcp, Handler::V4(Matcher::match_tcp)).abort_handle());
         }
         if let Some(udp) = udp {
             tasks.push(tokio::spawn(listen_udp(udp, inner.clone())).abort_handle());
+        }
+        if let Some((icmp, tcp, udp)) = v6_listeners {
+            tasks.push(spawn("ICMPv6", icmp, Handler::V6(Matcher::match_icmp6)).abort_handle());
+            if let Some(tcp) = tcp {
+                tasks.push(spawn("TCPv6", tcp, Handler::V6(Matcher::match_tcp6)).abort_handle());
+            }
+            if let Some(udp) = udp {
+                tasks.push(tokio::spawn(listen_udp(udp, inner.clone())).abort_handle());
+            }
         }
         Ok(RawScanner {
             scan_type,
@@ -261,15 +340,33 @@ impl RawScanner {
         })
     }
 
-    /// Probe one port of `dst` from `src`. Connect scans don't come here.
+    /// The route raw probes to `dst` would take, or why there is none
+    /// and the host should get unprivileged probes instead.
+    pub(crate) fn route(&self, dst: IpAddr) -> io::Result<Route> {
+        if let IpAddr::V6(v6) = dst {
+            if self.inner.send6.is_none() {
+                return Err(no_ipv6());
+            }
+            if v6.to_ipv4_mapped().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "IPv4-mapped addresses can't be sent on raw IPv6 sockets",
+                ));
+            }
+        }
+        super::route(dst)
+    }
+
+    /// Probe one port of `route.dst()`. Connect scans don't come here.
     pub(crate) async fn probe(
         &self,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
+        route: Route,
         port: u16,
         timing: &Timing,
         stats: &Stats,
+        host_rtt: &HostRtt,
     ) -> PortResult {
+        let (src, dst) = (route.src(), route.dst());
         let (protocol, silent) = match self.scan_type {
             ScanType::Udp => (Protocol::Udp, PortState::OpenFiltered),
             _ => (Protocol::Tcp, PortState::Filtered),
@@ -284,67 +381,74 @@ impl RawScanner {
                 sleep(timing.scan_delay).await;
             }
             let packet = match protocol {
-                Protocol::Tcp => m.syn_packet(src, dst, port, try_no),
-                Protocol::Udp => m.udp_packet(src, dst, port, &payload),
+                Protocol::Tcp => m.syn_packet(route, port, try_no),
+                Protocol::Udp => m.udp_packet(route, port, &payload),
             };
             let (_registration, reply) = self.inner.ports.register((dst, port, protocol));
             let sent = match self.inner.send(&packet, dst).await {
                 Ok(t) => t,
                 Err(e) => {
-                    stats.record_error(dst.into(), port, &e);
+                    stats.record_error(dst, port, &e);
                     return PortResult::new(port, protocol, PortState::Filtered, None);
                 }
             };
+            let limit = host_rtt.timeout(timing, try_no);
             rmap_log::trace!(
-                "sent {}/{} probe {src} -> {dst}:{port} try={try_no}",
+                "sent {}/{} probe {src} -> {dst}:{port} try={try_no} limit={limit:?}",
                 protocol.as_str(),
                 self.scan_type.label()
             );
-            if let Ok(Ok(reply)) = timeout(timing.connect_timeout, reply).await {
+            if let Ok(Ok(reply)) = timeout(limit, reply).await {
                 let state = match protocol {
                     Protocol::Tcp => tcp_state(reply),
                     Protocol::Udp => udp_state(reply),
                 };
-                return PortResult::new(port, protocol, state, Some(sent.elapsed()));
+                let rtt = sent.elapsed();
+                // Karn's rule: after a retry the reply may answer an earlier
+                // probe, so only first attempts are measured.
+                if try_no == 0 {
+                    host_rtt.sample(rtt);
+                }
+                return PortResult::new(port, protocol, state, Some(rtt));
             }
         }
         PortResult::new(port, protocol, silent, None)
     }
 
-    /// Check whether `dst` is up: ARP on a directly connected subnet,
-    /// otherwise ICMP echo raced against the TCP connect ping.
+    /// Check whether `route.dst()` is up: ARP on a directly connected IPv4
+    /// subnet, otherwise ICMP (or ICMPv6) echo raced against the TCP connect
+    /// ping. IPv6 has no neighbour-discovery ping; the kernel resolves
+    /// neighbours for the echo request itself. Only ARP learns the host's
+    /// MAC address.
     pub(crate) async fn ping(
         self: &Arc<Self>,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
+        route: Route,
         timing: &Timing,
         stats: &Arc<Stats>,
-    ) -> Option<Duration> {
-        if let Some(rtt) = self.arp_ping(src, dst, timing).await {
-            return rtt;
+    ) -> Option<(Duration, Option<MacAddr>)> {
+        if let Route::V4(src, dst) = route
+            && let Some(answer) = self.arp_ping(src, dst, timing).await
+        {
+            return answer;
         }
         let mut racers = JoinSet::new();
         let (me, t) = (self.clone(), *timing);
-        racers.spawn(async move { me.echo_ping(src, dst, &t).await });
+        racers.spawn(async move { me.echo_ping(route, &t).await });
         let (s, t) = (stats.clone(), *timing);
-        racers.spawn(async move { crate::tcp::ping(dst.into(), &t, &s).await });
+        racers.spawn(async move { crate::tcp::ping(route.dst(), &t, &s).await });
         while let Some(done) = racers.join_next().await {
             if let Ok(Some(rtt)) = done {
-                return Some(rtt);
+                return Some((rtt, None));
             }
         }
         None
     }
 
-    pub(crate) async fn echo_ping(
-        &self,
-        src: Ipv4Addr,
-        dst: Ipv4Addr,
-        timing: &Timing,
-    ) -> Option<Duration> {
+    pub(crate) async fn echo_ping(&self, route: Route, timing: &Timing) -> Option<Duration> {
+        let (src, dst) = (route.src(), route.dst());
         let limit = timing.connect_timeout.max(Duration::from_secs(1));
         for try_no in 0..=timing.retries {
-            let packet = self.inner.matcher.echo_packet(src, dst, u16::from(try_no));
+            let packet = self.inner.matcher.echo_packet(route, u16::from(try_no));
             let (_registration, reply) = self.inner.pings.register(dst);
             let sent = match self.inner.send(&packet, dst).await {
                 Ok(t) => t,
@@ -354,7 +458,7 @@ impl RawScanner {
                 }
             };
             rmap_log::trace!("sent echo request {src} -> {dst} try={try_no}");
-            if let Ok(Ok(())) = timeout(limit, reply).await {
+            if let Ok(Ok(_)) = timeout(limit, reply).await {
                 return Some(sent.elapsed());
             }
         }
@@ -369,7 +473,7 @@ impl RawScanner {
         src: Ipv4Addr,
         dst: Ipv4Addr,
         timing: &Timing,
-    ) -> Option<Option<Duration>> {
+    ) -> Option<Option<(Duration, Option<MacAddr>)>> {
         let iface = self.interfaces.iter().find(|i| {
             !i.loopback && i.addr == src && i.addr != dst && i.index != 0 && i.on_link(dst)
         })?;
@@ -378,7 +482,7 @@ impl RawScanner {
         let frame = Matcher::arp_frame(mac, src, dst);
         let limit = timing.connect_timeout.max(Duration::from_millis(500));
         for try_no in 0..=timing.retries {
-            let (_registration, reply) = self.inner.pings.register(dst);
+            let (_registration, reply) = self.inner.pings.register(dst.into());
             self.inner.rate.wait().await;
             let sent = Instant::now();
             if let Err(e) = sys::send_frame(&fd, &frame).await {
@@ -386,8 +490,8 @@ impl RawScanner {
                 return None;
             }
             rmap_log::trace!("sent ARP who-has {dst} on {} try={try_no}", iface.name);
-            if let Ok(Ok(())) = timeout(limit, reply).await {
-                return Some(Some(sent.elapsed()));
+            if let Ok(Ok(mac)) = timeout(limit, reply).await {
+                return Some(Some((sent.elapsed(), mac)));
             }
         }
         Some(None)

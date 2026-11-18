@@ -15,7 +15,8 @@ use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 
 use crate::Stats;
-use crate::payloads::udp_payload;
+use crate::rtt::HostRtt;
+use rmap_detect::udp::udp_payload;
 
 /// How one UDP exchange ended.
 #[derive(Debug)]
@@ -68,14 +69,22 @@ async fn attempt(ip: IpAddr, port: u16, payload: &[u8], limit: Duration) -> Outc
 }
 
 /// Probe one UDP port. Silence after every retry means `OpenFiltered`.
-pub async fn probe(ip: IpAddr, port: u16, timing: &Timing, stats: &Stats) -> PortResult {
+/// Waits as long as the host's RTT estimate says, and feeds answers back.
+pub async fn probe(
+    ip: IpAddr,
+    port: u16,
+    timing: &Timing,
+    stats: &Stats,
+    host_rtt: &HostRtt,
+) -> PortResult {
     let payload = udp_payload(port);
     for try_no in 0..=timing.retries {
         if !timing.scan_delay.is_zero() {
             sleep(timing.scan_delay).await;
         }
-        let outcome = attempt(ip, port, &payload, timing.connect_timeout).await;
-        rmap_log::trace!("udp probe {ip}:{port} try={try_no} outcome={outcome:?}");
+        let limit = host_rtt.timeout(timing, try_no);
+        let outcome = attempt(ip, port, &payload, limit).await;
+        rmap_log::trace!("udp probe {ip}:{port} try={try_no} limit={limit:?} outcome={outcome:?}");
         let (state, rtt) = match outcome {
             Outcome::Reply(rtt) => (PortState::Open, Some(rtt)),
             Outcome::Refused(rtt) => (PortState::Closed, Some(rtt)),
@@ -85,6 +94,10 @@ pub async fn probe(ip: IpAddr, port: u16, timing: &Timing, stats: &Stats) -> Por
             }
             Outcome::TimedOut => continue,
         };
+        // Each attempt uses a fresh socket, so its RTT is unambiguous.
+        if let Some(rtt) = rtt {
+            host_rtt.sample(rtt);
+        }
         return PortResult::new(port, Protocol::Udp, state, rtt);
     }
     PortResult::new(port, Protocol::Udp, PortState::OpenFiltered, None)
@@ -137,6 +150,7 @@ mod tests {
             port,
             &quick(),
             &Stats::default(),
+            &HostRtt::default(),
         )
         .await;
         assert_eq!(r.state, PortState::Open);
@@ -153,6 +167,7 @@ mod tests {
             port,
             &quick(),
             &Stats::default(),
+            &HostRtt::default(),
         )
         .await;
         drop(server);
@@ -175,6 +190,7 @@ mod tests {
             port,
             &timing,
             &Stats::default(),
+            &HostRtt::default(),
         )
         .await;
         assert_eq!(r.state, PortState::Closed);

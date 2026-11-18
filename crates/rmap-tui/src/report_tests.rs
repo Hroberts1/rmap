@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::KeyModifiers;
 use rmap_core::{HostState, PortResult, PortState, Protocol, ScanEvent, Service};
 use rmap_report::{ReportBuilder, RunStatus, ScanStore};
 
@@ -174,7 +175,7 @@ fn export_dialog_writes_json_and_xml() {
     let d = export_dialog(&app);
     assert_eq!(d.format, ExportFormat::Json);
     assert!(d.path.ends_with(".json"));
-    assert!(Path::new(&d.path).starts_with(tmp.0.join("scans").join("exports")));
+    assert!(Path::new(&*d.path).starts_with(tmp.0.join("scans").join("exports")));
     assert!(render(&mut app, 100, 30).contains("export"));
 
     press(&mut app, KeyCode::Char('d')); // typed into the path, not "toggle down hosts"
@@ -182,8 +183,8 @@ fn export_dialog_writes_json_and_xml() {
     press(&mut app, KeyCode::Backspace);
     press(&mut app, KeyCode::Enter);
     let d = export_dialog(&app);
-    assert_eq!(d.status, Some(Ok(d.path.clone())));
-    let back = rmap_report::json::from_str(&std::fs::read_to_string(&d.path).unwrap());
+    assert_eq!(d.status, Some(Ok(d.path.to_string())));
+    let back = rmap_report::json::from_str(&std::fs::read_to_string(&*d.path).unwrap());
     assert_eq!(back.unwrap().hosts[0].ports[0].port, 22);
     assert!(render(&mut app, 100, 30).contains("✓ saved to"));
 
@@ -192,12 +193,31 @@ fn export_dialog_writes_json_and_xml() {
     assert_eq!(d.format, ExportFormat::Xml);
     assert!(d.path.ends_with(".xml") && d.status.is_none());
     press(&mut app, KeyCode::Enter);
-    let xml = std::fs::read_to_string(&export_dialog(&app).path).unwrap();
+    let xml = std::fs::read_to_string(&*export_dialog(&app).path).unwrap();
     assert!(
         xml.contains("<port protocol=\"tcp\" portid=\"22\">"),
         "{xml}"
     );
     assert!(xml.contains("product=\"OpenSSH\" version=\"9.6\""));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Tab);
+    }
+    let d = export_dialog(&app);
+    assert_eq!(d.format, ExportFormat::Html);
+    assert!(d.path.ends_with(".html"));
+    // All five formats fit on the dialog's format line at 80x24.
+    let screen = render(&mut app, 80, 24);
+    assert!(
+        screen.contains("Markdown") && screen.contains("HTML"),
+        "{screen}"
+    );
+    render(&mut app, 20, 6); // tiny terminals must not panic
+    press(&mut app, KeyCode::Enter);
+    let html = std::fs::read_to_string(&*export_dialog(&app).path).unwrap();
+    assert!(
+        html.contains("<td>22/tcp</td>") && html.contains("OpenSSH 9.6"),
+        "{html}"
+    );
 
     // A path that can't be written shows the error inline.
     ctrl(&mut app, 'u');
@@ -331,7 +351,7 @@ fn compare_needs_a_finished_scan_and_another_saved_one() {
     assert!(app.dialog.is_none());
     let log = &app.scan.as_ref().unwrap().log;
     assert!(
-        log.last().unwrap().starts_with("no other saved scans"),
+        log.back().unwrap().starts_with("no other saved scans"),
         "{log:?}"
     );
 
@@ -350,7 +370,7 @@ fn compare_needs_a_finished_scan_and_another_saved_one() {
     press(&mut app, KeyCode::Char('c'));
     assert!(app.dialog.is_none());
     let log = &app.scan.as_ref().unwrap().log;
-    assert!(log.last().unwrap().contains("before comparing"), "{log:?}");
+    assert!(log.back().unwrap().contains("before comparing"), "{log:?}");
 }
 
 #[test]
@@ -398,22 +418,91 @@ fn export_toggle_swaps_only_matching_extensions() {
         status: None,
     };
     d.toggle_format();
-    assert_eq!((d.format, d.path.as_str()), (ExportFormat::Xml, "out.xml"));
+    assert_eq!((d.format, &*d.path), (ExportFormat::Xml, "out.xml"));
+    for (format, path) in [
+        (ExportFormat::Markdown, "out.md"),
+        (ExportFormat::Csv, "out.csv"),
+        (ExportFormat::Html, "out.html"),
+        (ExportFormat::Json, "out.json"),
+    ] {
+        d.toggle_format();
+        assert_eq!((d.format, &*d.path), (format, path));
+    }
     d.path = "report.txt".into();
     d.toggle_format();
-    assert_eq!(
-        (d.format, d.path.as_str()),
-        (ExportFormat::Json, "report.txt")
-    );
+    assert_eq!((d.format, &*d.path), (ExportFormat::Xml, "report.txt"));
     d.path.clear();
     d.toggle_format();
     assert_eq!(d.path, "");
 }
 
+/// The export dialog's cursor column, counted from the start of the path
+/// text, and the path row as drawn.
+fn export_cursor(app: &mut App, w: u16, h: u16) -> (usize, String) {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| crate::ui::draw(f, app)).unwrap();
+    let cursor = term.get_cursor_position().unwrap();
+    let buf = term.backend().buffer().clone();
+    let row: String = (0..w).map(|x| buf[(x, cursor.y)].symbol()).collect();
+    let label = row.find("Path    ").expect("cursor is on the path row");
+    let start = row[..label].chars().count() + "Path    ".len();
+    (cursor.x as usize - start, row)
+}
+
 #[test]
-fn long_paths_show_their_tail() {
-    assert_eq!(crate::report_ui::tail("abcdef", 10), "abcdef");
-    assert_eq!(crate::report_ui::tail("abcdef", 4), "…def");
-    assert_eq!(crate::report_ui::tail("ééééé", 2), "…é");
-    assert_eq!(crate::report_ui::tail("abc", 0), "…");
+fn export_path_edits_at_the_cursor() {
+    let tmp = TempDir::new();
+    let (_rt, mut app) = stopped_scan(&tmp, "127.0.0.1", "9.6");
+    press(&mut app, KeyCode::Char('e'));
+    ctrl(&mut app, 'u');
+    type_text(&mut app, "out.json");
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Left);
+    }
+    type_text(&mut app, "put");
+    let d = export_dialog(&app);
+    assert_eq!(d.path, "output.json");
+    assert_eq!(d.format, ExportFormat::Json, "← → move the cursor now");
+    assert_eq!(export_cursor(&mut app, 80, 24).0, 6);
+
+    press(&mut app, KeyCode::Home);
+    press(&mut app, KeyCode::Delete);
+    ctrl(&mut app, 'e');
+    press(&mut app, KeyCode::Backspace);
+    ctrl(&mut app, 'a');
+    app.on_paste("dir/\nignored second line");
+    assert_eq!(export_dialog(&app).path, "dir/utput.jso");
+    assert_eq!(
+        export_cursor(&mut app, 80, 24).0,
+        4,
+        "paste lands at the cursor"
+    );
+    press(&mut app, KeyCode::End);
+    ctrl(&mut app, 'w');
+    assert_eq!(export_dialog(&app).path, "");
+}
+
+#[test]
+fn long_export_paths_scroll_with_the_cursor() {
+    let tmp = TempDir::new();
+    let (_rt, mut app) = stopped_scan(&tmp, "127.0.0.1", "9.6");
+    press(&mut app, KeyCode::Char('e'));
+    ctrl(&mut app, 'u');
+    type_text(&mut app, &format!("start-{}-end.json", "x".repeat(150)));
+    let (col, row) = export_cursor(&mut app, 80, 24);
+    assert!(
+        row.contains("-end.json") && !row.contains("start-"),
+        "{row}"
+    );
+    assert!(col > 0 && col < 80, "cursor on screen: {col}");
+    press(&mut app, KeyCode::Home);
+    let (col, row) = export_cursor(&mut app, 80, 24);
+    assert!(
+        row.contains("start-") && !row.contains("-end.json"),
+        "{row}"
+    );
+    assert_eq!(col, 0);
+    for (w, h) in [(20, 6), (1, 1), (0, 0)] {
+        render(&mut app, w, h);
+    }
 }

@@ -1174,6 +1174,13 @@ name = "rmap-log"
 version = "0.1.0"
 
 [[package]]
+name = "rmap-oui"
+version = "0.1.0"
+dependencies = [
+ "rmap-core",
+]
+
+[[package]]
 name = "rmap-packet"
 version = "0.1.0"
 
@@ -1183,6 +1190,7 @@ version = "0.1.0"
 dependencies = [
  "rmap-core",
  "rmap-log",
+ "rmap-oui",
  "serde",
  "serde_json",
 ]
@@ -1195,7 +1203,10 @@ dependencies = [
  "rmap-core",
  "rmap-engine",
  "rmap-log",
+ "rmap-oui",
  "rmap-report",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
