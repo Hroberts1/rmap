@@ -31,6 +31,7 @@ fn config(targets: &str, ports: &str, timing: Timing, discovery: bool) -> ScanCo
         discovery,
         scan_type: ScanType::Connect,
         service_detection: false,
+        vuln_matching: false,
     }
 }
 
@@ -671,6 +672,72 @@ async fn service_detection_reports_after_the_port() {
     assert_eq!(
         service.cpes,
         ["cpe:2.3:a:openbsd:openssh:9.6:p1:*:*:*:*:*:*"]
+    );
+}
+
+// ------------------------------------------------- vulnerability matching ---
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_matching_reports_a_real_cve_for_a_real_detected_service() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+    let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
+    cfg.service_detection = true;
+    cfg.vuln_matching = true;
+    let out = run_scan(cfg).await;
+    assert!(out.finished());
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+    let service_at = out
+        .events
+        .iter()
+        .position(|e| matches!(e, ScanEvent::Service { .. }))
+        .expect("service event");
+    let (vulns_at, findings) = out
+        .events
+        .iter()
+        .enumerate()
+        .find_map(|(i, e)| match e {
+            ScanEvent::Vulnerabilities {
+                port: p, findings, ..
+            } if *p == port => Some((i, findings)),
+            _ => None,
+        })
+        .expect("vulnerabilities event");
+    assert!(
+        vulns_at > service_at,
+        "vulns must follow the service they're matched from"
+    );
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].id, "CVE-2024-6387");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_matching_sends_nothing_for_a_clean_version() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.9\r\n").await;
+    let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
+    cfg.service_detection = true;
+    cfg.vuln_matching = true;
+    let out = run_scan(cfg).await;
+    assert!(out.finished());
+    assert!(
+        !out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Vulnerabilities { .. })),
+        "{:?}",
+        out.events
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_matching_without_service_detection_sends_nothing() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+    let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
+    cfg.vuln_matching = true; // no service_detection: nothing to look up
+    let out = run_scan(cfg).await;
+    assert!(out.finished());
+    assert!(
+        !out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Vulnerabilities { .. }))
     );
 }
 

@@ -70,7 +70,7 @@ pub enum HostState {
     Assumed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PortResult {
     pub port: u16,
@@ -80,6 +80,10 @@ pub struct PortResult {
     pub rtt: Option<Duration>,
     /// Filled in by service detection, possibly after the port is reported.
     pub service: Option<Service>,
+    /// Filled in by vulnerability matching, possibly after the port is
+    /// reported. Empty, not missing, when detection ran and found nothing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub vulnerabilities: Vec<crate::Vulnerability>,
 }
 
 impl PortResult {
@@ -90,6 +94,7 @@ impl PortResult {
             state,
             rtt,
             service: None,
+            vulnerabilities: Vec::new(),
         }
     }
 }
@@ -116,6 +121,14 @@ pub enum ScanEvent {
         protocol: Protocol,
         port: u16,
         service: Service,
+    },
+    /// Vulnerability matching found potential CVEs for a service already
+    /// reported with `Service`. Never sent when the list would be empty.
+    Vulnerabilities {
+        ip: IpAddr,
+        protocol: Protocol,
+        port: u16,
+        findings: Vec<crate::Vulnerability>,
     },
     /// Every port on this host has been probed.
     HostDone {

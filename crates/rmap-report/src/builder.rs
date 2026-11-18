@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
-use rmap_core::{Protocol, ScanEvent, Service};
+use rmap_core::{Protocol, ScanEvent, Service, Vulnerability};
 
 use crate::model::{ConfigSummary, HostReport, RunStatus, ScanReport};
 
@@ -15,6 +15,9 @@ pub struct ReportBuilder {
     hosts: BTreeMap<IpAddr, HostReport>,
     /// Services that arrived before their port, attached when it shows up.
     early_services: HashMap<(IpAddr, Protocol, u16), Service>,
+    /// Vulnerability findings that arrived before their port, attached
+    /// when it shows up.
+    early_vulnerabilities: HashMap<(IpAddr, Protocol, u16), Vec<Vulnerability>>,
     /// Events that referred to a host or port we hadn't seen.
     orphans: u64,
 }
@@ -25,6 +28,7 @@ impl ReportBuilder {
             report: ScanReport::new(config, started_ms),
             hosts: BTreeMap::new(),
             early_services: HashMap::new(),
+            early_vulnerabilities: HashMap::new(),
             orphans: 0,
         }
     }
@@ -63,6 +67,12 @@ impl ReportBuilder {
                 {
                     result.service = Some(service);
                 }
+                if let Some(findings) =
+                    self.early_vulnerabilities
+                        .remove(&(*ip, result.protocol, result.port))
+                {
+                    result.vulnerabilities = findings;
+                }
                 let key = (result.port, result.protocol);
                 match host
                     .ports
@@ -91,6 +101,28 @@ impl ReportBuilder {
                     None => {
                         self.early_services
                             .insert((*ip, *protocol, *port), service.clone());
+                    }
+                }
+            }
+            ScanEvent::Vulnerabilities {
+                ip,
+                protocol,
+                port,
+                findings,
+            } => {
+                let Some(host) = self.hosts.get_mut(ip) else {
+                    self.orphans += 1;
+                    return;
+                };
+                match host
+                    .ports
+                    .iter_mut()
+                    .find(|p| p.port == *port && p.protocol == *protocol)
+                {
+                    Some(p) => p.vulnerabilities = findings.clone(),
+                    None => {
+                        self.early_vulnerabilities
+                            .insert((*ip, *protocol, *port), findings.clone());
                     }
                 }
             }

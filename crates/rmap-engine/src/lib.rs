@@ -25,6 +25,7 @@ pub mod raw;
 mod service;
 pub mod tcp;
 pub mod udp;
+mod vuln;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -54,6 +55,10 @@ pub struct ScanConfig {
     pub scan_type: ScanType,
     /// Identify the software behind open ports.
     pub service_detection: bool,
+    /// Look up each identified service's CPEs in the local CVE database.
+    /// Has no effect without `service_detection`: there is nothing to
+    /// look up yet.
+    pub vuln_matching: bool,
 }
 
 impl ScanConfig {
@@ -67,7 +72,7 @@ impl ScanConfig {
             .collect();
         let more = self.targets.len().saturating_sub(shown.len());
         format!(
-            "targets=[{}{}] ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={}",
+            "targets=[{}{}] ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={} vuln_matching={}",
             shown.join(","),
             if more > 0 {
                 format!(",+{more} more")
@@ -84,6 +89,7 @@ impl ScanConfig {
             self.timing.retries,
             self.discovery,
             self.service_detection,
+            self.vuln_matching,
         )
     }
 }
@@ -214,6 +220,9 @@ struct Shared {
     probe_slots: Semaphore,
     /// Present when service detection is on.
     services: Option<service::Detection>,
+    /// Present when vulnerability matching is on and there is a service
+    /// detector to feed it CPEs.
+    vulns: Option<vuln::Matching>,
     tx: UnboundedSender<ScanEvent>,
     progress: Arc<Progress>,
     stats: Arc<Stats>,
@@ -286,6 +295,7 @@ async fn run(
         services: config
             .service_detection
             .then(|| service::Detection::new(config.timing)),
+        vulns: (config.service_detection && config.vuln_matching).then(vuln::Matching::new),
         tx,
         progress,
         stats,
@@ -473,10 +483,15 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                     let open = result.state == PortState::Open;
                     let _ = sh.tx.send(ScanEvent::Port { ip, result });
                     if let Some(services) = sh.services.as_ref().filter(|_| open) {
-                        // Free the probe slot first so detection can't
-                        // hold up the port scan.
+                        // Free the probe slot first so detection (and any
+                        // vuln lookup after it) can't hold up the port scan.
                         drop(slot);
-                        services.identify(ip, port, Protocol::Tcp, &sh.tx).await;
+                        if let Some(service) =
+                            services.identify(ip, port, Protocol::Tcp, &sh.tx).await
+                            && let Some(vulns) = sh.vulns.as_ref()
+                        {
+                            vulns.check(ip, Protocol::Tcp, port, &service.cpes, &sh.tx);
+                        }
                     }
                 }
                 PortState::Closed => {

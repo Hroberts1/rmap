@@ -28,6 +28,7 @@ rmap-engine = { path = "crates/rmap-engine" }
 rmap-log = { path = "crates/rmap-log" }
 rmap-packet = { path = "crates/rmap-packet" }
 rmap-report = { path = "crates/rmap-report" }
+rmap-vuln = { path = "crates/rmap-vuln" }
 tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync"] }
 ratatui = "0.30"
 # Raw-socket syscalls only (Linux raw backend in rmap-engine).

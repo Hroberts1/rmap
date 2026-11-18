@@ -13,9 +13,10 @@ A from-scratch network scanner in Rust with an interactive TUI. Read README.md f
 
 | Crate | Owns |
 |---|---|
-| `rmap-core` | Shared types: `Target`, `PortList`, `Timing`, `ScanType`, `Protocol`, `PortState`, `PortResult`, `Service`, `ScanEvent`. Optional `serde` feature. |
+| `rmap-core` | Shared types: `Target`, `PortList`, `Timing`, `ScanType`, `Protocol`, `PortState`, `PortResult`, `Service`, `Vulnerability`, `VulnSeverity`, `ScanEvent`. Optional `serde` feature. |
 | `rmap-engine` | Async scan engine. `Scan::start(handle, ScanConfig)` streams `ScanEvent`s. |
 | `rmap-detect` | Service detection: probe database (`probes.txt`), pattern matcher, TLS/DER parsing, CPE table. `detect(ip, port, protocol, timing)`. |
+| `rmap-vuln` | Vulnerability matching: CPE version-range matcher, CVE database (`cves.txt`). `Database::builtin().find(cpe)`. Depends only on `rmap-core`. |
 | `rmap-log` | Local logs and crash reports. Use `rmap_log::{error,warn,info,debug,trace}!`. |
 | `rmap-packet` | Ethernet/ARP/IPv4/TCP/UDP/ICMPv4 building and parsing, RFC 1071 checksums. No dependencies; parsers never panic. |
 | `rmap-report` | `ScanReport` model, `ReportBuilder` (events → report), JSON and Nmap XML export, saved scans (`ScanStore`), and `diff`. |
@@ -31,7 +32,9 @@ These in `rmap-core` exist so parallel milestones agree on shapes. Extend them; 
 - `PortResult { port, protocol, state, rtt, service: Option<Service> }`, built with `PortResult::new`
 - `Service { name, product, version, info, os_hint, cpes, method, confidence }`
 - `ScanEvent::Service { ip, protocol, port, service }`: detection results sent after the `Port` event
-- `ScanConfig { .., scan_type, service_detection }` in `rmap-engine`. SYN/UDP are implemented (raw backend in `rmap-engine/src/raw`, chosen in `backend.rs`, with unprivileged fallbacks). Service detection is implemented (`rmap-detect`, wired in via `rmap-engine/src/service.rs`). No placeholder warnings remain for either in `rmap_engine::run`.
+- `Vulnerability { id, summary, severity, score, published }`
+- `ScanEvent::Vulnerabilities { ip, protocol, port, findings }`: sent after the `Service` event for that port, never sent when `findings` would be empty
+- `ScanConfig { .., scan_type, service_detection, vuln_matching }` in `rmap-engine`. SYN/UDP are implemented (raw backend in `rmap-engine/src/raw`, chosen in `backend.rs`, with unprivileged fallbacks). Service detection is implemented (`rmap-detect`, wired in via `rmap-engine/src/service.rs`). Vulnerability matching is implemented (`rmap-vuln`, wired in via `rmap-engine/src/vuln.rs`; has no effect without `service_detection`, since it needs that layer's CPEs). No placeholder warnings remain for any of the three in `rmap_engine::run`.
 
 ## Conventions
 
