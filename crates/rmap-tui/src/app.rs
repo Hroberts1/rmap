@@ -342,6 +342,8 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// The key help overlay on the results screen.
     pub help: bool,
+    /// Text for the event loop to send to the clipboard (OSC 52).
+    pub clipboard: Option<String>,
     quit: bool,
 }
 
@@ -358,6 +360,7 @@ impl App {
             diff: None,
             confirm: None,
             help: false,
+            clipboard: None,
             quit: false,
         }
     }
@@ -593,6 +596,8 @@ impl App {
             KeyCode::Char('d') => view.show_down = !view.show_down,
             KeyCode::Char('e') => self.open_export(),
             KeyCode::Char('c') => self.open_compare(),
+            KeyCode::Char('y') => self.clipboard = crate::clipboard::copy_selection(view, false),
+            KeyCode::Char('Y') => self.clipboard = crate::clipboard::copy_selection(view, true),
             KeyCode::Down | KeyCode::Char('j') => view.move_focused(1),
             KeyCode::Up | KeyCode::Char('k') => view.move_focused(-1),
             KeyCode::PageDown => view.move_focused(10),
@@ -1354,6 +1359,87 @@ mod tests {
         assert!(
             !app.scan.as_ref().unwrap().show_down,
             "the key only closed help"
+        );
+    }
+
+    #[test]
+    fn y_copies_the_selection() {
+        let (_rt, mut app) = app();
+        let ip = nas_host(&mut app);
+        let last_log = |app: &App| app.scan.as_ref().unwrap().log.last().cloned().unwrap();
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("192.168.1.20"));
+        assert_eq!(last_log(&app), "copied 192.168.1.20");
+        // Host pane: every CVE on the host, deduplicated.
+        let view = app.scan.as_mut().unwrap();
+        let dup = view.hosts[&ip].open[0].vulnerabilities[0].clone();
+        view.hosts.get_mut(&ip).unwrap().open[2]
+            .vulnerabilities
+            .push(dup);
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(
+            app.clipboard.take().as_deref(),
+            Some("CVE-2024-6387,CVE-2023-48795")
+        );
+        assert_eq!(last_log(&app), "copied 2 CVE IDs from 192.168.1.20");
+
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("192.168.1.20:22"));
+        assert_eq!(last_log(&app), "copied 192.168.1.20:22");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.clipboard.take(), None);
+        assert_eq!(last_log(&app), "nothing to copy: no CVEs on this port");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("CVE-2024-6387"));
+        for (w, h) in [(80, 24), (120, 32)] {
+            assert!(render(&mut app, w, h).contains("copied 1 CVE ID from"));
+        }
+        press(&mut app, KeyCode::Char('?'));
+        assert!(render(&mut app, 80, 24).contains("copy CVE IDs"));
+        press(&mut app, KeyCode::Esc);
+
+        // IPv6 gets brackets; a host with no open ports has nothing to copy.
+        let view = app.scan.as_mut().unwrap();
+        let v6: IpAddr = "fe80::1".parse().unwrap();
+        view.apply(ScanEvent::Host {
+            ip: v6,
+            hostname: None,
+            state: HostState::Up,
+            rtt: None,
+        });
+        view.selected = Some(v6);
+        view.port_selected = 0;
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take(), None);
+        assert_eq!(last_log(&app), "nothing to copy: no open port selected");
+        app.scan.as_mut().unwrap().apply(ScanEvent::Port {
+            ip: v6,
+            result: PortResult::new(22, Protocol::Tcp, rmap_core::PortState::Open, None),
+        });
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.clipboard.take().as_deref(), Some("[fe80::1]:22"));
+    }
+
+    #[test]
+    fn oversized_copies_are_refused() {
+        let (_rt, mut app) = app();
+        let ip = nas_host(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        let mut cve = view.hosts[&ip].open[0].vulnerabilities[0].clone();
+        let ports = &mut view.hosts.get_mut(&ip).unwrap().open;
+        for i in 0..1000 {
+            cve.id = format!("CVE-2099-{i:05}");
+            ports[1].vulnerabilities.push(cve.clone());
+        }
+        press(&mut app, KeyCode::Char('Y'));
+        assert_eq!(app.clipboard, None);
+        let log = app.scan.as_ref().unwrap().log.last().unwrap();
+        assert!(
+            log.starts_with("nothing copied:") && log.contains("limit"),
+            "{log}"
         );
     }
 
