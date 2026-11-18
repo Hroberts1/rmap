@@ -111,6 +111,8 @@ pub enum Confirm {
     QuitRunning,
     /// Quit from the setup form.
     Quit,
+    /// Delete the profile highlighted in the profile picker.
+    DeleteProfile,
 }
 
 impl Confirm {
@@ -119,6 +121,7 @@ impl Confirm {
             Confirm::StopAndLeave => "Stop the running scan and start a new one?",
             Confirm::QuitRunning => "A scan is still running. Stop it and quit?",
             Confirm::Quit => "Quit rmap?",
+            Confirm::DeleteProfile => "Delete the selected profile?",
         }
     }
 }
@@ -342,22 +345,27 @@ pub struct App {
     pub confirm: Option<Confirm>,
     /// The key help overlay on the results screen.
     pub help: bool,
+    /// Scan profiles, recent targets, and their pickers on the setup form.
+    pub profiles: crate::profiles::Profiles,
     quit: bool,
 }
 
 impl App {
     pub fn new(rt: Handle) -> Self {
+        let store = crate::report::default_store();
+        let profiles = crate::profiles::Profiles::load(store.as_ref().map(ScanStore::dir));
         App {
             rt,
             screen: Screen::Setup,
             form: Form::default(),
             scan: None,
             pending: None,
-            store: crate::report::default_store(),
+            store,
             dialog: None,
             diff: None,
             confirm: None,
             help: false,
+            profiles,
             quit: false,
         }
     }
@@ -418,6 +426,10 @@ impl App {
             self.help = false;
             return;
         }
+        if self.profiles.picker.is_some() {
+            self.on_picker_key(key);
+            return;
+        }
         if self.dialog.is_some() {
             self.on_dialog_key(key);
             return;
@@ -434,6 +446,10 @@ impl App {
     pub fn on_paste(&mut self, pasted: &str) {
         rmap_log::debug!("paste of {} bytes", pasted.len());
         if self.confirm.is_some() || self.pending.is_some() || self.help {
+            return;
+        }
+        if self.profiles.picker.is_some() {
+            self.profiles.paste(pasted);
             return;
         }
         if let Some(Dialog::Export(d)) = self.dialog.as_mut() {
@@ -459,6 +475,7 @@ impl App {
                 rmap_log::info!("user confirmed: {confirm:?}");
                 match confirm {
                     Confirm::Quit | Confirm::QuitRunning => self.quit = true,
+                    Confirm::DeleteProfile => self.delete_selected_profile(),
                     Confirm::StopAndLeave => {
                         if let Some(view) = self.scan.as_mut()
                             && view.is_running()
@@ -492,6 +509,9 @@ impl App {
     }
 
     fn on_setup_key(&mut self, key: KeyEvent) {
+        if self.on_profiles_shortcut(&key) {
+            return;
+        }
         let form = &mut self.form;
         match key.code {
             KeyCode::Esc => self.confirm = Some(Confirm::Quit),
@@ -649,6 +669,7 @@ impl App {
     fn launch(&mut self, config: ScanConfig) {
         // Save the previous scan before it's replaced.
         self.autosave_if_done();
+        self.profiles.remember_targets(&self.form.targets);
         let report = ReportBuilder::new(
             crate::report::config_summary(&self.form.targets, &config),
             unix_millis_now(),

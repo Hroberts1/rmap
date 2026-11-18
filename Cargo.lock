@@ -1196,6 +1196,8 @@ dependencies = [
  "rmap-engine",
  "rmap-log",
  "rmap-report",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
