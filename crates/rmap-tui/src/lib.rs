@@ -10,6 +10,7 @@ mod limits;
 mod mac;
 mod report;
 mod report_ui;
+mod tabs;
 mod ui;
 
 use std::io::{self, Stdout};
