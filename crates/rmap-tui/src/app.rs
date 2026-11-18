@@ -16,7 +16,7 @@ use crate::input::{TextInput, paste_as_list};
 use crate::report::{Dialog, DiffView};
 
 /// Most engine events handled per frame, so a burst can't stall input.
-const EVENTS_PER_FRAME: usize = 5_000;
+pub(crate) const EVENTS_PER_FRAME: usize = 5_000;
 const MAX_LOG_LINES: usize = 200;
 /// Marks engine warnings in the log panel, which draws them highlighted.
 pub const WARNING_PREFIX: &str = "warning: ";
@@ -147,6 +147,8 @@ pub struct ScanView {
     /// First table row drawn in the port pane; kept by the renderer so the
     /// view only scrolls when the selection would leave it.
     pub port_offset: usize,
+    /// Re-scan of one host (`r`), run after the main scan ends.
+    pub rescan: Option<crate::rescan::Rescan>,
 }
 
 impl ScanView {
@@ -327,7 +329,7 @@ pub enum Screen {
 }
 
 pub struct App {
-    rt: Handle,
+    pub(crate) rt: Handle,
     pub screen: Screen,
     pub form: Form,
     pub scan: Option<ScanView>,
@@ -395,6 +397,7 @@ impl App {
                 }
             }
         }
+        view.drain_rescan();
         self.autosave_if_done();
     }
 
@@ -480,7 +483,12 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some((config, _)) = self.pending.take() {
                     rmap_log::info!("user confirmed scanning public addresses");
-                    self.launch(config);
+                    // Only a rescan asks from the results screen.
+                    if matches!(self.screen, Screen::Results) {
+                        self.start_rescan(config);
+                    } else {
+                        self.launch(config);
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -590,6 +598,8 @@ impl App {
                 view.stopped = true;
                 view.log("scan stopped".into());
             }
+            KeyCode::Char('s') if view.rescan.is_some() => view.stop_rescan(),
+            KeyCode::Char('r') => self.request_rescan(),
             KeyCode::Char('d') => view.show_down = !view.show_down,
             KeyCode::Char('e') => self.open_export(),
             KeyCode::Char('c') => self.open_compare(),
@@ -686,6 +696,7 @@ impl App {
             focus: Pane::Hosts,
             port_selected: 0,
             port_offset: 0,
+            rescan: None,
         });
         self.screen = Screen::Results;
     }

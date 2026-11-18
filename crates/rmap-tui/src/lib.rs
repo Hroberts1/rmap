@@ -8,6 +8,7 @@ mod app;
 mod input;
 mod report;
 mod report_ui;
+mod rescan;
 mod ui;
 
 use std::io::{self, Stdout};

@@ -286,15 +286,14 @@ fn draw_results(frame: &mut Frame, view: &mut ScanView) {
 /// the rest are dropped from the end as the terminal narrows.
 fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
     let mut wanted = vec![("Tab", "pane"), ("↑↓", "select")];
-    if view.is_running() {
+    if view.is_running() || view.rescan.is_some() {
         wanted.push(("s", "stop"));
     }
-    wanted.extend([
-        ("e", "export"),
-        ("n", "new scan"),
-        ("c", "compare"),
-        ("d", "down hosts"),
-    ]);
+    wanted.extend([("e", "export"), ("n", "new scan"), ("c", "compare")]);
+    if !view.is_running() {
+        wanted.push(("r", "rescan"));
+    }
+    wanted.push(("d", "down hosts"));
     let always = [("?", "help"), ("q", "quit")];
     // key_help draws each pair as " key " + " what  ".
     let cost = |(k, w): &(&str, &str)| k.chars().count() + w.chars().count() + 5;
@@ -312,7 +311,9 @@ fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
-    let (status, color) = if view.failed {
+    let (status, color) = if view.rescan.is_some() {
+        ("rescanning", ACCENT)
+    } else if view.failed {
         ("failed", Color::Red)
     } else if view.stopped {
         ("stopped", Color::Yellow)
@@ -357,7 +358,10 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
     spans.push(Span::raw(format!(" · {}", fmt_elapsed(view.elapsed()))));
     frame.render_widget(Paragraph::new(Line::from(spans)), stats);
 
-    let progress = &view.scan.progress;
+    let progress = view
+        .rescan
+        .as_ref()
+        .map_or(&view.scan.progress, |r| &r.scan.progress);
     let done = progress
         .completed
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -424,6 +428,9 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
     let rows = visible.iter().map(|ip| {
         let h = &view.hosts[ip];
         let (mark, style) = match h.state {
+            _ if view.rescan.as_ref().is_some_and(|r| r.ip == *ip) => {
+                ("↻", Style::new().fg(ACCENT))
+            }
             HostState::Up | HostState::Assumed if !h.open.is_empty() => {
                 ("●", Style::new().fg(Color::Green))
             }
@@ -798,7 +805,8 @@ fn draw_help(frame: &mut Frame) {
         ("Home End g G", "first / last"),
         ("Tab ← → h l", "switch between hosts and ports"),
         ("d", "show or hide down hosts"),
-        ("s", "stop the scan"),
+        ("s", "stop the scan or rescan"),
+        ("r", "rescan host: all ports, CVEs"),
         ("e", "export JSON / XML"),
         ("c", "compare with a saved scan"),
         ("n Esc", "new scan"),
