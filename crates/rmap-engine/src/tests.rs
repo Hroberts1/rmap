@@ -32,6 +32,8 @@ fn config(targets: &str, ports: &str, timing: Timing, discovery: bool) -> ScanCo
         scan_type: ScanType::Connect,
         service_detection: false,
         vuln_matching: false,
+        exclude: Vec::new(),
+        max_rate: None,
     }
 }
 
@@ -785,5 +787,129 @@ async fn stop_cancels_service_detection() {
             .iter()
             .any(|e| matches!(e, ScanEvent::Service { .. } | ScanEvent::Finished { .. })),
         "{rest:?}"
+    );
+}
+
+// ------------------------------------------------- exclusions and rate cap
+
+fn excluding(targets: &str, exclude: &str, discovery: bool) -> ScanConfig {
+    let timing = Timing {
+        connect_timeout: Duration::from_millis(200),
+        retries: 0,
+        ..Timing::template(4)
+    };
+    ScanConfig {
+        exclude: parse_targets(exclude).unwrap(),
+        ..config(targets, "80", timing, discovery)
+    }
+}
+
+fn started_hosts(out: &Outcome) -> u64 {
+    match out.events.first() {
+        Some(ScanEvent::Started { hosts, .. }) => *hosts,
+        other => panic!("first event was {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn excluded_addresses_are_never_probed() {
+    // Single address, a range, and an overlapping block, with discovery on
+    // so pings are covered too.
+    let out = run_scan(excluding(
+        "192.0.2.0/29",
+        "192.0.2.2, 192.0.2.4-192.0.2.5, 192.0.2.5/32",
+        true,
+    ))
+    .await;
+    assert!(out.finished());
+    assert_eq!(started_hosts(&out), 5);
+    let mut seen: Vec<IpAddr> = out.hosts().into_iter().map(|h| h.0).collect();
+    seen.sort();
+    let want: Vec<IpAddr> = [
+        "192.0.2.0",
+        "192.0.2.1",
+        "192.0.2.3",
+        "192.0.2.6",
+        "192.0.2.7",
+    ]
+    .iter()
+    .map(|s| s.parse().unwrap())
+    .collect();
+    assert_eq!(seen, want);
+    assert_eq!(out.scan.progress.ratio(), 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn excluding_everything_finishes_with_a_clear_warning() {
+    let out = run_scan(excluding("192.0.2.0/30, 192.0.2.9", "192.0.2.0/24", false)).await;
+    assert!(out.finished());
+    assert_eq!(started_hosts(&out), 0);
+    assert!(out.hosts().is_empty());
+    assert!(
+        out.warnings().iter().any(|w| w.contains("exclude list")),
+        "{:?}",
+        out.warnings()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unresolvable_exclusion_stops_before_probing() {
+    let out = run_scan(excluding("192.0.2.1", "no-such-host.invalid", false)).await;
+    assert!(out.finished());
+    assert!(out.hosts().is_empty());
+    assert!(
+        out.warnings()
+            .iter()
+            .any(|w| w.contains("no-such-host.invalid") && w.contains("nothing was scanned"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hostname_target_resolving_to_an_excluded_address_is_skipped() {
+    let out = run_scan(excluding("localhost", "127.0.0.0/8, ::1", false)).await;
+    assert!(out.finished());
+    assert!(out.hosts().is_empty());
+    assert!(
+        out.warnings()
+            .iter()
+            .any(|w| w.contains("skipped localhost"))
+    );
+    assert_eq!(out.scan.progress.ratio(), 1.0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_rate_caps_probe_starts() {
+    // Open loopback ports answer at once, so without the cap these 20
+    // probes finish in milliseconds. At 40/s the 20th can't start before
+    // 19/40 s = 475 ms; only a lower bound is checked, so a slow machine
+    // can't make this flaky.
+    let mut ports = Vec::new();
+    for _ in 0..20 {
+        ports.push(listener().await.to_string());
+    }
+    let c = ScanConfig {
+        max_rate: Some(40),
+        ..config("127.0.0.1", &ports.join(","), patient(), false)
+    };
+    let started = Instant::now();
+    let out = run_scan(c).await;
+    let elapsed = started.elapsed();
+    assert_eq!(out.open_ports().len(), 20);
+    assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+}
+
+#[test]
+fn describe_includes_scope_and_rate() {
+    let c = ScanConfig {
+        max_rate: Some(25),
+        ..excluding("192.0.2.0/24", "192.0.2.7, plc.lan", false)
+    };
+    let d = c.describe();
+    assert!(d.contains("exclude=[192.0.2.7,plc.lan]"), "{d}");
+    assert!(d.contains("max_rate=25/s"), "{d}");
+    assert!(
+        config("192.0.2.1", "80", patient(), false)
+            .describe()
+            .contains("max_rate=unlimited")
     );
 }

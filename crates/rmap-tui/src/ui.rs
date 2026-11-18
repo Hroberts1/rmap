@@ -71,7 +71,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     let area = centered(
         frame.area(),
         76.min(frame.area().width),
-        22.min(frame.area().height),
+        24.min(frame.area().height),
     );
     let block = Block::bordered()
         .title(Line::from(" rmap · new scan ").bold().fg(ACCENT))
@@ -82,11 +82,13 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     let [
         targets,
         targets_hint,
+        exclude,
         ports,
         ports_hint,
         scan_type,
         timing,
         timing_hint,
+        max_rate,
         discovery,
         services,
         vulns,
@@ -95,10 +97,12 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         log_line,
     ] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(2),
+        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(1),
@@ -152,6 +156,14 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         hint("CIDR, ranges (10.0.0.1-50), hostnames; comma separated"),
         targets_hint,
     );
+    text_field(
+        frame,
+        exclude,
+        Field::Exclude,
+        "Exclude",
+        &form.exclude,
+        "never probe these, e.g. fragile PLCs (same syntax)",
+    );
     text_field(frame, ports, Field::Ports, "Ports", &form.ports, "common");
     frame.render_widget(hint("22,80,443 · 1-1024 · common · all"), ports_hint);
 
@@ -186,6 +198,14 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         if t.retries == 1 { "y" } else { "ies" }
     );
     frame.render_widget(Paragraph::new(Line::from(timing_desc).dim()), timing_hint);
+    text_field(
+        frame,
+        max_rate,
+        Field::MaxRate,
+        "Max rate",
+        &form.max_rate,
+        "unlimited (probes per second across all hosts)",
+    );
 
     let check = if form.discovery {
         "[x] ping hosts first, skip ones that don't answer"

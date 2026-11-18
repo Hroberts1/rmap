@@ -54,6 +54,13 @@ pub struct ConfigSummary {
     pub timing_name: String,
     pub discovery: bool,
     pub service_detection: bool,
+    /// Addresses excluded from the scan, exactly as typed; empty if none.
+    /// Kept so the report documents the scan's authorised scope.
+    #[serde(default)]
+    pub exclude: String,
+    /// Cap on probes started per second; `None` means unlimited.
+    #[serde(default)]
+    pub max_rate: Option<u32>,
 }
 
 /// One host's results.

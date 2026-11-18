@@ -24,20 +24,24 @@ pub const WARNING_PREFIX: &str = "warning: ";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Targets,
+    Exclude,
     Ports,
     ScanType,
     Timing,
+    MaxRate,
     Discovery,
     Services,
     Vulns,
 }
 
 impl Field {
-    const ALL: [Field; 7] = [
+    const ALL: [Field; 9] = [
         Field::Targets,
+        Field::Exclude,
         Field::Ports,
         Field::ScanType,
         Field::Timing,
+        Field::MaxRate,
         Field::Discovery,
         Field::Services,
         Field::Vulns,
@@ -56,7 +60,11 @@ impl Field {
 
 pub struct Form {
     pub targets: TextInput,
+    /// Addresses never to probe, in target syntax.
+    pub exclude: TextInput,
     pub ports: TextInput,
+    /// Probes per second across the whole scan; empty means unlimited.
+    pub max_rate: TextInput,
     pub scan_type: ScanType,
     pub timing: u8,
     pub discovery: bool,
@@ -73,7 +81,9 @@ impl Default for Form {
     fn default() -> Self {
         Form {
             targets: TextInput::default(),
+            exclude: TextInput::default(),
             ports: "common".into(),
+            max_rate: TextInput::default(),
             scan_type: ScanType::Connect,
             timing: 3,
             discovery: true,
@@ -447,7 +457,11 @@ impl App {
         let form = &mut self.form;
         match form.focus {
             Field::Targets => form.targets.insert_str(&paste_as_list(pasted)),
+            Field::Exclude => form.exclude.insert_str(&paste_as_list(pasted)),
             Field::Ports => form.ports.insert_str(&paste_as_list(pasted)),
+            Field::MaxRate => form
+                .max_rate
+                .insert_str(pasted.lines().next().unwrap_or("").trim()),
             _ => {}
         }
     }
@@ -504,6 +518,12 @@ impl App {
                 }
                 Field::Ports => {
                     form.ports.handle_key(&key);
+                }
+                Field::Exclude => {
+                    form.exclude.handle_key(&key);
+                }
+                Field::MaxRate => {
+                    form.max_rate.handle_key(&key);
                 }
                 Field::Timing => match code {
                     KeyCode::Left | KeyCode::Char('-') => {
@@ -623,6 +643,30 @@ impl App {
                 return;
             }
         };
+        let exclude = match crate::limits::parse_exclude(&form.exclude) {
+            Ok(e) => e,
+            Err(e) => {
+                rmap_log::info!("rejected exclude {:?}: {e}", form.exclude);
+                form.error = Some(format!("Exclude: {e}"));
+                form.focus = Field::Exclude;
+                return;
+            }
+        };
+        if !exclude.is_empty() && rmap_engine::exclude::count_hosts(&targets, &exclude) == 0 {
+            rmap_log::info!("rejected scan: every target is excluded");
+            form.error = Some("Exclude: every target address is excluded; nothing to scan".into());
+            form.focus = Field::Exclude;
+            return;
+        }
+        let max_rate = match crate::limits::parse_max_rate(&form.max_rate) {
+            Ok(r) => r,
+            Err(e) => {
+                rmap_log::info!("rejected max rate {:?}: {e}", form.max_rate);
+                form.error = Some(format!("Max rate: {e}"));
+                form.focus = Field::MaxRate;
+                return;
+            }
+        };
         form.error = None;
         let public: Vec<String> = targets
             .iter()
@@ -637,6 +681,8 @@ impl App {
             scan_type: form.scan_type,
             service_detection: form.service_detection,
             vuln_matching: form.vuln_matching,
+            exclude,
+            max_rate,
         };
         if public.is_empty() {
             self.launch(config);
@@ -650,10 +696,10 @@ impl App {
         // Save the previous scan before it's replaced.
         self.autosave_if_done();
         let report = ReportBuilder::new(
-            crate::report::config_summary(&self.form.targets, &config),
+            crate::report::config_summary(&self.form.targets, &self.form.exclude, &config),
             unix_millis_now(),
         );
-        let summary = format!(
+        let mut summary = format!(
             "{} · {} · {} port{} · T{} {}{}",
             self.form.targets.trim(),
             config.scan_type.label(),
@@ -667,6 +713,13 @@ impl App {
                 " · no discovery"
             },
         );
+        // Rate first: the exclude list can be long and the title truncates.
+        if let Some(rate) = config.max_rate {
+            summary += &format!(" · max {rate}/s");
+        }
+        if !config.exclude.is_empty() {
+            summary += &format!(" · excluding {}", self.form.exclude.trim());
+        }
         let scan = Scan::start(&self.rt, config);
         self.scan = Some(ScanView {
             scan,
@@ -815,9 +868,11 @@ mod tests {
         let (_rt, mut app) = app();
         assert_eq!(app.form.focus, Field::Targets);
         for expected in [
+            Field::Exclude,
             Field::Ports,
             Field::ScanType,
             Field::Timing,
+            Field::MaxRate,
             Field::Discovery,
             Field::Services,
             Field::Vulns,
@@ -836,7 +891,7 @@ mod tests {
         type_text(&mut app, "10.0.0.1x");
         press(&mut app, KeyCode::Backspace);
         assert_eq!(app.form.targets, "10.0.0.1");
-        press(&mut app, KeyCode::Tab);
+        app.form.focus = Field::Ports;
         for _ in 0..10 {
             press(&mut app, KeyCode::Backspace); // extra presses on empty text are harmless
         }

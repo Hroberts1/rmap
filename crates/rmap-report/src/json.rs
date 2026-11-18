@@ -113,8 +113,13 @@ pub(crate) mod tests {
         let host = &mut v["hosts"][0];
         host.as_object_mut().unwrap().remove("ports");
         host.as_object_mut().unwrap().remove("hostname");
+        // Reports saved before exclusions and the rate cap existed.
+        let config = v["config"].as_object_mut().unwrap();
+        config.remove("exclude");
+        config.remove("max_rate");
         let r = from_str(&v.to_string()).unwrap();
         assert!(r.hosts[0].ports.is_empty() && r.hosts[0].hostname.is_none());
+        assert!(r.config.exclude.is_empty() && r.config.max_rate.is_none());
     }
 
     #[test]

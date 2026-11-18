@@ -19,6 +19,7 @@
 //! shows up in the summary even when it isn't logged line by line.
 
 mod backend;
+pub mod exclude;
 pub mod payloads;
 pub mod rate;
 pub mod raw;
@@ -59,26 +60,34 @@ pub struct ScanConfig {
     /// Has no effect without `service_detection`: there is nothing to
     /// look up yet.
     pub vuln_matching: bool,
+    /// Addresses never to probe, in target syntax. Hostnames are resolved at
+    /// scan start; if one doesn't resolve the scan stops before sending
+    /// anything. Empty means no exclusions.
+    pub exclude: Vec<Target>,
+    /// Most probes started per second across all hosts (discovery pings,
+    /// port probes and service detection each count as one). `None` means
+    /// no cap beyond the timing template.
+    pub max_rate: Option<u32>,
 }
 
 impl ScanConfig {
     /// One-line description for logs.
     pub fn describe(&self) -> String {
-        let shown: Vec<String> = self
-            .targets
-            .iter()
-            .take(10)
-            .map(ToString::to_string)
-            .collect();
-        let more = self.targets.len().saturating_sub(shown.len());
-        format!(
-            "targets=[{}{}] ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={} vuln_matching={}",
-            shown.join(","),
+        let list = |targets: &[Target]| {
+            let shown: Vec<String> = targets.iter().take(10).map(ToString::to_string).collect();
+            let more = targets.len().saturating_sub(shown.len());
             if more > 0 {
-                format!(",+{more} more")
+                format!("{},+{more} more", shown.join(","))
             } else {
-                String::new()
-            },
+                shown.join(",")
+            }
+        };
+        format!(
+            "targets=[{}] exclude=[{}] max_rate={} ports={} scan={:?} timing=T{}({}) concurrency={} host_parallelism={} timeout={:?} retries={} discovery={} service_detection={} vuln_matching={}",
+            list(&self.targets),
+            list(&self.exclude),
+            self.max_rate
+                .map_or("unlimited".to_string(), |r| format!("{r}/s")),
             self.ports.len(),
             self.scan_type,
             self.timing.level,
@@ -218,6 +227,8 @@ struct Shared {
     /// Set once the user has been told IPv6 targets can't use raw probes.
     ipv6_warned: AtomicBool,
     probe_slots: Semaphore,
+    /// The user's cap on probe starts per second, shared by every host.
+    max_rate: Option<rate::RateLimiter>,
     /// Present when service detection is on.
     services: Option<service::Detection>,
     /// Present when vulnerability matching is on and there is a service
@@ -231,6 +242,13 @@ struct Shared {
 impl Shared {
     fn warn_ui(&self, msg: String) {
         let _ = self.tx.send(ScanEvent::Warning(msg));
+    }
+
+    /// Wait for a turn under the user's rate cap before starting a probe.
+    async fn pace(&self) {
+        if let Some(limit) = &self.max_rate {
+            limit.wait().await;
+        }
     }
 }
 
@@ -273,8 +291,24 @@ async fn run(
         rmap_log::warn!("{msg}");
         let _ = tx.send(ScanEvent::Warning(msg));
     }
-    let hosts: u64 = config.targets.iter().map(Target::count).sum();
     let per_host = config.ports.len();
+    let exclude = match exclude::resolve(&config.exclude).await {
+        Ok(list) => list,
+        Err(msg) => {
+            let msg = format!("{msg}; nothing was scanned");
+            rmap_log::warn!("{msg}");
+            let _ = tx.send(ScanEvent::Started {
+                hosts: 0,
+                ports_per_host: per_host,
+            });
+            let _ = tx.send(ScanEvent::Warning(msg));
+            let _ = tx.send(ScanEvent::Finished {
+                elapsed: started.elapsed(),
+            });
+            return;
+        }
+    };
+    let hosts = exclude::count_hosts(&config.targets, &exclude);
     progress
         .total
         .store(hosts * per_host as u64, Ordering::Relaxed);
@@ -299,7 +333,13 @@ async fn run(
         tx,
         progress,
         stats,
+        max_rate: config.max_rate.map(rate::RateLimiter::per_second),
     });
+    if hosts == 0 && !config.targets.is_empty() {
+        let msg = "every target address is in the exclude list; nothing to scan".to_string();
+        rmap_log::warn!("{msg}");
+        shared.warn_ui(msg);
+    }
 
     let mut host_tasks: JoinSet<IpAddr> = JoinSet::new();
     let reap = |r: Result<IpAddr, JoinError>, shared: &Shared| {
@@ -327,6 +367,19 @@ async fn run(
             _ => Box::new(target.addrs().map(|ip| (ip, None))),
         };
         for (ip, hostname) in addrs {
+            if exclude::is_excluded(&exclude, ip) {
+                rmap_log::trace!("skipping excluded {ip}");
+                if let Some(name) = hostname {
+                    let msg = format!("skipped {name} ({ip}): it is in the exclude list");
+                    rmap_log::info!("{msg}");
+                    shared.warn_ui(msg);
+                    shared
+                        .progress
+                        .completed
+                        .fetch_add(per_host as u64, Ordering::Relaxed);
+                }
+                continue;
+            }
             let slot = host_slots
                 .clone()
                 .acquire_owned()
@@ -425,6 +478,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
     }
 
     let (state, rtt) = if shared.discovery {
+        shared.pace().await;
         match prober.ping(ip, &shared.timing, &shared.stats).await {
             Some(rtt) => (HostState::Up, Some(rtt)),
             None => (HostState::Down, None),
@@ -469,6 +523,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         let (sh, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
         let prober = prober.clone();
         probes.spawn(async move {
+            sh.pace().await;
             let result = prober.probe(ip, port, &sh.timing, &sh.stats).await;
             sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
@@ -486,6 +541,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                         // Free the probe slot first so detection (and any
                         // vuln lookup after it) can't hold up the port scan.
                         drop(slot);
+                        sh.pace().await;
                         if let Some(service) =
                             services.identify(ip, port, Protocol::Tcp, &sh.tx).await
                             && let Some(vulns) = sh.vulns.as_ref()

@@ -6,6 +6,7 @@
 
 mod app;
 mod input;
+mod limits;
 mod report;
 mod report_ui;
 mod ui;

@@ -73,7 +73,7 @@ pub fn default_store() -> Option<ScanStore> {
 }
 
 /// The report's description of the scan the user asked for.
-pub fn config_summary(targets: &str, config: &ScanConfig) -> ConfigSummary {
+pub fn config_summary(targets: &str, exclude: &str, config: &ScanConfig) -> ConfigSummary {
     ConfigSummary {
         targets: targets.trim().to_string(),
         ports: port_ranges(config.ports.as_slice()),
@@ -83,6 +83,8 @@ pub fn config_summary(targets: &str, config: &ScanConfig) -> ConfigSummary {
         timing_name: config.timing.name.to_string(),
         discovery: config.discovery,
         service_detection: config.service_detection,
+        exclude: exclude.trim().to_string(),
+        max_rate: config.max_rate,
     }
 }
 

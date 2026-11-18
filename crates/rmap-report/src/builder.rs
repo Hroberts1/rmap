@@ -192,6 +192,8 @@ pub(crate) mod tests {
             timing_name: "normal".into(),
             discovery: true,
             service_detection: true,
+            exclude: String::new(),
+            max_rate: None,
         }
     }
 
