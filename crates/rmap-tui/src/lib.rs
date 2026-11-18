@@ -12,6 +12,7 @@ mod limits;
 mod log_view;
 mod mac;
 mod profiles;
+mod rate;
 mod report;
 mod report_ui;
 mod tabs;

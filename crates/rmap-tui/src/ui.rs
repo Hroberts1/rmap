@@ -6,11 +6,12 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Block, Cell, Clear, LineGauge, Paragraph, Row, Table, TableState, Wrap};
 use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, Vulnerability, service_name};
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
 use crate::input::TextInput;
+use crate::rate;
 
 pub(crate) const ACCENT: Color = Color::Cyan;
 
@@ -406,8 +407,6 @@ pub(crate) fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
     if cves > 0 {
         spans.push(Span::raw(format!(" · {cves} potential CVEs")).fg(Color::Red));
     }
-    spans.push(Span::raw(format!(" · {}", fmt_elapsed(view.elapsed()))));
-    frame.render_widget(Paragraph::new(Line::from(spans)), stats);
 
     let progress = view
         .rescan
@@ -417,13 +416,49 @@ pub(crate) fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
         .completed
         .load(std::sync::atomic::Ordering::Relaxed);
     let total = progress.total.load(std::sync::atomic::Ordering::Relaxed);
+    // Live rate while running, the whole-scan average once finished, and
+    // none after a stop or failure (their elapsed time keeps ticking).
+    let rate = if view.is_running() {
+        view.rate.rate()
+    } else {
+        view.finished
+            .map(|d| done as f64 / d.as_secs_f64())
+            .filter(|r| r.is_finite())
+    };
+    let mut timing = format!(" · {}", fmt_elapsed(view.elapsed()));
+    if view.is_running()
+        && let Some(eta) = rate::eta(done, total, rate)
+    {
+        timing.push_str(&format!(" · ETA {}", rate::clock(eta)));
+    }
+    // Timing gets its own area so a long stats line truncates before it.
+    let spans = Line::from(spans);
+    let [stats, clock] = Layout::horizontal([
+        Constraint::Max(spans.width() as u16),
+        Constraint::Length(timing.chars().count() as u16),
+    ])
+    .flex(Flex::Start)
+    .areas(stats);
+    frame.render_widget(Paragraph::new(spans), stats);
+    frame.render_widget(Paragraph::new(timing), clock);
+
+    let text = rate::progress_text(done, total, rate, &view.rate, gauge.width as usize);
+    let [bar, label] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(text.chars().count() as u16 + 1),
+    ])
+    .areas(gauge);
     frame.render_widget(
-        Gauge::default()
-            .gauge_style(Style::new().fg(color))
+        LineGauge::default()
+            .filled_symbol("█")
+            .unfilled_symbol("░")
+            .filled_style(Style::new().fg(color))
+            .unfilled_style(Style::new().fg(Color::DarkGray))
             .ratio(progress.ratio())
-            .label(format!("{done} / {total} probes")),
-        gauge,
+            .label(""),
+        bar,
     );
+    frame.render_widget(Paragraph::new(format!(" {text}")), label);
 }
 
 /// Highlight for the selected row. REVERSED works on light and dark

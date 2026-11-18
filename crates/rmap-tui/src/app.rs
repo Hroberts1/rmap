@@ -176,6 +176,8 @@ pub struct ScanView {
     pub sort: SortOrder,
     /// Re-scan of one host (`r`), run after the main scan ends.
     pub rescan: Option<crate::rescan::Rescan>,
+    /// Progress samples for the header's rate, ETA and sparkline.
+    pub rate: crate::rate::RateMeter,
 }
 
 impl ScanView {
@@ -461,6 +463,14 @@ impl App {
             view.keep_selection();
         }
         view.drain_rescan();
+        if view.is_running() {
+            let done = view
+                .scan
+                .progress
+                .completed
+                .load(std::sync::atomic::Ordering::Relaxed);
+            view.rate.sample(view.started.elapsed(), done);
+        }
         self.autosave_if_done();
     }
 
@@ -867,6 +877,7 @@ impl App {
             filtering: false,
             sort: SortOrder::default(),
             rescan: None,
+            rate: Default::default(),
         });
         self.screen = Screen::Results;
     }
@@ -1475,6 +1486,59 @@ mod tests {
                 println!("{screen}");
             }
         }
+    }
+
+    #[test]
+    fn header_shows_rate_eta_and_sparkline() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (_rt, mut app) = app();
+        nas_host(&mut app);
+        let view = app.scan.as_mut().unwrap();
+        // Pretend it's still running: 380 probes/s for six seconds.
+        view.stopped = false;
+        for s in 0..=6 {
+            view.rate
+                .sample(Duration::from_secs(s), 15_840 - (6 - s) * 380);
+        }
+        view.scan.progress.total.store(25_400, Relaxed);
+        view.scan.progress.completed.store(15_840, Relaxed);
+        for (w, h) in [(120, 32), (80, 24)] {
+            let screen = render(&mut app, w, h);
+            let header: String = screen.lines().take(4).collect::<Vec<_>>().join("\n");
+            for needle in ["ETA 0:25", "15,840 / 25,400 probes · 380/s ██████"] {
+                assert!(header.contains(needle), "{needle} at {w}x{h}:\n{header}");
+            }
+            if std::env::var_os("RMAP_SHOW_RENDER").is_some() {
+                println!("{screen}");
+            }
+        }
+        // Narrow: the sparkline goes, then the rate; nothing panics.
+        let header = render(&mut app, 59, 24);
+        assert!(
+            header.contains("380/s") && !header.contains("380/s █"),
+            "{header}"
+        );
+        let header = render(&mut app, 52, 24);
+        assert!(header.contains("25,400 probes") && !header.contains("380/s"));
+        assert!(!render(&mut app, 44, 24).contains("probes"));
+        for (w, h) in [(20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+        // Stopped: no ETA and no rate.
+        app.scan.as_mut().unwrap().stopped = true;
+        let screen = render(&mut app, 120, 32);
+        assert!(!screen.contains("ETA"), "{screen}");
+        assert!(screen.contains("25,400 probes│"), "{screen}");
+        // Finished: the whole-scan average and the final duration.
+        let view = app.scan.as_mut().unwrap();
+        view.stopped = false;
+        view.finished = Some(Duration::from_secs(40));
+        let screen = render(&mut app, 120, 32);
+        assert!(!screen.contains("ETA"), "{screen}");
+        assert!(
+            screen.contains("· 396/s") && screen.contains("· 40.0s"),
+            "{screen}"
+        );
     }
 
     #[test]
