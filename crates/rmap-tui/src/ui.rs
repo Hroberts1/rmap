@@ -40,6 +40,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(confirm) = app.confirm {
         draw_yes_no(frame, confirm);
     }
+    if crate::theme::no_color() {
+        crate::theme::strip_colors(frame.buffer_mut());
+    }
 }
 
 pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -253,6 +256,10 @@ const STACK_BELOW: u16 = 100;
 const LOG_ROWS: usize = 3;
 
 fn draw_results(frame: &mut Frame, view: &mut ScanView) {
+    if view.log_view.is_some() {
+        crate::log_view::draw(frame, view);
+        return;
+    }
     let log_height = match view.log.len().min(LOG_ROWS) {
         0 => 0,
         n => n as u16 + 2,
@@ -311,7 +318,7 @@ fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
     key_help(&shown)
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
+pub(crate) fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
     let (status, color) = if view.failed {
         ("failed", Color::Red)
     } else if view.stopped {
@@ -364,7 +371,7 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
     let total = progress.total.load(std::sync::atomic::Ordering::Relaxed);
     frame.render_widget(
         Gauge::default()
-            .gauge_style(Style::new().fg(color).bg(Color::DarkGray))
+            .gauge_style(Style::new().fg(color))
             .ratio(progress.ratio())
             .label(format!("{done} / {total} probes")),
         gauge,
@@ -769,26 +776,23 @@ fn host_info(h: &HostRow) -> Line<'static> {
     Line::from(spans)
 }
 
+/// One log line, with engine warnings highlighted.
+pub(crate) fn log_line(l: &str) -> Line<'static> {
+    if l.starts_with(crate::app::WARNING_PREFIX) {
+        Line::from(l.to_string()).fg(Color::Yellow)
+    } else {
+        Line::from(l.to_string()).dim()
+    }
+}
+
 fn draw_log(frame: &mut Frame, area: Rect, view: &ScanView) {
     let height = area.height.saturating_sub(2) as usize;
-    let lines: Vec<Line> = view
-        .log
-        .iter()
-        .rev()
-        .take(height)
-        .rev()
-        .map(|l| {
-            if l.starts_with(crate::app::WARNING_PREFIX) {
-                Line::from(l.clone()).fg(Color::Yellow)
-            } else {
-                Line::from(l.clone()).dim()
-            }
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(" log ")),
-        area,
-    );
+    let skip = view.log.len().saturating_sub(height);
+    let lines: Vec<Line> = view.log.iter().skip(skip).map(|l| log_line(l)).collect();
+    let block = Block::bordered()
+        .title(" log ")
+        .title(Line::from(" l full log ").dim().right_aligned());
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_help(frame: &mut Frame) {
@@ -796,11 +800,12 @@ fn draw_help(frame: &mut Frame) {
         ("↑↓ j k", "move in the focused pane"),
         ("PgUp PgDn", "move by 10"),
         ("Home End g G", "first / last"),
-        ("Tab ← → h l", "switch between hosts and ports"),
+        ("Tab ← → h", "switch between hosts and ports"),
         ("d", "show or hide down hosts"),
         ("s", "stop the scan"),
         ("e", "export JSON / XML"),
         ("c", "compare with a saved scan"),
+        ("l", "full log (scrollable)"),
         ("n Esc", "new scan"),
         ("q", "quit"),
         ("Ctrl-C", "quit immediately"),

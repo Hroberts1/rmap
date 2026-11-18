@@ -1,6 +1,6 @@
 //! Application state and input handling.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -135,7 +135,10 @@ pub struct ScanView {
     pub stopped: bool,
     /// The engine went away without finishing, most likely a panic.
     pub failed: bool,
-    pub log: Vec<String>,
+    pub log: VecDeque<String>,
+    /// The full-height log view (`l`): lines scrolled back from the newest,
+    /// or `None` when closed. See `log_view.rs`.
+    pub log_view: Option<usize>,
     /// Everything the engine reported, for export and saving.
     pub report: ReportBuilder,
     /// Where the scan was auto-saved, once it ended.
@@ -214,9 +217,9 @@ impl ScanView {
     }
 
     pub(crate) fn log(&mut self, line: String) {
-        self.log.push(line);
+        self.log.push_back(line);
         if self.log.len() > MAX_LOG_LINES {
-            self.log.remove(0);
+            self.log.pop_front();
         }
     }
 
@@ -437,7 +440,8 @@ impl App {
             return;
         }
         if let Some(Dialog::Export(d)) = self.dialog.as_mut() {
-            d.path.push_str(pasted.lines().next().unwrap_or("").trim());
+            d.path
+                .insert_str(pasted.lines().next().unwrap_or("").trim());
             d.status = None;
             return;
         }
@@ -559,6 +563,9 @@ impl App {
             self.screen = Screen::Setup;
             return;
         };
+        if crate::log_view::on_key(view, &key) {
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => {
                 if view.is_running() {
@@ -583,7 +590,8 @@ impl App {
                     Pane::Ports => Pane::Hosts,
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => view.focus = Pane::Ports,
+            KeyCode::Right => view.focus = Pane::Ports,
+            KeyCode::Char('l') => view.log_view = Some(0),
             KeyCode::Left | KeyCode::Char('h') => view.focus = Pane::Hosts,
             KeyCode::Char('s') if view.is_running() => {
                 view.scan.stop();
@@ -679,7 +687,8 @@ impl App {
             finished: None,
             stopped: false,
             failed: false,
-            log: Vec::new(),
+            log: VecDeque::new(),
+            log_view: None,
             report,
             saved: None,
             save_attempted: false,
@@ -1125,7 +1134,7 @@ mod tests {
         }
         assert_eq!(view.log.len(), MAX_LOG_LINES);
         assert_eq!(
-            view.log.last().unwrap(),
+            view.log.back().unwrap(),
             &format!("{WARNING_PREFIX}w{}", MAX_LOG_LINES + 49)
         );
     }

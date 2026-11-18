@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use rmap_engine::ScanConfig;
 use rmap_report::{
     ConfigSummary, DiffLine, ExportFormat, SavedScan, ScanReport, ScanStore, diff, port_ranges,
@@ -15,11 +15,12 @@ use rmap_report::{
 };
 
 use crate::app::{App, Screen};
+use crate::input::TextInput;
 
 /// The export dialog on the results screen.
 pub struct ExportDialog {
     pub format: ExportFormat,
-    pub path: String,
+    pub path: TextInput,
     /// Outcome of the last attempt: `Ok(path)` or `Err(message)`.
     pub status: Option<Result<String, String>>,
 }
@@ -33,9 +34,9 @@ impl ExportDialog {
         // Swap the extension if the path still has the old one.
         let old = format!(".{}", self.format.extension());
         if self.path.to_ascii_lowercase().ends_with(&old) {
-            self.path.truncate(self.path.len() - old.len());
-            self.path.push('.');
-            self.path.push_str(next.extension());
+            // `old` is ASCII, so this byte offset is a char boundary.
+            let stem = &self.path[..self.path.len() - old.len()];
+            self.path = format!("{stem}.{}", next.extension()).into();
         }
         self.format = next;
     }
@@ -83,17 +84,6 @@ pub fn config_summary(targets: &str, config: &ScanConfig) -> ConfigSummary {
         timing_name: config.timing.name.to_string(),
         discovery: config.discovery,
         service_detection: config.service_detection,
-    }
-}
-
-fn edit_text(text: &mut String, key: &KeyEvent) {
-    match key.code {
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => text.clear(),
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => text.push(c),
-        KeyCode::Backspace => {
-            text.pop();
-        }
-        _ => {}
     }
 }
 
@@ -162,7 +152,7 @@ impl App {
         rmap_log::debug!("export dialog opened");
         self.dialog = Some(Dialog::Export(ExportDialog {
             format,
-            path: path.display().to_string(),
+            path: path.display().to_string().into(),
             status: None,
         }));
     }
@@ -215,14 +205,15 @@ impl App {
             Some(Dialog::Export(mut d)) => {
                 match key.code {
                     KeyCode::Esc => return,
-                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                    KeyCode::Tab | KeyCode::BackTab => {
                         d.toggle_format();
                         d.status = None;
                     }
                     KeyCode::Enter => self.run_export(&mut d),
                     _ => {
-                        edit_text(&mut d.path, &key);
-                        d.status = None;
+                        if d.path.handle_key(&key) {
+                            d.status = None;
+                        }
                     }
                 }
                 self.dialog = Some(Dialog::Export(d));

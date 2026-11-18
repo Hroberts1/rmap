@@ -6,8 +6,10 @@
 
 mod app;
 mod input;
+mod log_view;
 mod report;
 mod report_ui;
+mod theme;
 mod ui;
 
 use std::io::{self, Stdout};
