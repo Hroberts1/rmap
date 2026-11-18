@@ -791,7 +791,7 @@ fn draw_log(frame: &mut Frame, area: Rect, view: &ScanView) {
     let lines: Vec<Line> = view.log.iter().skip(skip).map(|l| log_line(l)).collect();
     let block = Block::bordered()
         .title(" log ")
-        .title(Line::from(" l full log ").dim().right_aligned());
+        .title(Line::from(" L full log ").dim().right_aligned());
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -800,12 +800,12 @@ fn draw_help(frame: &mut Frame) {
         ("↑↓ j k", "move in the focused pane"),
         ("PgUp PgDn", "move by 10"),
         ("Home End g G", "first / last"),
-        ("Tab ← → h", "switch between hosts and ports"),
+        ("Tab ← → h l", "switch between hosts and ports"),
         ("d", "show or hide down hosts"),
         ("s", "stop the scan"),
         ("e", "export JSON / XML"),
         ("c", "compare with a saved scan"),
-        ("l", "full log (scrollable)"),
+        ("L", "full log (scrollable)"),
         ("n Esc", "new scan"),
         ("q", "quit"),
         ("Ctrl-C", "quit immediately"),

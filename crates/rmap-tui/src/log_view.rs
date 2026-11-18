@@ -1,4 +1,4 @@
-//! The full-height log on the results screen, opened with `l`.
+//! The full-height log on the results screen, opened with `L`.
 //!
 //! `ScanView::log_view` holds how many lines the view is scrolled back from
 //! the newest one, so `Some(0)` follows new lines as they arrive.
@@ -22,7 +22,7 @@ pub(crate) fn on_key(view: &mut ScanView, key: &KeyEvent) -> bool {
     };
     let top = view.log.len();
     view.log_view = match key.code {
-        KeyCode::Esc | KeyCode::Char('l') => None,
+        KeyCode::Esc | KeyCode::Char('L') => None,
         KeyCode::Up | KeyCode::Char('k') => Some((back + 1).min(top)),
         KeyCode::Down | KeyCode::Char('j') => Some(back.saturating_sub(1)),
         KeyCode::PageUp => Some((back + PAGE).min(top)),
@@ -65,7 +65,7 @@ pub(crate) fn draw(frame: &mut Frame, view: &mut ScanView) {
             ("↑↓", "scroll"),
             ("PgUp PgDn", "page"),
             ("Home End", "oldest / newest"),
-            ("l Esc", "close"),
+            ("L Esc", "close"),
         ])),
         footer,
     );
@@ -120,7 +120,7 @@ mod tests {
         let screen = render(&mut app, 80, 24);
         assert!(!screen.contains("entry #030"), "small panel:\n{screen}");
 
-        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('L'));
         let screen = render(&mut app, 80, 24);
         // 24 rows less header (4), borders (2) and footer (1): 17 lines.
         assert!(screen.contains("log · 34-50 of 50"), "{screen}");
@@ -149,15 +149,15 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(log_view(&app), None);
         assert!(matches!(app.screen, Screen::Results), "Esc only closes it");
-        press(&mut app, KeyCode::Char('l'));
-        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('L'));
+        press(&mut app, KeyCode::Char('L'));
         assert_eq!(log_view(&app), None, "l toggles");
     }
 
     #[test]
     fn other_keys_still_reach_the_results_screen() {
         let (_rt, mut app) = results_with_log(0);
-        press(&mut app, KeyCode::Char('l'));
+        press(&mut app, KeyCode::Char('L'));
         assert!(render(&mut app, 80, 24).contains("log · empty"));
         press(&mut app, KeyCode::Char('?'));
         assert!(app.help && log_view(&app).is_some());

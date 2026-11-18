@@ -136,7 +136,7 @@ pub struct ScanView {
     /// The engine went away without finishing, most likely a panic.
     pub failed: bool,
     pub log: VecDeque<String>,
-    /// The full-height log view (`l`): lines scrolled back from the newest,
+    /// The full-height log view (`L`): lines scrolled back from the newest,
     /// or `None` when closed. See `log_view.rs`.
     pub log_view: Option<usize>,
     /// Everything the engine reported, for export and saving.
@@ -590,8 +590,8 @@ impl App {
                     Pane::Ports => Pane::Hosts,
                 }
             }
-            KeyCode::Right => view.focus = Pane::Ports,
-            KeyCode::Char('l') => view.log_view = Some(0),
+            KeyCode::Right | KeyCode::Char('l') => view.focus = Pane::Ports,
+            KeyCode::Char('L') => view.log_view = Some(0),
             KeyCode::Left | KeyCode::Char('h') => view.focus = Pane::Hosts,
             KeyCode::Char('s') if view.is_running() => {
                 view.scan.stop();

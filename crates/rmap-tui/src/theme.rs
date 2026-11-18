@@ -101,7 +101,7 @@ mod tests {
             let host_row = (0..h)
                 .find(|&y| {
                     let text: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
-                    text.contains("10.0.0.2 ")
+                    text.contains("● 10.0.0.2")
                 })
                 .unwrap();
             assert!(reversed(host_row), "the selected host stays highlighted");
