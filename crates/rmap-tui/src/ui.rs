@@ -16,7 +16,10 @@ pub(crate) const ACCENT: Color = Color::Cyan;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     match app.screen {
-        Screen::Setup => draw_setup(frame, app),
+        Screen::Setup => {
+            draw_setup(frame, app);
+            crate::profiles::draw(frame, &app.profiles);
+        }
         Screen::Results => {
             if let Some(view) = app.scan.as_mut() {
                 draw_results(frame, view);
@@ -95,7 +98,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         discovery,
         services,
         vulns,
-        _,
+        shortcuts,
         error,
         log_line,
     ] = Layout::vertical([
@@ -249,6 +252,14 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         Paragraph::new(Line::from(vec![label(Field::Vulns, "Vulns"), vulns_check])),
         vulns,
     );
+
+    let mut keys = key_help(&[
+        ("^P", "profiles"),
+        ("^R", "recent targets"),
+        ("^S", "save profile"),
+    ]);
+    keys.spans.insert(0, Span::raw(" ".repeat(12)));
+    frame.render_widget(Paragraph::new(keys).dim(), shortcuts);
 
     if let Some(err) = &form.error {
         frame.render_widget(

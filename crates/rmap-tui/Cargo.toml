@@ -7,10 +7,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-rmap-core = { workspace = true }
+rmap-core = { workspace = true, features = ["serde"] }
 rmap-log = { workspace = true }
 rmap-engine = { workspace = true }
 rmap-oui = { workspace = true }
 rmap-report = { workspace = true }
 ratatui = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

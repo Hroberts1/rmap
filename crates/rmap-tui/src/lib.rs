@@ -10,6 +10,7 @@ mod input;
 mod limits;
 mod log_view;
 mod mac;
+mod profiles;
 mod report;
 mod report_ui;
 mod tabs;
