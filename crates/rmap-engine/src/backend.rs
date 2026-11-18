@@ -10,7 +10,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmap_core::{PortResult, ScanType, Timing};
+use rmap_core::{MacAddr, PortResult, ScanType, Timing};
 
 use crate::{Stats, tcp, udp};
 
@@ -115,14 +115,18 @@ pub(crate) enum HostProber {
 }
 
 impl HostProber {
+    /// Round-trip time if the host is up, and its MAC address when the
+    /// probe that answered was ARP.
     pub(crate) async fn ping(
         &self,
         ip: IpAddr,
         timing: &Timing,
         stats: &Arc<Stats>,
-    ) -> Option<Duration> {
+    ) -> Option<(Duration, Option<MacAddr>)> {
         match self {
-            HostProber::Unprivileged(_) => tcp::ping(ip, timing, stats).await,
+            HostProber::Unprivileged(_) => {
+                tcp::ping(ip, timing, stats).await.map(|rtt| (rtt, None))
+            }
             #[cfg(target_os = "linux")]
             HostProber::Raw { raw, src, dst, .. } => raw.ping(*src, *dst, timing, stats).await,
         }

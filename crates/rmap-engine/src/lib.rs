@@ -477,14 +477,14 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         shared.warn_ui(msg);
     }
 
-    let (state, rtt) = if shared.discovery {
+    let (state, rtt, mac) = if shared.discovery {
         shared.pace().await;
         match prober.ping(ip, &shared.timing, &shared.stats).await {
-            Some(rtt) => (HostState::Up, Some(rtt)),
-            None => (HostState::Down, None),
+            Some((rtt, mac)) => (HostState::Up, Some(rtt), mac),
+            None => (HostState::Down, None, None),
         }
     } else {
-        (HostState::Assumed, None)
+        (HostState::Assumed, None, None)
     };
     let counter = if state == HostState::Down {
         &shared.stats.hosts_down
@@ -492,13 +492,16 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         &shared.stats.hosts_up
     };
     counter.fetch_add(1, Ordering::Relaxed);
-    rmap_log::debug!("host {ip} {state:?} rtt={rtt:?}");
+    rmap_log::debug!("host {ip} {state:?} rtt={rtt:?} mac={mac:?}");
     let _ = shared.tx.send(ScanEvent::Host {
         ip,
         hostname,
         state,
         rtt,
     });
+    if let Some(mac) = mac {
+        let _ = shared.tx.send(ScanEvent::Mac { ip, mac });
+    }
     if state == HostState::Down {
         shared
             .progress

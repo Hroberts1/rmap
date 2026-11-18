@@ -434,7 +434,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
     // No wider than the longest name, so OPEN stays next to it.
     let longest = visible
         .iter()
-        .filter_map(|ip| view.hosts[ip].hostname.as_deref())
+        .filter_map(|ip| crate::mac::host_name(&view.hosts[ip]))
         .map(|n| n.chars().count())
         .max()
         .unwrap_or(0)
@@ -458,7 +458,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView) {
         if h.open.iter().any(|p| !p.vulnerabilities.is_empty()) {
             open.push(Span::raw(" !").fg(Color::Red).bold());
         }
-        let name = h.hostname.as_deref().unwrap_or_default();
+        let name = crate::mac::host_name(h).unwrap_or_default();
         let mut cells = vec![
             Cell::from(mark).style(style),
             Cell::from(ip.to_string()),
@@ -544,13 +544,15 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let mut info_lines = vec![host_info(host)];
+    info_lines.extend(crate::mac::detail_line(host));
     let [info, ports, footer] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(info_lines.len() as u16),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .areas(inner);
-    frame.render_widget(Paragraph::new(host_info(host)), info);
+    frame.render_widget(Paragraph::new(info_lines), info);
 
     // Column plan. Detail and CVE lines span from SERVICE to the right
     // edge (Cell::column_span) and wrap, instead of being squeezed into

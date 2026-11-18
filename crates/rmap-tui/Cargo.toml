@@ -10,6 +10,7 @@ rust-version.workspace = true
 rmap-core = { workspace = true }
 rmap-log = { workspace = true }
 rmap-engine = { workspace = true }
+rmap-oui = { workspace = true }
 rmap-report = { workspace = true }
 ratatui = { workspace = true }
 tokio = { workspace = true }

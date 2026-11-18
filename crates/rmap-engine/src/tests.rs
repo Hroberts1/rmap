@@ -234,6 +234,12 @@ async fn discovery_finds_loopback_up() {
     let out = run_scan(config("127.0.0.1", &port.to_string(), patient(), true)).await;
     assert_eq!(out.hosts()[0].2, HostState::Up);
     assert_eq!(out.open_ports().len(), 1);
+    assert!(
+        !out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Mac { .. })),
+        "loopback has no ARP, so no MAC"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -612,8 +618,8 @@ async fn raw_veth_peer() {
     };
     let up = raw.arp_ping(src, peer, &quick).await;
     assert!(
-        matches!(up, Some(Some(_))),
-        "ARP answer from {peer}: {up:?}"
+        matches!(up, Some(Some((_, Some(_))))),
+        "ARP answer with a MAC from {peer}: {up:?}"
     );
     let down = raw.arp_ping(src, absent, &quick).await;
     assert_eq!(down, Some(None), "no ARP answer from {absent}");
@@ -628,6 +634,16 @@ async fn raw_veth_peer() {
     let out = run_scan(syn).await;
     assert!(out.warnings().is_empty(), "{:?}", out.warnings());
     assert_eq!(out.hosts()[0].2, HostState::Up);
+    let host_at = out
+        .events
+        .iter()
+        .position(|e| matches!(e, ScanEvent::Host { .. }))
+        .unwrap();
+    assert!(
+        matches!(out.events[host_at + 1], ScanEvent::Mac { ip, .. } if ip == IpAddr::V4(peer)),
+        "MAC event right after the host: {:?}",
+        out.events
+    );
     assert_eq!(out.open_ports(), [(IpAddr::V4(peer), open)]);
     assert_eq!(out.host_done()[0].1, 1, "port 1 answers RST");
 

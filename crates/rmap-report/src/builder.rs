@@ -55,6 +55,13 @@ impl ReportBuilder {
                 host.rtt = *rtt;
                 self.hosts.insert(*ip, host);
             }
+            ScanEvent::Mac { ip, mac } => match self.hosts.get_mut(ip) {
+                Some(h) => {
+                    h.mac = Some(*mac);
+                    h.vendor = rmap_oui::lookup(*mac).name().map(Into::into);
+                }
+                None => self.orphans += 1,
+            },
             ScanEvent::Port { ip, result } => {
                 let Some(host) = self.hosts.get_mut(ip) else {
                     self.orphans += 1;
@@ -339,6 +346,36 @@ pub(crate) mod tests {
         });
         assert_eq!(b.orphans(), 3);
         assert!(b.report().hosts.is_empty());
+    }
+
+    #[test]
+    fn mac_events_fill_mac_and_vendor() {
+        let mut b = ReportBuilder::new(config(), 0);
+        host(&mut b, "10.0.0.2", HostState::Up);
+        host(&mut b, "10.0.0.3", HostState::Up);
+        let mac = |s: &str| s.parse::<rmap_core::MacAddr>().unwrap();
+        b.apply(&ScanEvent::Mac {
+            ip: ip("10.0.0.2"),
+            mac: mac("00:11:32:aa:bb:cc"),
+        });
+        b.apply(&ScanEvent::Mac {
+            ip: ip("10.0.0.3"),
+            mac: mac("da:11:32:aa:bb:cc"),
+        });
+        b.apply(&ScanEvent::Mac {
+            ip: ip("10.9.9.9"),
+            mac: mac("00:11:32:aa:bb:cc"),
+        });
+        let r = b.report();
+        let h = r.host(ip("10.0.0.2")).unwrap();
+        assert_eq!(h.mac, Some(mac("00:11:32:aa:bb:cc")));
+        assert_eq!(h.vendor.as_deref(), Some("Synology"));
+        let h = r.host(ip("10.0.0.3")).unwrap();
+        assert!(
+            h.mac.is_some() && h.vendor.is_none(),
+            "randomised: no vendor"
+        );
+        assert_eq!(b.orphans(), 1);
     }
 
     #[test]

@@ -44,8 +44,10 @@ pub enum Matched {
         protocol: Protocol,
         reply: Reply,
     },
-    /// An echo reply (or ARP reply) from a host we pinged.
+    /// An echo reply from a host we pinged.
     HostUp(Ipv4Addr),
+    /// An ARP reply: the host is up and this is its hardware address.
+    ArpReply { ip: Ipv4Addr, mac: MacAddr },
 }
 
 /// Port state for a TCP SYN probe's reply.
@@ -223,7 +225,19 @@ impl Matcher {
             return None;
         }
         let arp = ArpPacket::parse(payload).ok()?;
-        (arp.op == OP_REPLY).then_some(Matched::HostUp(arp.sender_ip))
+        if arp.op != OP_REPLY {
+            return None;
+        }
+        let mac = arp.sender_mac;
+        // A group or all-zero sender is junk; the host still answered.
+        Some(if mac.0[0] & 0x01 != 0 || mac == MacAddr::ZERO {
+            Matched::HostUp(arp.sender_ip)
+        } else {
+            Matched::ArpReply {
+                ip: arp.sender_ip,
+                mac,
+            }
+        })
     }
 }
 
@@ -419,8 +433,17 @@ mod tests {
         }
         .write(&mut reply);
         reply.extend_from_slice(&[0; 18]); // Ethernet minimum-size padding
-        assert_eq!(Matcher::match_arp(&reply), Some(Matched::HostUp(THEM)));
+        assert_eq!(
+            Matcher::match_arp(&reply),
+            Some(Matched::ArpReply {
+                ip: THEM,
+                mac: MacAddr([2, 0, 0, 0, 0, 2])
+            })
+        );
         assert_eq!(Matcher::match_arp(&reply[..20]), None);
+        // A broadcast sender MAC still proves the host is up, but isn't kept.
+        reply[22..28].copy_from_slice(&[0xff; 6]);
+        assert_eq!(Matcher::match_arp(&reply), Some(Matched::HostUp(THEM)));
     }
 
     #[test]

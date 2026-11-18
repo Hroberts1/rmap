@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rmap_core::{HostState, PortResult, PortState, ScanType};
+use rmap_core::{HostState, MacAddr, PortResult, PortState, ScanType};
 use rmap_log::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,12 @@ pub struct HostReport {
     /// Every port on this host was probed.
     #[serde(default)]
     pub complete: bool,
+    /// Hardware address, when discovery learned it over ARP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<MacAddr>,
+    /// Vendor of `mac` from rmap's built-in OUI table, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
 }
 
 impl HostReport {
@@ -95,6 +101,8 @@ impl HostReport {
             closed: 0,
             filtered: 0,
             complete: state == HostState::Down,
+            mac: None,
+            vendor: None,
         }
     }
 

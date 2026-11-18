@@ -301,6 +301,15 @@ fn write_host(w: &mut XmlWriter, h: &HostReport, start: &str, end: &str) {
         "address",
         &[("addr", &h.ip.to_string()), ("addrtype", addrtype)],
     );
+    if let Some(mac) = h.mac {
+        // Nmap writes MACs in upper case.
+        let addr = mac.to_string().to_ascii_uppercase();
+        let mut attrs = vec![("addr", addr.as_str()), ("addrtype", "mac")];
+        if let Some(vendor) = &h.vendor {
+            attrs.push(("vendor", vendor));
+        }
+        w.empty("address", &attrs);
+    }
     match &h.hostname {
         Some(name) => {
             w.start("hostnames", &[]);
@@ -515,6 +524,24 @@ mod tests {
         }
         let expected = std::fs::read_to_string(path).unwrap();
         assert_eq!(xml, expected.replace("\r\n", "\n"));
+    }
+
+    #[test]
+    fn mac_address_and_vendor() {
+        let mut r = sample();
+        r.hosts[0].mac = Some("00:11:32:aa:bb:cc".parse().unwrap());
+        r.hosts[0].vendor = Some("Synology".into());
+        r.hosts[1].mac = Some("da:00:00:00:00:01".parse().unwrap());
+        let xml = to_string(&r);
+        assert!(
+            xml.contains(concat!(
+                "<address addr=\"10.0.0.2\" addrtype=\"ipv4\"/>\n",
+                "    <address addr=\"00:11:32:AA:BB:CC\" addrtype=\"mac\" vendor=\"Synology\"/>"
+            )),
+            "{xml}"
+        );
+        assert!(xml.contains("<address addr=\"DA:00:00:00:00:01\" addrtype=\"mac\"/>"));
+        assert_balanced(&xml);
     }
 
     #[test]
