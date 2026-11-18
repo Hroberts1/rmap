@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nmaprun>
+<nmaprun scanner="rmap" args="rmap targets=10.0.0.0/30 ports=22,80,443 scan=connect timing=T3 discovery=true service_detection=true" start="1763389805" startstr="2025-11-17 14:30:05 UTC" version="0.1.0" xmloutputversion="1.05">
+  <scaninfo type="connect" protocol="tcp" numservices="3" services="22,80,443"/>
+  <verbose level="0"/>
+  <debugging level="0"/>
+  <host starttime="1763389805" endtime="1763389809">
+    <status state="up" reason="host-response" reason_ttl="0"/>
+    <address addr="10.0.0.2" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="db.lan" type="PTR"/>
+    </hostnames>
+    <ports>
+      <extraports state="closed" count="997">
+        <extrareasons reason="conn-refused" count="997"/>
+      </extraports>
+      <extraports state="filtered" count="1">
+        <extrareasons reason="no-response" count="1"/>
+      </extraports>
+      <port protocol="tcp" portid="22">
+        <state state="open" reason="syn-ack" reason_ttl="0"/>
+        <service name="ssh" product="OpenSSH" version="9.6p1" extrainfo="Ubuntu Linux; protocol 2.0" ostype="Linux" method="probed" conf="10">
+          <cpe>cpe:/a:openbsd:openssh:9.6p1</cpe>
+        </service>
+      </port>
+      <port protocol="udp" portid="161">
+        <state state="open|filtered" reason="no-response" reason_ttl="0"/>
+        <service name="snmp" method="table" conf="3"/>
+      </port>
+    </ports>
+    <times srtt="1234" rttvar="1234" to="100000"/>
+  </host>
+  <host starttime="1763389805" endtime="1763389809">
+    <status state="up" reason="user-set" reason_ttl="0"/>
+    <address addr="::1" addrtype="ipv6"/>
+    <hostnames/>
+    <ports/>
+  </host>
+  <runstats>
+    <finished time="1763389809" timestr="2025-11-17 14:30:09 UTC" elapsed="4.32" summary="rmap done at 2025-11-17 14:30:09 UTC; 2 IP addresses (2 hosts up) scanned in 4.32 seconds" exit="success"/>
+    <hosts up="2" down="0" total="2"/>
+  </runstats>
+</nmaprun>

@@ -1,0 +1,329 @@
+//! Turns the engine's event stream into a [`ScanReport`].
+
+use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
+
+use rmap_core::{Protocol, ScanEvent, Service};
+
+use crate::model::{ConfigSummary, HostReport, RunStatus, ScanReport};
+
+/// Collects [`ScanEvent`]s into a report. Pure: the caller supplies the
+/// clock, so the same events always give the same report.
+#[derive(Debug, Clone)]
+pub struct ReportBuilder {
+    report: ScanReport,
+    hosts: BTreeMap<IpAddr, HostReport>,
+    /// Services that arrived before their port, attached when it shows up.
+    early_services: HashMap<(IpAddr, Protocol, u16), Service>,
+    /// Events that referred to a host or port we hadn't seen.
+    orphans: u64,
+}
+
+impl ReportBuilder {
+    pub fn new(config: ConfigSummary, started_ms: i64) -> Self {
+        ReportBuilder {
+            report: ScanReport::new(config, started_ms),
+            hosts: BTreeMap::new(),
+            early_services: HashMap::new(),
+            orphans: 0,
+        }
+    }
+
+    pub fn status(&self) -> RunStatus {
+        self.report.status
+    }
+
+    /// Events dropped because they referred to an unknown host.
+    pub fn orphans(&self) -> u64 {
+        self.orphans
+    }
+
+    pub fn apply(&mut self, event: &ScanEvent) {
+        match event {
+            ScanEvent::Started { .. } | ScanEvent::Warning(_) => {}
+            ScanEvent::Host {
+                ip,
+                hostname,
+                state,
+                rtt,
+            } => {
+                let mut host = HostReport::new(*ip, hostname.clone(), *state);
+                host.rtt = *rtt;
+                self.hosts.insert(*ip, host);
+            }
+            ScanEvent::Port { ip, result } => {
+                let Some(host) = self.hosts.get_mut(ip) else {
+                    self.orphans += 1;
+                    return;
+                };
+                let mut result = result.clone();
+                if let Some(service) =
+                    self.early_services
+                        .remove(&(*ip, result.protocol, result.port))
+                {
+                    result.service = Some(service);
+                }
+                let key = (result.port, result.protocol);
+                match host
+                    .ports
+                    .binary_search_by_key(&key, |p| (p.port, p.protocol))
+                {
+                    Ok(i) => host.ports[i] = result,
+                    Err(i) => host.ports.insert(i, result),
+                }
+            }
+            ScanEvent::Service {
+                ip,
+                protocol,
+                port,
+                service,
+            } => {
+                let Some(host) = self.hosts.get_mut(ip) else {
+                    self.orphans += 1;
+                    return;
+                };
+                match host
+                    .ports
+                    .iter_mut()
+                    .find(|p| p.port == *port && p.protocol == *protocol)
+                {
+                    Some(p) => p.service = Some(service.clone()),
+                    None => {
+                        self.early_services
+                            .insert((*ip, *protocol, *port), service.clone());
+                    }
+                }
+            }
+            ScanEvent::HostDone {
+                ip,
+                closed,
+                filtered,
+                ..
+            } => match self.hosts.get_mut(ip) {
+                Some(h) => {
+                    h.closed = *closed;
+                    h.filtered = *filtered;
+                    h.complete = true;
+                }
+                None => self.orphans += 1,
+            },
+            ScanEvent::Finished { elapsed } => {
+                if self.report.status == RunStatus::Running {
+                    self.report.status = RunStatus::Completed;
+                    self.report.finished_ms =
+                        Some(self.report.started_ms + elapsed.as_millis() as i64);
+                }
+            }
+        }
+    }
+
+    /// The user stopped the scan at `now_ms`.
+    pub fn mark_stopped(&mut self, now_ms: i64) {
+        self.end(RunStatus::Stopped, now_ms);
+    }
+
+    /// The engine died at `now_ms`.
+    pub fn mark_failed(&mut self, now_ms: i64) {
+        self.end(RunStatus::Failed, now_ms);
+    }
+
+    fn end(&mut self, status: RunStatus, now_ms: i64) {
+        if self.report.status == RunStatus::Running {
+            self.report.status = status;
+            self.report.finished_ms = Some(now_ms.max(self.report.started_ms));
+        }
+    }
+
+    /// The report as it stands.
+    pub fn report(&self) -> ScanReport {
+        let mut report = self.report.clone();
+        report.hosts = self.hosts.values().cloned().collect();
+        report
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::time::Duration;
+
+    use rmap_core::{HostState, PortResult, PortState, ScanType};
+
+    use super::*;
+
+    pub(crate) fn config() -> ConfigSummary {
+        ConfigSummary {
+            targets: "10.0.0.0/30".into(),
+            ports: "22,80,443".into(),
+            port_count: 3,
+            scan_type: ScanType::Connect,
+            timing_level: 3,
+            timing_name: "normal".into(),
+            discovery: true,
+            service_detection: true,
+        }
+    }
+
+    pub(crate) fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn host(b: &mut ReportBuilder, addr: &str, state: HostState) {
+        b.apply(&ScanEvent::Host {
+            ip: ip(addr),
+            hostname: None,
+            state,
+            rtt: Some(Duration::from_millis(2)),
+        });
+    }
+
+    fn port(b: &mut ReportBuilder, addr: &str, port: u16, protocol: Protocol) {
+        b.apply(&ScanEvent::Port {
+            ip: ip(addr),
+            result: PortResult::new(port, protocol, PortState::Open, None),
+        });
+    }
+
+    fn ssh(version: &str) -> Service {
+        Service {
+            name: "ssh".into(),
+            product: Some("OpenSSH".into()),
+            version: Some(version.into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn builds_a_sorted_report() {
+        let mut b = ReportBuilder::new(config(), 1_000);
+        b.apply(&ScanEvent::Started {
+            hosts: 3,
+            ports_per_host: 3,
+        });
+        host(&mut b, "10.0.0.2", HostState::Up);
+        host(&mut b, "10.0.0.1", HostState::Down);
+        port(&mut b, "10.0.0.2", 443, Protocol::Tcp);
+        port(&mut b, "10.0.0.2", 22, Protocol::Tcp);
+        port(&mut b, "10.0.0.2", 22, Protocol::Udp);
+        b.apply(&ScanEvent::Service {
+            ip: ip("10.0.0.2"),
+            protocol: Protocol::Tcp,
+            port: 22,
+            service: ssh("9.6p1"),
+        });
+        b.apply(&ScanEvent::HostDone {
+            ip: ip("10.0.0.2"),
+            closed: 1,
+            filtered: 0,
+            elapsed: Duration::from_millis(5),
+        });
+        b.apply(&ScanEvent::Warning("ignored".into()));
+        assert_eq!(b.status(), RunStatus::Running);
+        b.apply(&ScanEvent::Finished {
+            elapsed: Duration::from_millis(2_500),
+        });
+
+        let r = b.report();
+        assert_eq!(r.status, RunStatus::Completed);
+        assert_eq!(r.finished_ms, Some(3_500));
+        assert_eq!(r.elapsed(), Duration::from_millis(2_500));
+        let addrs: Vec<String> = r.hosts.iter().map(|h| h.ip.to_string()).collect();
+        assert_eq!(addrs, ["10.0.0.1", "10.0.0.2"]);
+        let h = r.host(ip("10.0.0.2")).unwrap();
+        let ports: Vec<(u16, Protocol)> = h.ports.iter().map(|p| (p.port, p.protocol)).collect();
+        assert_eq!(
+            ports,
+            [
+                (22, Protocol::Tcp),
+                (22, Protocol::Udp),
+                (443, Protocol::Tcp)
+            ]
+        );
+        assert_eq!(h.ports[0].service, Some(ssh("9.6p1")));
+        assert!(h.ports[1].service.is_none(), "udp/22 untouched");
+        assert!(h.complete && h.closed == 1);
+        assert!(
+            r.host(ip("10.0.0.1")).unwrap().complete,
+            "down hosts are done"
+        );
+        assert_eq!((r.hosts_up(), r.open_ports()), (1, 3));
+    }
+
+    #[test]
+    fn service_before_port_is_kept() {
+        let mut b = ReportBuilder::new(config(), 0);
+        host(&mut b, "10.0.0.2", HostState::Up);
+        b.apply(&ScanEvent::Service {
+            ip: ip("10.0.0.2"),
+            protocol: Protocol::Tcp,
+            port: 22,
+            service: ssh("8.9"),
+        });
+        port(&mut b, "10.0.0.2", 22, Protocol::Tcp);
+        assert_eq!(b.report().hosts[0].ports[0].service, Some(ssh("8.9")));
+    }
+
+    #[test]
+    fn later_service_replaces_earlier() {
+        let mut b = ReportBuilder::new(config(), 0);
+        host(&mut b, "10.0.0.2", HostState::Up);
+        port(&mut b, "10.0.0.2", 22, Protocol::Tcp);
+        for v in ["8.9", "9.6"] {
+            b.apply(&ScanEvent::Service {
+                ip: ip("10.0.0.2"),
+                protocol: Protocol::Tcp,
+                port: 22,
+                service: ssh(v),
+            });
+        }
+        assert_eq!(b.report().hosts[0].ports[0].service, Some(ssh("9.6")));
+    }
+
+    #[test]
+    fn duplicate_port_events_do_not_duplicate() {
+        let mut b = ReportBuilder::new(config(), 0);
+        host(&mut b, "10.0.0.2", HostState::Up);
+        port(&mut b, "10.0.0.2", 22, Protocol::Tcp);
+        port(&mut b, "10.0.0.2", 22, Protocol::Tcp);
+        assert_eq!(b.report().hosts[0].ports.len(), 1);
+    }
+
+    #[test]
+    fn orphan_events_are_counted_not_stored() {
+        let mut b = ReportBuilder::new(config(), 0);
+        port(&mut b, "10.9.9.9", 1, Protocol::Tcp);
+        b.apply(&ScanEvent::Service {
+            ip: ip("10.9.9.9"),
+            protocol: Protocol::Tcp,
+            port: 1,
+            service: ssh("1"),
+        });
+        b.apply(&ScanEvent::HostDone {
+            ip: ip("10.9.9.9"),
+            closed: 0,
+            filtered: 0,
+            elapsed: Duration::ZERO,
+        });
+        assert_eq!(b.orphans(), 3);
+        assert!(b.report().hosts.is_empty());
+    }
+
+    #[test]
+    fn stopped_and_failed_scans() {
+        let mut b = ReportBuilder::new(config(), 10_000);
+        b.mark_stopped(12_000);
+        b.apply(&ScanEvent::Finished {
+            elapsed: Duration::from_secs(9),
+        });
+        let r = b.report();
+        assert_eq!(r.status, RunStatus::Stopped, "a late Finished doesn't win");
+        assert_eq!(r.finished_ms, Some(12_000));
+
+        let mut b = ReportBuilder::new(config(), 10_000);
+        b.mark_failed(5); // clock went backwards
+        b.mark_stopped(20_000);
+        let r = b.report();
+        assert_eq!(r.status, RunStatus::Failed, "the first ending sticks");
+        assert_eq!(r.finished_ms, Some(10_000));
+        assert!(r.summary().ends_with("failed"));
+    }
+}

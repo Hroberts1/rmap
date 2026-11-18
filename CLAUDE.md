@@ -18,6 +18,7 @@ A from-scratch network scanner in Rust with an interactive TUI. Read README.md f
 | `rmap-detect` | Service detection: probe database (`probes.txt`), pattern matcher, TLS/DER parsing, CPE table. `detect(ip, port, protocol, timing)`. |
 | `rmap-log` | Local logs and crash reports. Use `rmap_log::{error,warn,info,debug,trace}!`. |
 | `rmap-packet` | Ethernet/ARP/IPv4/TCP/UDP/ICMPv4 building and parsing, RFC 1071 checksums. No dependencies; parsers never panic. |
+| `rmap-report` | `ScanReport` model, `ReportBuilder` (events → report), JSON and Nmap XML export, saved scans (`ScanStore`), and `diff`. |
 | `rmap-tui` | Setup form (`app.rs` state, `ui.rs` drawing) and live results. |
 
 New milestone work should live in **its own crate** where possible (for example `rmap-packet`, `rmap-detect`, `rmap-vuln`, `rmap-report`) and plug into the engine/TUI through small, well-named hooks. Parallel milestone branches then touch shared files as little as possible.
