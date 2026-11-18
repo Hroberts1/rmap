@@ -1014,3 +1014,70 @@ async fn adaptive_timeouts_give_up_on_silent_udp_ports_sooner() {
     }
     check_adaptive_is_faster(true, warmed).await;
 }
+
+/// A fake UDP service on a well-known port that ignores the port scan's
+/// payload but answers detection's first probe there, so only detection
+/// can see it is open. UDP probes are chosen by port number, so it must
+/// sit on the real port: the first of these that is free on 127.0.0.1.
+async fn udp_detection_only_server() -> Option<(u16, &'static str)> {
+    // (port, bytes only the detection probe contains, service name)
+    let candidates: [(u16, &'static [u8], &'static str); 3] = [
+        (5353, b"_services", "mdns"),
+        (53, b"version", "dns"),
+        (161, b"\x02\x01\x01\x04\x06public", "snmp"), // v2c, not the scan's v1
+    ];
+    for (port, needle, name) in candidates {
+        let Ok(s) = tokio::net::UdpSocket::bind(("127.0.0.1", port)).await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = s.recv_from(&mut buf).await {
+                let query = &buf[..n];
+                if !query.windows(needle.len()).any(|w| w == needle) {
+                    continue;
+                }
+                let mut reply = query.to_vec();
+                if port == 161 {
+                    reply[13] = 0xa2; // GetRequest -> GetResponse
+                } else {
+                    reply[2] |= 0x80; // DNS QR: a response with no answers
+                }
+                let _ = s.send_to(&reply, from).await;
+            }
+        });
+        return Some((port, name));
+    }
+    None
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_detection_upgrades_open_filtered_to_open() {
+    use rmap_core::Protocol::Udp;
+    let Some((port, name)) = udp_detection_only_server().await else {
+        // Linux without root can't bind 53 or 161, and 5353 is often taken.
+        eprintln!("skipped: no free well-known UDP port on 127.0.0.1");
+        return;
+    };
+    let (_keep, silent) = udp_silent().await;
+    let ports = format!("{port},{silent}");
+    let mut cfg = typed("127.0.0.1", &ports, udp_timing(), ScanType::Udp);
+    cfg.service_detection = true;
+    let out = run_scan(cfg).await;
+    assert!(out.finished());
+    // One Port event per port, the answering one upgraded.
+    let mut expected = vec![
+        (port, Udp, PortState::Open),
+        (silent, Udp, PortState::OpenFiltered),
+    ];
+    expected.sort_by_key(|p| p.0);
+    assert_eq!(out.port_states(), expected);
+    let port_at = out
+        .events
+        .iter()
+        .position(|e| matches!(e, ScanEvent::Port { result, .. } if result.port == port));
+    let service_at = out.events.iter().position(|e| {
+        matches!(e, ScanEvent::Service { port: p, service, .. } if *p == port && service.name == name)
+    });
+    assert!(port_at.unwrap() < service_at.expect("service event"));
+}

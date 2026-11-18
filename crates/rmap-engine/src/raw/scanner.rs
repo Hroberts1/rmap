@@ -20,9 +20,9 @@ use tokio::time::{sleep, timeout};
 use super::matcher::{Matched, Matcher, Reply, tcp_state, udp_state};
 use super::sys::{self, Interface};
 use crate::Stats;
-use crate::payloads::udp_payload;
 use crate::rate::RateLimiter;
 use crate::rtt::HostRtt;
+use rmap_detect::udp::udp_payload;
 
 type PortKey = (Ipv4Addr, u16, Protocol);
 

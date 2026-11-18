@@ -86,6 +86,19 @@ const TABLE: &[Entry] = &[
     e("RabbitMQ", "vmware", "rabbitmq"),
     e("Asterisk", "digium", "asterisk"),
     unversioned("Apple remote desktop vnc", "apple", "apple_remote_desktop"),
+    e("dnsmasq", "thekelleys", "dnsmasq"),
+    e("ISC BIND", "isc", "bind"),
+    e("Unbound", "nlnetlabs", "unbound"),
+    e("PowerDNS Recursor", "powerdns", "recursor"),
+    e(
+        "PowerDNS Authoritative Server",
+        "powerdns",
+        "authoritative_server",
+    ),
+    e("ntpd", "ntp", "ntp"),
+    e("NTPsec", "ntpsec", "ntpsec"),
+    e("MiniUPnPd", "miniupnp_project", "miniupnpd"),
+    e("libupnp", "libupnp_project", "libupnp"),
 ];
 
 /// Every product name the table knows, for tests.
@@ -320,6 +333,21 @@ mod tests {
                 "Asterisk",
                 Some("18.10.0~dfsg"),
                 "cpe:2.3:a:digium:asterisk:18.10.0\\~dfsg:*:*:*:*:*:*:*",
+            ),
+            (
+                "ISC BIND",
+                Some("9.11.4 P2"),
+                "cpe:2.3:a:isc:bind:9.11.4:p2:*:*:*:*:*:*",
+            ),
+            (
+                "ntpd",
+                Some("4.2.8p15"),
+                "cpe:2.3:a:ntp:ntp:4.2.8:p15:*:*:*:*:*:*",
+            ),
+            (
+                "dnsmasq",
+                Some("2.90"),
+                "cpe:2.3:a:thekelleys:dnsmasq:2.90:*:*:*:*:*:*:*",
             ),
         ];
         for (product, version, want) in cases {

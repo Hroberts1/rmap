@@ -1,12 +1,21 @@
 //! Probe payloads built in code, referenced from the database as `@name`.
 
 use crate::db::Builtin;
+use crate::udp;
 
 pub fn build(b: Builtin) -> Vec<u8> {
     match b {
         Builtin::TlsClientHello => tls_client_hello(&random32()),
         Builtin::SmbNegotiate => smb_negotiate(),
         Builtin::MongoBuildInfo => mongodb_buildinfo(),
+        Builtin::DnsVersionBind => udp::dns_version_bind(),
+        Builtin::MdnsServices => udp::mdns_services(),
+        Builtin::NtpReadvar => udp::ntp_readvar(),
+        Builtin::NtpClient => udp::ntp_client(),
+        Builtin::SnmpV2c => udp::snmp_v2c_get(),
+        Builtin::SnmpV1 => udp::snmp_v1_get(),
+        Builtin::NetbiosStatus => udp::netbios_status(),
+        Builtin::SsdpSearch => udp::ssdp_search(),
     }
 }
 

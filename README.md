@@ -194,13 +194,13 @@ The raw backend (`crates/rmap-engine/src/raw`) sends packets built by `rmap-pack
 | Other ICMP unreachable codes | filtered |
 | Nothing after retries | open\|filtered |
 
-UDP probes carry real requests for DNS, NTP, SNMPv1 (`public`), NetBIOS name service and SSDP, so those services answer instead of staying silent; other ports get an empty datagram. Linux limits how fast it sends ICMP errors, so on fast templates some closed UDP ports can show as open|filtered.
+UDP probes carry real requests for DNS, NTP, SNMPv1 (`public`, see [UDP detection](#udp-detection)), NetBIOS name service and SSDP, so those services answer instead of staying silent; other ports get an empty datagram. Linux limits how fast it sends ICMP errors, so on fast templates some closed UDP ports can show as open|filtered.
 
 Privileged discovery uses ARP for targets on a directly connected Ethernet subnet (an unanswered ARP request means the host is down) and, elsewhere, ICMP echo raced against the TCP connect ping.
 
 ## Service detection
 
-Tick **Services** on the setup form and rmap identifies the software behind each open TCP port. The port table shows the service and version, and the details pane adds a line per port with extra information, the OS the service revealed, and a [CPE 2.3](https://nvd.nist.gov/products/cpe) name:
+Tick **Services** on the setup form and rmap identifies the software behind each open TCP port, and each open or open|filtered UDP port. The port table shows the service and version, and the details pane adds a line per port with extra information, the OS the service revealed, and a [CPE 2.3](https://nvd.nist.gov/products/cpe) name:
 
 ```
 22/tcp  open  ssh   OpenSSH 8.9p1
@@ -216,7 +216,15 @@ How it works (`crates/rmap-detect`):
 
 `Service::method` says how the result was reached (`banner`, `probe`, or `port_table`), and `confidence` runs from 0 (guess) to 10.
 
-Covered today: OpenSSH, Dropbear, nginx, Apache httpd, Microsoft IIS and HTTPAPI, lighttpd, Caddy, Tomcat Coyote, Elasticsearch, Postfix, Exim, Sendmail, Microsoft Exchange, vsftpd, ProFTPD, Pure-FTPd, FileZilla Server, Microsoft FTP, Dovecot, Courier, MySQL, MariaDB, PostgreSQL, Redis, Valkey, MongoDB, Memcached, RabbitMQ, Asterisk and Apple Remote Desktop, plus the protocols SSH, HTTP (any `Server:` header), FTP, SMTP, POP3, IMAP, TLS, SMB, RDP, VNC, telnet, SIP, RTSP, AMQP and MQTT. UDP detection isn't done yet; the database and API already take a protocol.
+Covered today: OpenSSH, Dropbear, nginx, Apache httpd, Microsoft IIS and HTTPAPI, lighttpd, Caddy, Tomcat Coyote, Elasticsearch, Postfix, Exim, Sendmail, Microsoft Exchange, vsftpd, ProFTPD, Pure-FTPd, FileZilla Server, Microsoft FTP, Dovecot, Courier, MySQL, MariaDB, PostgreSQL, Redis, Valkey, MongoDB, Memcached, RabbitMQ, Asterisk and Apple Remote Desktop, plus the protocols SSH, HTTP (any `Server:` header), FTP, SMTP, POP3, IMAP, TLS, SMB, RDP, VNC, telnet, SIP, RTSP, AMQP and MQTT. Over UDP: DNS (`version.bind`: BIND, dnsmasq, Unbound, PowerDNS, Knot, Microsoft DNS), NTP (ntpd and NTPsec versions over mode 6 control queries, otherwise stratum and reference from a mode 3 request), SNMP v2c and v1 (the sysDescr: Cisco IOS version, Windows, Linux or FreeBSD), NetBIOS name service (host name, workgroup, MAC), mDNS / DNS-SD (the advertised service types) and SSDP / UPnP (MiniUPnPd, libupnp, any `SERVER:` header).
+
+### UDP detection
+
+UDP probes are `protocol udp` blocks in `probes.txt`, tried only on the ports they list; there are no generic UDP probes, so unknown UDP ports cost nothing. Each probe sends one datagram on a connected socket and reads the first reply. DNS, NTP, SNMP, NetBIOS and mDNS replies are binary and decoded in code (`crates/rmap-detect/src/udp.rs`), which checks that the reply really answers rmap's request; the probe's match rules then read the text the decoder pulled out (the `version.bind` string, NTP system variables, the SNMP sysDescr) to name the product and version, so vulnerability matching works for them too. All text taken from a reply is escaped before it is shown.
+
+A port the UDP scan left as open|filtered is reported as **open** if any detection probe gets a reply. For UDP ports, detection therefore runs before the `Port` event is sent, which carries the final state; the `Service` event still follows it.
+
+**SNMP community guessing.** Both the UDP port scan (SNMPv1) and detection (SNMPv2c, then v1) send a GetRequest for sysDescr with the community string `public`. A reply means the agent accepts that community, which is reported in the port's info. Some intrusion detection systems and SNMP agents log or alert on requests with a guessed community, and a few lock out the source after failed attempts. Only scan UDP 161 on networks you are authorised to test, or leave 161 out of the port list.
 
 ### Adding a probe or match rule
 

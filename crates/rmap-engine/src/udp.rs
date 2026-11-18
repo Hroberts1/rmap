@@ -15,8 +15,8 @@ use tokio::net::UdpSocket;
 use tokio::time::{sleep, timeout};
 
 use crate::Stats;
-use crate::payloads::udp_payload;
 use crate::rtt::HostRtt;
+use rmap_detect::udp::udp_payload;
 
 /// How one UDP exchange ended.
 #[derive(Debug)]
