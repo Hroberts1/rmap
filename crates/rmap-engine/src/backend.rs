@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use rmap_core::{MacAddr, PortResult, ScanType, Timing};
 
+use crate::rtt::HostRtt;
 use crate::{Stats, tcp, udp};
 
 /// The probing method chosen for a whole scan.
@@ -138,18 +139,21 @@ impl HostProber {
         port: u16,
         timing: &Timing,
         stats: &Stats,
+        rtt: &HostRtt,
     ) -> PortResult {
         match self {
-            HostProber::Unprivileged(ScanType::Udp) => udp::probe(ip, port, timing, stats).await,
-            HostProber::Unprivileged(_) => tcp::probe(ip, port, timing, stats).await,
+            HostProber::Unprivileged(ScanType::Udp) => {
+                udp::probe(ip, port, timing, stats, rtt).await
+            }
+            HostProber::Unprivileged(_) => tcp::probe(ip, port, timing, stats, rtt).await,
             #[cfg(target_os = "linux")]
             HostProber::Raw {
                 scan_type: ScanType::Connect,
                 ..
-            } => tcp::probe(ip, port, timing, stats).await,
+            } => tcp::probe(ip, port, timing, stats, rtt).await,
             #[cfg(target_os = "linux")]
             HostProber::Raw { raw, src, dst, .. } => {
-                raw.probe(*src, *dst, port, timing, stats).await
+                raw.probe(*src, *dst, port, timing, stats, rtt).await
             }
         }
     }
