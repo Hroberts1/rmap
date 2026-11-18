@@ -1,6 +1,6 @@
 [package]
 name = "rmap-packet"
-description = "Packet building and parsing for rmap: Ethernet, ARP, IPv4, TCP, UDP, ICMPv4"
+description = "Packet building and parsing for rmap: Ethernet, ARP, IPv4, IPv6, TCP, UDP, ICMPv4, ICMPv6"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,28 +1,30 @@
 //! Packet building and parsing for rmap, written from scratch.
 //!
-//! Covers Ethernet II, ARP (Ethernet/IPv4), IPv4, TCP (with options), UDP
-//! and ICMPv4, plus RFC 1071 internet checksums.
+//! Covers Ethernet II, ARP (Ethernet/IPv4), IPv4, IPv6, TCP (with options),
+//! UDP, ICMPv4 and ICMPv6, plus RFC 1071 internet checksums over the IPv4
+//! and IPv6 pseudo-headers.
 //!
 //! Every parser takes untrusted bytes straight off the wire. Parsers never
 //! panic: truncated or malformed input returns an [`Error`]. Builders append
 //! to a caller-owned `Vec<u8>` so one buffer can be reused per packet.
-//!
-//! IPv6 is not implemented yet.
-// TODO(ipv6): add an IPv6 header and ICMPv6 so raw scans can cover v6 targets.
 
 pub mod arp;
 pub mod checksum;
 pub mod ethernet;
 pub mod icmp;
+pub mod icmpv6;
 pub mod ipv4;
+pub mod ipv6;
 pub mod tcp;
 pub mod udp;
 
 pub use arp::ArpPacket;
-pub use checksum::{internet_checksum, transport_checksum};
+pub use checksum::{internet_checksum, transport_checksum, transport_checksum_v6};
 pub use ethernet::{EthernetHeader, MacAddr};
 pub use icmp::IcmpMessage;
+pub use icmpv6::Icmpv6Message;
 pub use ipv4::Ipv4Header;
+pub use ipv6::Ipv6Header;
 pub use tcp::{TcpFlags, TcpHeader, TcpOption};
 pub use udp::UdpHeader;
 
