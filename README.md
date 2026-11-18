@@ -1,5 +1,7 @@
 # rmap
 
+[![CI](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml/badge.svg)](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml)
+
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
 
 rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, and [serde](https://serde.rs)/serde_json for the JSON report format.
