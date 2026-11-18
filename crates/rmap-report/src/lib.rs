@@ -1,15 +1,19 @@
 //! Scan reports: a serializable record of one scan, built from the engine's
-//! event stream, plus export (JSON and Nmap-compatible XML), saved scans on
-//! disk, and diffing two reports.
+//! event stream, plus export (JSON, Nmap-compatible XML, and client-facing
+//! Markdown, CSV and HTML), saved scans on disk, and diffing two reports.
 //!
 //! Everything here except [`store`] is pure: no clocks, no I/O. Callers pass
 //! timestamps in, which keeps the builder and the exporters easy to test.
 
 pub mod builder;
+pub mod csv;
 pub mod diff;
+pub mod html;
 pub mod json;
+pub mod markdown;
 pub mod model;
 pub mod store;
+mod summary;
 pub mod xml;
 
 pub use builder::ReportBuilder;
@@ -24,13 +28,34 @@ pub use store::{SavedScan, ScanStore};
 pub enum ExportFormat {
     Json,
     Xml,
+    Markdown,
+    Csv,
+    Html,
 }
 
 impl ExportFormat {
+    /// Every format, in the order the TUI offers them.
+    pub const ALL: [ExportFormat; 5] = [
+        ExportFormat::Json,
+        ExportFormat::Xml,
+        ExportFormat::Markdown,
+        ExportFormat::Csv,
+        ExportFormat::Html,
+    ];
+
+    /// The format after this one, wrapping around.
+    pub fn next(self) -> ExportFormat {
+        let i = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
     pub fn extension(self) -> &'static str {
         match self {
             ExportFormat::Json => "json",
             ExportFormat::Xml => "xml",
+            ExportFormat::Markdown => "md",
+            ExportFormat::Csv => "csv",
+            ExportFormat::Html => "html",
         }
     }
 
@@ -38,6 +63,9 @@ impl ExportFormat {
         match self {
             ExportFormat::Json => "JSON",
             ExportFormat::Xml => "Nmap XML",
+            ExportFormat::Markdown => "Markdown",
+            ExportFormat::Csv => "CSV",
+            ExportFormat::Html => "HTML",
         }
     }
 
@@ -46,6 +74,9 @@ impl ExportFormat {
         match self {
             ExportFormat::Json => json::to_string(report).map_err(|e| e.to_string()),
             ExportFormat::Xml => Ok(xml::to_string(report)),
+            ExportFormat::Markdown => Ok(markdown::to_string(report)),
+            ExportFormat::Csv => Ok(csv::to_string(report)),
+            ExportFormat::Html => Ok(html::to_string(report)),
         }
     }
 }
@@ -90,5 +121,19 @@ mod tests {
         let err = export(&report, ExportFormat::Json, &tmp.0).unwrap_err();
         assert!(err.contains(&tmp.0.display().to_string()), "{err}");
         assert_eq!(ExportFormat::Xml.extension(), "xml");
+    }
+
+    #[test]
+    fn every_format_exports_and_next_cycles_through_all() {
+        let tmp = TempDir::new("export-all");
+        let report = json::tests::sample();
+        let mut f = ExportFormat::Json;
+        for _ in 0..ExportFormat::ALL.len() {
+            let path = tmp.0.join(format!("out.{}", f.extension()));
+            export(&report, f, &path).unwrap();
+            assert!(std::fs::read_to_string(&path).unwrap().contains("22"));
+            f = f.next();
+        }
+        assert_eq!(f, ExportFormat::Json);
     }
 }

@@ -26,10 +26,7 @@ pub struct ExportDialog {
 
 impl ExportDialog {
     fn toggle_format(&mut self) {
-        let next = match self.format {
-            ExportFormat::Json => ExportFormat::Xml,
-            ExportFormat::Xml => ExportFormat::Json,
-        };
+        let next = self.format.next();
         // Swap the extension if the path still has the old one.
         let old = format!(".{}", self.format.extension());
         if self.path.to_ascii_lowercase().ends_with(&old) {

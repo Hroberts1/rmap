@@ -198,6 +198,25 @@ fn export_dialog_writes_json_and_xml() {
         "{xml}"
     );
     assert!(xml.contains("product=\"OpenSSH\" version=\"9.6\""));
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Tab);
+    }
+    let d = export_dialog(&app);
+    assert_eq!(d.format, ExportFormat::Html);
+    assert!(d.path.ends_with(".html"));
+    // All five formats fit on the dialog's format line at 80x24.
+    let screen = render(&mut app, 80, 24);
+    assert!(
+        screen.contains("Markdown") && screen.contains("HTML"),
+        "{screen}"
+    );
+    render(&mut app, 20, 6); // tiny terminals must not panic
+    press(&mut app, KeyCode::Enter);
+    let html = std::fs::read_to_string(&export_dialog(&app).path).unwrap();
+    assert!(
+        html.contains("<td>22/tcp</td>") && html.contains("OpenSSH 9.6"),
+        "{html}"
+    );
 
     // A path that can't be written shows the error inline.
     ctrl(&mut app, 'u');
@@ -399,11 +418,20 @@ fn export_toggle_swaps_only_matching_extensions() {
     };
     d.toggle_format();
     assert_eq!((d.format, d.path.as_str()), (ExportFormat::Xml, "out.xml"));
+    for (format, path) in [
+        (ExportFormat::Markdown, "out.md"),
+        (ExportFormat::Csv, "out.csv"),
+        (ExportFormat::Html, "out.html"),
+        (ExportFormat::Json, "out.json"),
+    ] {
+        d.toggle_format();
+        assert_eq!((d.format, d.path.as_str()), (format, path));
+    }
     d.path = "report.txt".into();
     d.toggle_format();
     assert_eq!(
         (d.format, d.path.as_str()),
-        (ExportFormat::Json, "report.txt")
+        (ExportFormat::Xml, "report.txt")
     );
     d.path.clear();
     d.toggle_format();
