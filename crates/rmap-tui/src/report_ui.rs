@@ -54,7 +54,7 @@ fn draw_export(frame: &mut Frame, d: &ExportDialog) {
     .vertical_margin(u16::from(inner.height > 5))
     .areas(inner);
 
-    let formats: Vec<Span> = [ExportFormat::Json, ExportFormat::Xml]
+    let formats: Vec<Span> = ExportFormat::ALL
         .into_iter()
         .flat_map(|f| {
             let s = format!(" {} ", f.label());
