@@ -5,6 +5,7 @@
 //! network; it polls the engine's event channel between keypresses.
 
 mod app;
+mod input;
 mod report;
 mod report_ui;
 mod ui;
@@ -14,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -48,6 +51,7 @@ fn event_loop(terminal: &mut Term, rt: Handle) -> io::Result<()> {
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                Event::Paste(text) => app.on_paste(&text),
                 Event::Resize(w, h) => rmap_log::debug!("terminal resized to {w}x{h}"),
                 _ => {}
             }
@@ -69,12 +73,19 @@ fn setup() -> io::Result<Term> {
         let _ = disable_raw_mode();
         return Err(e);
     }
+    // Pasted text then arrives as one Event::Paste, so a newline in a
+    // pasted target list can't act as Enter. Terminals without support
+    // (the legacy Windows console) just keep sending keys; not fatal.
+    if let Err(e) = execute!(io::stdout(), EnableBracketedPaste) {
+        rmap_log::debug!("bracketed paste unavailable: {e}");
+    }
     Terminal::new(CrosstermBackend::new(io::stdout())).inspect_err(|_| restore())
 }
 
 /// Put the terminal back the way we found it. Safe to call more than once.
 fn restore() {
     let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(
         io::stdout(),
         LeaveAlternateScreen,
