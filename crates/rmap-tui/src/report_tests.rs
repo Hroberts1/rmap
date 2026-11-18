@@ -430,10 +430,7 @@ fn export_toggle_swaps_only_matching_extensions() {
     }
     d.path = "report.txt".into();
     d.toggle_format();
-    assert_eq!(
-        (d.format, &*d.path),
-        (ExportFormat::Xml, "report.txt")
-    );
+    assert_eq!((d.format, &*d.path), (ExportFormat::Xml, "report.txt"));
     d.path.clear();
     d.toggle_format();
     assert_eq!(d.path, "");

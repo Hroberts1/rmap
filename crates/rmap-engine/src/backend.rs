@@ -150,9 +150,7 @@ impl HostProber {
                 ..
             } => tcp::probe(ip, port, timing, stats, rtt).await,
             #[cfg(target_os = "linux")]
-            HostProber::Raw { raw, route, .. } => {
-                raw.probe(*route, port, timing, stats, rtt).await
-            }
+            HostProber::Raw { raw, route, .. } => raw.probe(*route, port, timing, stats, rtt).await,
         }
     }
 }

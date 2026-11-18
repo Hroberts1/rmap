@@ -16,6 +16,7 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::filter::SortOrder;
 use crate::input::{TextInput, paste_as_list};
+use crate::mouse::HitMap;
 use crate::report::{Dialog, DiffView};
 
 /// Most engine events handled per frame, so a burst can't stall input.
@@ -221,7 +222,7 @@ impl ScanView {
         self.hosts.values().filter(|h| h.state == state).count()
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    pub(crate) fn move_selection(&mut self, delta: isize) {
         let visible = self.visible();
         if visible.is_empty() {
             return;
@@ -247,7 +248,7 @@ impl ScanView {
             .map_or(&[], |h| h.open.as_slice())
     }
 
-    fn move_port_selection(&mut self, delta: isize) {
+    pub(crate) fn move_port_selection(&mut self, delta: isize) {
         let n = self.selected_ports().len();
         if n == 0 {
             return;
@@ -402,6 +403,10 @@ pub struct App {
     pub profiles: crate::profiles::Profiles,
     /// Text for the event loop to send to the clipboard (OSC 52).
     pub clipboard: Option<String>,
+    /// Whether the terminal should report mouse events; `m` toggles it.
+    pub mouse_capture: bool,
+    /// Clickable areas of the last frame, written by the renderer.
+    pub hits: HitMap,
     quit: bool,
 }
 
@@ -422,6 +427,8 @@ impl App {
             help: false,
             profiles,
             clipboard: None,
+            mouse_capture: true,
+            hits: HitMap::default(),
             quit: false,
         }
     }
@@ -744,6 +751,7 @@ impl App {
             KeyCode::Char('c') => self.open_compare(),
             KeyCode::Char('y') => self.clipboard = crate::clipboard::copy_selection(view, false),
             KeyCode::Char('Y') => self.clipboard = crate::clipboard::copy_selection(view, true),
+            KeyCode::Char('m') => self.toggle_mouse_capture(),
             KeyCode::Down | KeyCode::Char('j') => view.move_focused(1),
             KeyCode::Up | KeyCode::Char('k') => view.move_focused(-1),
             KeyCode::PageDown => view.move_focused(10),
@@ -1640,7 +1648,7 @@ mod tests {
             assert!(render(&mut app, w, h).contains("copied 1 CVE ID from"));
         }
         press(&mut app, KeyCode::Char('?'));
-        assert!(render(&mut app, 80, 24).contains("copy CVE IDs"));
+        assert!(render(&mut app, 80, 24).contains("ip:port / CVE IDs"));
         press(&mut app, KeyCode::Esc);
 
         // IPv6 gets brackets; a host with no open ports has nothing to copy.
