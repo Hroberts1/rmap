@@ -147,6 +147,8 @@ pub struct ScanView {
     /// First table row drawn in the port pane; kept by the renderer so the
     /// view only scrolls when the selection would leave it.
     pub port_offset: usize,
+    /// Which results tab is shown, and the Services/Vulns tabs' selection.
+    pub tabs: crate::tabs::Tabs,
 }
 
 impl ScanView {
@@ -559,6 +561,9 @@ impl App {
             self.screen = Screen::Setup;
             return;
         };
+        if crate::tabs::on_key(view, key.code) {
+            return;
+        }
         match key.code {
             KeyCode::Char('q') => {
                 if view.is_running() {
@@ -686,6 +691,7 @@ impl App {
             focus: Pane::Hosts,
             port_selected: 0,
             port_offset: 0,
+            tabs: Default::default(),
         });
         self.screen = Screen::Results;
     }

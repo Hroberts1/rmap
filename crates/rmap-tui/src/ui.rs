@@ -248,7 +248,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
 
 /// Below this width the host list and details stack vertically, so the
 /// host table gets the full width instead of a third of it.
-const STACK_BELOW: u16 = 100;
+pub(crate) const STACK_BELOW: u16 = 100;
 /// Most log lines shown under the results; the panel shrinks to fit fewer.
 const LOG_ROWS: usize = 3;
 
@@ -266,6 +266,15 @@ fn draw_results(frame: &mut Frame, view: &mut ScanView) {
     .areas(frame.area());
 
     draw_header(frame, header, view);
+    if log_height > 0 {
+        draw_log(frame, log, view);
+    }
+    frame.render_widget(Paragraph::new(footer_help(view, footer.width)), footer);
+    let [strip, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(body);
+    crate::tabs::draw_strip(frame, strip, view);
+    if crate::tabs::draw(frame, body, view) {
+        return;
+    }
     let [hosts, detail] = if body.width < STACK_BELOW {
         // Hosts on top, sized to the list but never more than ~40%.
         let max = (body.height * 2 / 5).max(3);
@@ -276,16 +285,12 @@ fn draw_results(frame: &mut Frame, view: &mut ScanView) {
     };
     draw_host_table(frame, hosts, view);
     draw_host_detail(frame, detail, view);
-    if log_height > 0 {
-        draw_log(frame, log, view);
-    }
-    frame.render_widget(Paragraph::new(footer_help(view, footer.width)), footer);
 }
 
 /// The footer key strip, trimmed to fit: `? help` and `q quit` always show,
 /// the rest are dropped from the end as the terminal narrows.
 fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
-    let mut wanted = vec![("Tab", "pane"), ("↑↓", "select")];
+    let mut wanted = vec![("Tab", "pane"), ("↑↓", "select"), ("1-3", "tabs")];
     if view.is_running() {
         wanted.push(("s", "stop"));
     }
@@ -373,7 +378,7 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
 
 /// Highlight for the selected row. REVERSED works on light and dark
 /// themes alike; a hardcoded background colour doesn't.
-fn highlight(focused: bool) -> Style {
+pub(crate) fn highlight(focused: bool) -> Style {
     if focused {
         Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else {
@@ -381,7 +386,7 @@ fn highlight(focused: bool) -> Style {
     }
 }
 
-fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
+pub(crate) fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
     let block = Block::bordered().title(title);
     if focused {
         block.border_style(Style::new().fg(ACCENT))
@@ -660,7 +665,7 @@ fn spanning_row(text: Text<'static>, ncols: u16) -> Row<'static> {
 
 /// A potential CVE: a severity label (text, not just colour, so it reads
 /// without colour too), the score, then the ID and wrapped summary.
-fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
+pub(crate) fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
     let (label, color) = match v.severity {
         VulnSeverity::Critical => ("CRIT", Color::Red),
         VulnSeverity::High => ("HIGH", Color::Red),
@@ -730,7 +735,7 @@ fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
     lines
 }
 
-fn ellipsize(s: &str, width: usize) -> String {
+pub(crate) fn ellipsize(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         s.to_string()
     } else if width == 0 {
@@ -797,6 +802,7 @@ fn draw_help(frame: &mut Frame) {
         ("PgUp PgDn", "move by 10"),
         ("Home End g G", "first / last"),
         ("Tab ← → h l", "switch between hosts and ports"),
+        ("1 2 3", "hosts / services / vulns tab"),
         ("d", "show or hide down hosts"),
         ("s", "stop the scan"),
         ("e", "export JSON / XML"),
