@@ -12,6 +12,9 @@
 //! fresh connection, and the whole port is bounded by a time budget derived
 //! from the timing template. When nothing matches, the result falls back to
 //! the port-number table with low confidence.
+//!
+//! UDP ports get the `protocol udp` probes over a connected UDP socket, one
+//! datagram each way. Their binary replies are decoded in code ([`udp`]).
 
 pub mod cpe;
 pub mod db;
@@ -19,11 +22,14 @@ pub mod der;
 pub mod pattern;
 pub mod payloads;
 pub mod tls;
+pub mod udp;
 
 #[cfg(test)]
 mod e2e_tests;
 #[cfg(test)]
 mod rule_tests;
+#[cfg(test)]
+mod udp_e2e_tests;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -32,7 +38,7 @@ use std::time::Duration;
 
 use rmap_core::{DetectMethod, Protocol, Service, Timing, service_name};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
 
 use db::{Builtin, Database, Payload};
@@ -63,9 +69,22 @@ const TLS_NAMES: &[&str] = &[
 /// Returns `None` only when nothing at all is known: no probe got an
 /// answer and the port number isn't in the port table.
 pub async fn detect(ip: IpAddr, port: u16, protocol: Protocol, timing: &Timing) -> Option<Service> {
+    detect_port(ip, port, protocol, timing).await.service
+}
+
+/// Like [`detect`], also saying whether any probe got a reply.
+pub async fn detect_port(ip: IpAddr, port: u16, protocol: Protocol, timing: &Timing) -> Detected {
     Detector::builtin()
-        .detect(SocketAddr::new(ip, port), protocol, timing, port)
+        .detect_port(SocketAddr::new(ip, port), protocol, timing, port)
         .await
+}
+
+/// What detection learned about one port.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Detected {
+    pub service: Option<Service>,
+    /// Some probe got a reply. For UDP that proves the port open.
+    pub answered: bool,
 }
 
 /// A parsed probe database and the logic to run it.
@@ -129,6 +148,11 @@ impl Detector {
         {
             return Some(tls_service(&info, port));
         }
+        if let Payload::Builtin(b) = probe.payload
+            && let Some(decode) = udp::decoder(b)
+        {
+            return Some(self.refine(index, decode(response)?));
+        }
         let m = self.db.identify(index, response)?;
         rmap_log::debug!(
             "rule at probes.txt:{} ({}) matched the {} response",
@@ -144,6 +168,25 @@ impl Detector {
         Some(service)
     }
 
+    /// Let the probe's rules name the product from the text a UDP decoder
+    /// found; the decoder's own summary stays unless a rule sets `info`.
+    fn refine(&self, index: usize, decoded: udp::Decoded) -> Service {
+        let mut service = decoded.service;
+        if let Some(text) = &decoded.text
+            && let Some(m) = self.db.identify(index, text)
+        {
+            rmap_log::debug!("rule at probes.txt:{} matched decoded text", m.rule.line);
+            let rule = m.service;
+            service.product = rule.product;
+            service.version = rule.version;
+            service.os_hint = rule.os_hint.or(service.os_hint);
+            service.info = rule.info.or(service.info);
+            service.confidence = service.confidence.max(rule.confidence);
+        }
+        service.cpes = cpe::for_service(&service);
+        service
+    }
+
     /// Detect the service at `addr`, choosing probes as if it were on
     /// `port` (normally `addr.port()`; tests use other values).
     pub async fn detect(
@@ -153,11 +196,17 @@ impl Detector {
         timing: &Timing,
         port: u16,
     ) -> Option<Service> {
-        if protocol != Protocol::Tcp {
-            // UDP probes slot into the same database (`protocol udp`) once
-            // the engine has a UDP transport for them.
-            return port_table(port, None);
-        }
+        self.detect_port(addr, protocol, timing, port).await.service
+    }
+
+    /// Like [`Detector::detect`], also saying whether any probe got a reply.
+    pub async fn detect_port(
+        &self,
+        addr: SocketAddr,
+        protocol: Protocol,
+        timing: &Timing,
+        port: u16,
+    ) -> Detected {
         let started = Instant::now();
         let budget = budget(timing);
         let max_wait = timing
@@ -166,6 +215,7 @@ impl Detector {
             .max(Duration::from_secs(1));
         let mut unmatched: Option<Vec<u8>> = None;
         let mut failures = 0;
+        let mut answered = false;
         for index in self.plan(port, protocol) {
             let remaining = budget.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -180,7 +230,11 @@ impl Detector {
             };
             let wait = probe.wait.min(max_wait).min(remaining);
             let connect = timing.connect_timeout.min(remaining);
-            match exchange(addr, &payload, connect, wait).await {
+            let reply = match protocol {
+                Protocol::Tcp => exchange(addr, &payload, connect, wait).await,
+                Protocol::Udp => exchange_udp(addr, &payload, wait).await,
+            };
+            match reply {
                 Ok(response) => {
                     rmap_log::trace!(
                         "service {addr}: probe {} got {} bytes: {}",
@@ -192,6 +246,7 @@ impl Detector {
                         rmap_log::debug!("service {addr}: probe {} got no reply", probe.name);
                         continue;
                     }
+                    answered = true;
                     if let Some(service) = self.analyze(index, &response, port) {
                         rmap_log::debug!(
                             "service {addr}: {} {:?} via probe {} in {:?}",
@@ -200,7 +255,10 @@ impl Detector {
                             probe.name,
                             started.elapsed()
                         );
-                        return Some(service);
+                        return Detected {
+                            service: Some(service),
+                            answered,
+                        };
                     }
                     rmap_log::debug!("service {addr}: probe {} reply unrecognised", probe.name);
                     unmatched.get_or_insert(response);
@@ -216,7 +274,10 @@ impl Detector {
             }
         }
         rmap_log::debug!("service {addr}: no rule matched; using the port table");
-        port_table(port, unmatched.as_deref())
+        Detected {
+            service: port_table(port, unmatched.as_deref()),
+            answered,
+        }
     }
 }
 
@@ -269,6 +330,29 @@ async fn exchange(
         }
     }
     Ok(response)
+}
+
+/// Send one datagram on a connected socket and wait up to `wait` for the
+/// first reply. An ICMP port unreachable surfaces as an error.
+// shortcut: one datagram per probe, no retransmit; the port scan already
+// retried, so loss here only costs the version, not the port state.
+async fn exchange_udp(addr: SocketAddr, payload: &[u8], wait: Duration) -> io::Result<Vec<u8>> {
+    let local: SocketAddr = match addr {
+        SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = UdpSocket::bind(local).await?;
+    socket.connect(addr).await?;
+    socket.send(payload).await?;
+    let mut buf = vec![0u8; MAX_RESPONSE];
+    match timeout(wait, socket.recv(&mut buf)).await {
+        Err(_) => Ok(Vec::new()),
+        Ok(Ok(n)) => {
+            buf.truncate(n);
+            Ok(buf)
+        }
+        Ok(Err(e)) => Err(e),
+    }
 }
 
 fn tls_service(info: &tls::TlsInfo, port: u16) -> Service {
@@ -338,7 +422,16 @@ mod tests {
         assert_eq!(names(22)[0], "banner");
         assert_eq!(names(80)[0], "http-get");
         assert_eq!(names(40000), ["banner", "http-get", "tls", "generic-lines"]);
-        assert!(d.plan(53, Protocol::Udp).is_empty());
+        let udp = |port| {
+            d.plan(port, Protocol::Udp)
+                .into_iter()
+                .map(|i| d.database().probes[i].name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(udp(53), ["dns-version"]);
+        assert_eq!(udp(123), ["ntp-readvar", "ntp-client"]);
+        assert_eq!(udp(161), ["snmp-v2c", "snmp-v1"]);
+        assert!(udp(40000).is_empty(), "no generic UDP probes");
     }
 
     #[test]

@@ -730,6 +730,152 @@ fn every_rule_matches_its_banner() {
     assert_eq!(s.info.as_deref(), Some("authentication required"));
     r.check("mqtt", b"\x20\x02\x00\x02", "mqtt", None, None);
 
+    // ----------------------------------------------------------- UDP ---
+    // Rules on decoded probes see the text the decoder pulled out.
+    r.check(
+        "dns-version",
+        b"dnsmasq-2.90",
+        "dns",
+        Some("dnsmasq"),
+        Some("2.90"),
+    );
+    r.check(
+        "dns-version",
+        b"9.18.24-1ubuntu1-Ubuntu",
+        "dns",
+        Some("ISC BIND"),
+        Some("9.18.24"),
+    );
+    r.check(
+        "dns-version",
+        b"9.11.4-P2-RedHat-9.11.4-26.P2.el7_9.13",
+        "dns",
+        Some("ISC BIND"),
+        Some("9.11.4 P2"),
+    );
+    r.check(
+        "dns-version",
+        b"unbound 1.17.1",
+        "dns",
+        Some("Unbound"),
+        Some("1.17.1"),
+    );
+    r.check(
+        "dns-version",
+        b"PowerDNS Recursor 4.8.4 (built Jan 10 2024 08:31:19 by root@localhost)",
+        "dns",
+        Some("PowerDNS Recursor"),
+        Some("4.8.4"),
+    );
+    r.check(
+        "dns-version",
+        b"PowerDNS Authoritative Server 4.7.3 (built Dec 12 2022)",
+        "dns",
+        Some("PowerDNS Authoritative Server"),
+        Some("4.7.3"),
+    );
+    r.check(
+        "dns-version",
+        b"Knot DNS 3.2.6",
+        "dns",
+        Some("Knot DNS"),
+        Some("3.2.6"),
+    );
+    let s = r.check(
+        "dns-version",
+        b"Microsoft DNS 10.0.17763 (4A6339E8)",
+        "dns",
+        Some("Microsoft DNS"),
+        Some("10.0.17763"),
+    );
+    assert_eq!(s.os_hint.as_deref(), Some("Windows"));
+    r.check(
+        "ntp-readvar",
+        b"version=\"ntpd ntpsec-1.2.2 2023-04-06T00:00:00Z\", processor=\"x86_64\"",
+        "ntp",
+        Some("NTPsec"),
+        Some("1.2.2"),
+    );
+    let s = r.check(
+        "ntp-readvar",
+        b"version=\"ntpd 4.2.8p15@1.3728-o Wed Sep 23 11:46:38 UTC 2020 (1)\",\r\nprocessor=\"x86_64\", system=\"Linux/5.10.0-28-amd64\", leap=0, stratum=2",
+        "ntp",
+        Some("ntpd"),
+        Some("4.2.8p15"),
+    );
+    assert_eq!(s.os_hint.as_deref(), Some("Linux/5.10.0-28-amd64"));
+    r.check(
+        "ntp-readvar",
+        b"version=\"ntpd 4.2.6p5@1.2349-o Fri Apr 13 2018\", processor=\"x86_64\"",
+        "ntp",
+        Some("ntpd"),
+        Some("4.2.6p5"),
+    );
+    let s = r.check(
+        "snmp-v2c",
+        b"Cisco IOS Software, C2960 Software (C2960-LANBASEK9-M), Version 15.0(2)SE11, RELEASE SOFTWARE (fc3)\r\nTechnical Support: http://www.cisco.com/techsupport",
+        "snmp",
+        Some("Cisco IOS"),
+        Some("15.0(2)SE11"),
+    );
+    assert_eq!(s.os_hint.as_deref(), Some("Cisco IOS"));
+    let s = r.check(
+        "snmp-v1",
+        b"Hardware: Intel64 Family 6 Model 85 Stepping 7 AT/AT COMPATIBLE - Software: Windows Version 6.3 (Build 17763 Multiprocessor Free)",
+        "snmp",
+        None,
+        None,
+    );
+    assert_eq!(s.os_hint.as_deref(), Some("Windows 6.3"));
+    let s = r.check(
+        "snmp-v2c",
+        b"Linux gw01 5.15.0-91-generic #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023 x86_64",
+        "snmp",
+        None,
+        None,
+    );
+    assert_eq!(s.os_hint.as_deref(), Some("Linux 5.15.0-91-generic"));
+    let s = r.check(
+        "snmp-v2c",
+        b"FreeBSD fw.example.test 13.2-RELEASE-p4 FreeBSD 13.2-RELEASE-p4 amd64",
+        "snmp",
+        None,
+        None,
+    );
+    assert_eq!(s.os_hint.as_deref(), Some("FreeBSD 13.2-RELEASE-p4"));
+    r.check(
+        "ssdp",
+        b"HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\nST: upnp:rootdevice\r\nUSN: uuid:5a1c0e2b::upnp:rootdevice\r\nEXT:\r\nSERVER: AsusWRT/386 UPnP/1.1 MiniUPnPd/2.2.0\r\nLOCATION: http://192.0.2.1:5431/rootDesc.xml\r\n\r\n",
+        "upnp",
+        Some("MiniUPnPd"),
+        Some("2.2.0"),
+    );
+    r.check(
+        "ssdp",
+        b"HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\nServer: Linux/3.10.104, UPnP/1.0, Portable SDK for UPnP devices/1.6.22\r\n\r\n",
+        "upnp",
+        Some("libupnp"),
+        Some("1.6.22"),
+    );
+    let s = r.check(
+        "ssdp",
+        b"HTTP/1.1 200 OK\r\nST: ssdp:all\r\nSERVER: Microsoft-Windows/10.0 UPnP/1.0 UPnP-Device-Host/1.0\r\n\r\n",
+        "upnp",
+        None,
+        None,
+    );
+    assert_eq!(
+        s.info.as_deref(),
+        Some("Microsoft-Windows/10.0 UPnP/1.0 UPnP-Device-Host/1.0")
+    );
+    r.check(
+        "ssdp",
+        b"HTTP/1.1 200 OK\r\nST: ssdp:all\r\n\r\n",
+        "upnp",
+        None,
+        None,
+    );
+
     // ------------------------------------------------------ coverage ---
     let all: BTreeSet<usize> = r.db.rules().map(|rule| rule.id).collect();
     let missing: Vec<usize> =
@@ -783,7 +929,10 @@ fn detected_products_have_cpes() {
     let without_cpe = [
         "Apache Tomcat Coyote",
         "Microsoft HTTPAPI httpd",
-        "$1", // products taken from the response itself
+        "Microsoft DNS", // reports the Windows build
+        "Cisco IOS",     // an OS, and the table makes application CPEs
+        "Knot DNS",      // NVD naming not confirmed yet
+        "$1",            // products taken from the response itself
     ];
     let known: BTreeSet<&str> = crate::cpe::known_products().collect();
     let db = Database::parse(crate::db::BUILTIN).unwrap();

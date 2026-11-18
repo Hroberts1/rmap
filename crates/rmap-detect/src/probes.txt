@@ -374,3 +374,128 @@ probe generic-lines
   wait     3s
   generic
   fallback banner http-get rtsp-options sip-options
+
+# =================================================================== UDP ===
+# A UDP probe sends one datagram and reads the first reply. Replies to the
+# `@` payloads below, except ssdp-search, are binary and decoded in code
+# (crates/rmap-detect/src/udp.rs); their rules match the text the decoder
+# pulled out (a version.bind string, NTP system variables, an SNMP
+# sysDescr), not the raw datagram. A probe with no rules still identifies
+# the protocol from the decoded reply.
+
+# ------------------------------------------------------------------- dns ---
+probe dns-version
+  protocol udp
+  send     @dns-version-bind
+  ports    53
+  wait     2s
+
+match dns ^dnsmasq-([\d.]+)
+  product  dnsmasq
+  version  $1
+match dns ^(9\.\d+\.\d+)(?:-([PS]\d+))?
+  product  ISC BIND
+  version  $1 $2
+match dns ^unbound ([\d.]+)
+  product  Unbound
+  version  $1
+match dns ^PowerDNS Recursor ([\d.]+)
+  product  PowerDNS Recursor
+  version  $1
+match dns ^PowerDNS Authoritative Server ([\d.]+)
+  product  PowerDNS Authoritative Server
+  version  $1
+match dns ^Knot DNS ([\d.]+)
+  product  Knot DNS
+  version  $1
+match dns ^Microsoft DNS ([\d.]+)
+  product  Microsoft DNS
+  version  $1
+  os       Windows
+
+# ------------------------------------------------------------------ mdns ---
+probe mdns
+  protocol udp
+  send     @mdns-services
+  ports    5353
+  wait     2s
+
+# ------------------------------------------------------------------- ntp ---
+# Mode 6 first: ntpd reports its version there unless `noquery` is set. It
+# is usually ignored, and then the mode 3 client request still finds NTP.
+probe ntp-readvar
+  protocol udp
+  send     @ntp-readvar
+  ports    123
+  wait     2s
+
+match ntp version="ntpd ntpsec-([\d.]+)
+  product  NTPsec
+  version  $1
+match ntp version="ntpd ([\d.]+(?:p\d+)?)[^"]*"[\s\S]*?system="([^"]+)"
+  product  ntpd
+  version  $1
+  os       $2
+match ntp version="ntpd ([\d.]+(?:p\d+)?)
+  product  ntpd
+  version  $1
+
+probe ntp-client
+  protocol udp
+  send     @ntp-client
+  ports    123
+  wait     2s
+
+# ------------------------------------------------------------------ snmp ---
+# GetRequest sysDescr.0 with community "public": an answer means the agent
+# accepts that community. See README.md before scanning networks you don't
+# run: some monitoring treats community guessing as an attack.
+probe snmp-v2c
+  protocol udp
+  send     @snmp-v2c-get
+  ports    161
+  wait     2s
+
+match snmp ^Cisco IOS Software,[^\r\n]*?Version ([\w.()]+)
+  product  Cisco IOS
+  version  $1
+  os       Cisco IOS
+match snmp ^Hardware:[^\r\n]*?Software: Windows Version ([\d.]+)
+  os       Windows $1
+match snmp ^Linux \S+ (\d+\.\d+[\w.-]*)
+  os       Linux $1
+match snmp ^FreeBSD \S+ (\d+\.\d+-\S+)
+  os       FreeBSD $1
+
+probe snmp-v1
+  protocol udp
+  send     @snmp-v1-get
+  ports    161
+  wait     2s
+  fallback snmp-v2c
+
+# --------------------------------------------------------------- netbios ---
+probe netbios-status
+  protocol udp
+  send     @netbios-status
+  ports    137
+  wait     2s
+
+# ------------------------------------------------------------------ ssdp ---
+probe ssdp
+  protocol udp
+  send     @ssdp-search
+  ports    1900
+  wait     3s
+
+match upnp (?i)^HTTP/1\.1 200[\s\S]*?\r\nSERVER:[^\r\n]*MiniUPnPd/([\d.]+)
+  product  MiniUPnPd
+  version  $1
+match upnp (?i)^HTTP/1\.1 200[\s\S]*?\r\nSERVER:[^\r\n]*Portable SDK for UPnP devices/([\d.]+)
+  product  libupnp
+  version  $1
+match upnp (?i)^HTTP/1\.1 200[\s\S]*?\r\nSERVER: *([^\r\n]+)
+  info     $1
+  confidence 8
+match upnp (?i)^HTTP/1\.1 200
+  confidence 7

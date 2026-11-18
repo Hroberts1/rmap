@@ -19,7 +19,6 @@
 //! shows up in the summary even when it isn't logged line by line.
 
 mod backend;
-pub mod payloads;
 pub mod rate;
 pub mod raw;
 mod service;
@@ -481,17 +480,30 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                         result.rtt
                     );
                     let open = result.state == PortState::Open;
-                    let _ = sh.tx.send(ScanEvent::Port { ip, result });
-                    if let Some(services) = sh.services.as_ref().filter(|_| open) {
-                        // Free the probe slot first so detection (and any
-                        // vuln lookup after it) can't hold up the port scan.
-                        drop(slot);
-                        if let Some(service) =
-                            services.identify(ip, port, Protocol::Tcp, &sh.tx).await
-                            && let Some(vulns) = sh.vulns.as_ref()
-                        {
-                            vulns.check(ip, Protocol::Tcp, port, &service.cpes, &sh.tx);
+                    let protocol = result.protocol;
+                    // Free the probe slot before detection so it (and any
+                    // vuln lookup after it) can't hold up the port scan.
+                    let service = match sh.services.as_ref() {
+                        // A UDP reply can upgrade open|filtered to open, so
+                        // detection runs first and sends the Port event.
+                        Some(services) if protocol == Protocol::Udp => {
+                            drop(slot);
+                            services.identify_udp(ip, result, &sh.tx).await
                         }
+                        Some(services) if open => {
+                            let _ = sh.tx.send(ScanEvent::Port { ip, result });
+                            drop(slot);
+                            services.identify(ip, port, protocol, &sh.tx).await
+                        }
+                        _ => {
+                            let _ = sh.tx.send(ScanEvent::Port { ip, result });
+                            None
+                        }
+                    };
+                    if let Some(service) = service
+                        && let Some(vulns) = sh.vulns.as_ref()
+                    {
+                        vulns.check(ip, protocol, port, &service.cpes, &sh.tx);
                     }
                 }
                 PortState::Closed => {

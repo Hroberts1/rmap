@@ -68,6 +68,16 @@ pub enum Builtin {
     SmbNegotiate,
     /// MongoDB `buildInfo` command in an OP_MSG.
     MongoBuildInfo,
+    // UDP requests (see [`crate::udp`]). All but SSDP have binary replies,
+    // decoded in code; match rules then read any text the decoder found.
+    DnsVersionBind,
+    MdnsServices,
+    NtpReadvar,
+    NtpClient,
+    SnmpV2c,
+    SnmpV1,
+    NetbiosStatus,
+    SsdpSearch,
 }
 
 impl Builtin {
@@ -76,6 +86,14 @@ impl Builtin {
             "tls-client-hello" => Builtin::TlsClientHello,
             "smb-negotiate" => Builtin::SmbNegotiate,
             "mongodb-buildinfo" => Builtin::MongoBuildInfo,
+            "dns-version-bind" => Builtin::DnsVersionBind,
+            "mdns-services" => Builtin::MdnsServices,
+            "ntp-readvar" => Builtin::NtpReadvar,
+            "ntp-client" => Builtin::NtpClient,
+            "snmp-v2c-get" => Builtin::SnmpV2c,
+            "snmp-v1-get" => Builtin::SnmpV1,
+            "netbios-status" => Builtin::NetbiosStatus,
+            "ssdp-search" => Builtin::SsdpSearch,
             _ => return None,
         })
     }
