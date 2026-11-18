@@ -22,6 +22,7 @@ use super::sys::{self, Interface};
 use crate::Stats;
 use crate::payloads::udp_payload;
 use crate::rate::RateLimiter;
+use crate::rtt::HostRtt;
 
 type PortKey = (Ipv4Addr, u16, Protocol);
 
@@ -269,6 +270,7 @@ impl RawScanner {
         port: u16,
         timing: &Timing,
         stats: &Stats,
+        host_rtt: &HostRtt,
     ) -> PortResult {
         let (protocol, silent) = match self.scan_type {
             ScanType::Udp => (Protocol::Udp, PortState::OpenFiltered),
@@ -295,17 +297,24 @@ impl RawScanner {
                     return PortResult::new(port, protocol, PortState::Filtered, None);
                 }
             };
+            let limit = host_rtt.timeout(timing, try_no);
             rmap_log::trace!(
-                "sent {}/{} probe {src} -> {dst}:{port} try={try_no}",
+                "sent {}/{} probe {src} -> {dst}:{port} try={try_no} limit={limit:?}",
                 protocol.as_str(),
                 self.scan_type.label()
             );
-            if let Ok(Ok(reply)) = timeout(timing.connect_timeout, reply).await {
+            if let Ok(Ok(reply)) = timeout(limit, reply).await {
                 let state = match protocol {
                     Protocol::Tcp => tcp_state(reply),
                     Protocol::Udp => udp_state(reply),
                 };
-                return PortResult::new(port, protocol, state, Some(sent.elapsed()));
+                let rtt = sent.elapsed();
+                // Karn's rule: after a retry the reply may answer an earlier
+                // probe, so only first attempts are measured.
+                if try_no == 0 {
+                    host_rtt.sample(rtt);
+                }
+                return PortResult::new(port, protocol, state, Some(rtt));
             }
         }
         PortResult::new(port, protocol, silent, None)

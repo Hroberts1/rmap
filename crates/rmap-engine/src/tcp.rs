@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
 use crate::Stats;
+use crate::rtt::HostRtt;
 
 /// Ports tried during unprivileged host discovery. A host counts as up if
 /// any of them accepts or actively refuses a connection.
@@ -64,14 +65,32 @@ async fn attempt(ip: IpAddr, port: u16, limit: Duration, stats: &Stats) -> Outco
     }
 }
 
-/// Probe one port, retrying timeouts as the timing template allows.
-pub async fn probe(ip: IpAddr, port: u16, timing: &Timing, stats: &Stats) -> PortResult {
+/// Whether connect round trips reflect the wire. Windows retries a refused
+/// SYN internally and reports the refusal about two seconds later, so its
+/// "RTTs" are not network RTTs and adapted timeouts would turn closed ports
+/// filtered. Connect probes there keep the fixed template timeout.
+const ADAPTIVE_CONNECT: bool = !cfg!(windows);
+
+/// Probe one port, retrying timeouts as the timing template allows. Waits
+/// as long as the host's RTT estimate says, and feeds answers back to it.
+pub async fn probe(
+    ip: IpAddr,
+    port: u16,
+    timing: &Timing,
+    stats: &Stats,
+    host_rtt: &HostRtt,
+) -> PortResult {
     for try_no in 0..=timing.retries {
         if !timing.scan_delay.is_zero() {
             sleep(timing.scan_delay).await;
         }
-        let outcome = attempt(ip, port, timing.connect_timeout, stats).await;
-        rmap_log::trace!("probe {ip}:{port} try={try_no} outcome={outcome:?}");
+        let limit = if ADAPTIVE_CONNECT {
+            host_rtt.timeout(timing, try_no)
+        } else {
+            timing.connect_timeout
+        };
+        let outcome = attempt(ip, port, limit, stats).await;
+        rmap_log::trace!("probe {ip}:{port} try={try_no} limit={limit:?} outcome={outcome:?}");
         let (state, rtt) = match outcome {
             Outcome::Open(rtt) => (PortState::Open, Some(rtt)),
             Outcome::Refused(rtt) => (PortState::Closed, Some(rtt)),
@@ -81,6 +100,10 @@ pub async fn probe(ip: IpAddr, port: u16, timing: &Timing, stats: &Stats) -> Por
             }
             Outcome::TimedOut => continue,
         };
+        // Each attempt is a fresh connection, so its RTT is unambiguous.
+        if let (true, Some(rtt)) = (ADAPTIVE_CONNECT, rtt) {
+            host_rtt.sample(rtt);
+        }
         return PortResult::new(port, Protocol::Tcp, state, rtt);
     }
     PortResult::new(port, Protocol::Tcp, PortState::Filtered, None)

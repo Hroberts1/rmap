@@ -22,6 +22,7 @@ mod backend;
 pub mod payloads;
 pub mod rate;
 pub mod raw;
+pub mod rtt;
 mod service;
 pub mod tcp;
 pub mod udp;
@@ -453,6 +454,11 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         return;
     }
 
+    let host_rtt = Arc::new(rtt::HostRtt::seeded(rtt));
+    rmap_log::debug!(
+        "host {ip} probe timeout starts at {:?}",
+        host_rtt.timeout(&shared.timing, 0)
+    );
     let closed = Arc::new(AtomicU32::new(0));
     let filtered = Arc::new(AtomicU32::new(0));
     let mut probes = JoinSet::new();
@@ -467,9 +473,11 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
             .forget();
         let slot = ProbeSlot(shared.clone());
         let (sh, closed, filtered) = (shared.clone(), closed.clone(), filtered.clone());
-        let prober = prober.clone();
+        let (prober, host_rtt) = (prober.clone(), host_rtt.clone());
         probes.spawn(async move {
-            let result = prober.probe(ip, port, &sh.timing, &sh.stats).await;
+            let result = prober
+                .probe(ip, port, &sh.timing, &sh.stats, &host_rtt)
+                .await;
             sh.progress.completed.fetch_add(1, Ordering::Relaxed);
             match result.state {
                 PortState::Open | PortState::OpenFiltered => {
@@ -521,7 +529,12 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
         filtered.load(Ordering::Relaxed),
     );
     let elapsed = started.elapsed();
-    rmap_log::debug!("host {ip} done in {elapsed:?}: closed={closed} filtered={filtered}");
+    let est = host_rtt.snapshot();
+    rmap_log::debug!(
+        "host {ip} done in {elapsed:?}: closed={closed} filtered={filtered} srtt={:?} timeout={:?}",
+        est.srtt(),
+        est.timeout(&shared.timing, 0)
+    );
     let _ = shared.tx.send(ScanEvent::HostDone {
         ip,
         closed,

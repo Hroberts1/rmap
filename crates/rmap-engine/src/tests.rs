@@ -787,3 +787,88 @@ async fn stop_cancels_service_detection() {
         "{rest:?}"
     );
 }
+
+// ---------------------------------------------------- adaptive timeouts ---
+
+/// A 1 s template timeout with one retry, and a 100 ms floor once the
+/// host's RTT is known.
+fn adaptive_timing() -> Timing {
+    Timing {
+        connect_timeout: Duration::from_secs(1),
+        min_rtt_timeout: Duration::from_millis(100),
+        max_rtt_timeout: Duration::from_secs(2),
+        retries: 1,
+        ..Timing::template(4)
+    }
+}
+
+/// Probe 16 ports of an unroutable address at once, sharing `host_rtt`,
+/// and time how long until all are given up on.
+async fn time_unanswered(udp: bool, host_rtt: Arc<rtt::HostRtt>) -> Duration {
+    let ip: IpAddr = "192.0.2.1".parse().unwrap();
+    let started = Instant::now();
+    let mut probes = JoinSet::new();
+    for port in 1..=16 {
+        let host_rtt = host_rtt.clone();
+        probes.spawn(async move {
+            let (t, s) = (adaptive_timing(), Stats::default());
+            let result = if udp {
+                udp::probe(ip, port, &t, &s, &host_rtt).await
+            } else {
+                tcp::probe(ip, port, &t, &s, &host_rtt).await
+            };
+            assert_ne!(result.state, PortState::Open);
+        });
+    }
+    while let Some(r) = probes.join_next().await {
+        r.unwrap();
+    }
+    started.elapsed()
+}
+
+/// Times unanswered probes with no RTT estimate (the fixed template
+/// timeout: 1 s + 1 s) and with one warmed up on loopback (100 + 200 ms).
+async fn check_adaptive_is_faster(udp: bool, warmed: rtt::HostRtt) {
+    assert!(
+        warmed.snapshot().srtt().is_some(),
+        "warm-up measured nothing"
+    );
+    let (fixed, adaptive) = tokio::join!(
+        time_unanswered(udp, Arc::new(rtt::HostRtt::default())),
+        time_unanswered(udp, Arc::new(warmed)),
+    );
+    if fixed < Duration::from_millis(1500) {
+        // This machine fails 192.0.2.1 fast (no route), so nothing waits.
+        eprintln!("skipping: unroutable probes failed fast ({fixed:?})");
+        return;
+    }
+    assert!(
+        adaptive * 3 < fixed,
+        "adaptive {adaptive:?} should be well under fixed {fixed:?}"
+    );
+}
+
+// Windows reports connect results after OS-internal retries, so the connect
+// backend keeps fixed timeouts there (see `tcp::ADAPTIVE_CONNECT`).
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_timeouts_give_up_on_silent_tcp_ports_sooner() {
+    let port = listener().await;
+    let warmed = rtt::HostRtt::default();
+    for _ in 0..10 {
+        let r = tcp::probe(LO, port, &patient(), &Stats::default(), &warmed).await;
+        assert_eq!(r.state, PortState::Open);
+    }
+    check_adaptive_is_faster(false, warmed).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adaptive_timeouts_give_up_on_silent_udp_ports_sooner() {
+    let port = udp_echo().await;
+    let warmed = rtt::HostRtt::default();
+    for _ in 0..10 {
+        let r = udp::probe(LO, port, &udp_timing(), &Stats::default(), &warmed).await;
+        assert_eq!(r.state, PortState::Open);
+    }
+    check_adaptive_is_faster(true, warmed).await;
+}
