@@ -12,6 +12,7 @@ use rmap_report::{ReportBuilder, ScanStore, unix_millis_now};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::error::TryRecvError;
 
+use crate::filter::SortOrder;
 use crate::input::{TextInput, paste_as_list};
 use crate::report::{Dialog, DiffView};
 
@@ -147,6 +148,10 @@ pub struct ScanView {
     /// First table row drawn in the port pane; kept by the renderer so the
     /// view only scrolls when the selection would leave it.
     pub port_offset: usize,
+    /// Host list filter text (`/`), and whether it has keyboard focus.
+    pub filter: TextInput,
+    pub filtering: bool,
+    pub sort: SortOrder,
 }
 
 impl ScanView {
@@ -158,13 +163,32 @@ impl ScanView {
         self.finished.unwrap_or_else(|| self.started.elapsed())
     }
 
-    /// Hosts shown in the list, in address order.
+    /// Hosts shown in the list, filtered and in the chosen sort order.
     pub fn visible(&self) -> Vec<IpAddr> {
-        self.hosts
+        let mut ips: Vec<IpAddr> = self
+            .hosts
             .iter()
             .filter(|(_, h)| self.show_down || h.state != HostState::Down)
+            .filter(|(ip, h)| crate::filter::matches(**ip, h, &self.filter))
             .map(|(ip, _)| *ip)
-            .collect()
+            .collect();
+        crate::filter::sort(&mut ips, &self.hosts, self.sort);
+        ips
+    }
+
+    /// After the filter or sort changes: keep the selected host if it is
+    /// still listed, else select the first row (or nothing).
+    pub(crate) fn keep_selection(&mut self) {
+        let visible = self.visible();
+        let keep = self
+            .selected
+            .filter(|s| visible.contains(s))
+            .or(visible.first().copied());
+        if keep != self.selected {
+            self.selected = keep;
+            self.port_selected = 0;
+            self.port_offset = 0;
+        }
     }
 
     pub fn count(&self, state: HostState) -> usize {
@@ -242,7 +266,8 @@ impl ScanView {
                         done: state == HostState::Down,
                     },
                 );
-                if self.selected.is_none() && state != HostState::Down {
+                // With a filter on, drain_events picks the first match instead.
+                if self.selected.is_none() && state != HostState::Down && self.filter.is_empty() {
                     self.selected = Some(ip);
                 }
             }
@@ -395,6 +420,9 @@ impl App {
                 }
             }
         }
+        if view.selected.is_none() {
+            view.keep_selection();
+        }
         self.autosave_if_done();
     }
 
@@ -439,6 +467,15 @@ impl App {
         if let Some(Dialog::Export(d)) = self.dialog.as_mut() {
             d.path.push_str(pasted.lines().next().unwrap_or("").trim());
             d.status = None;
+            return;
+        }
+        if let Some(view) = self.scan.as_mut()
+            && view.filtering
+            && matches!(self.screen, Screen::Results)
+        {
+            view.filter
+                .insert_str(pasted.lines().next().unwrap_or("").trim());
+            view.keep_selection();
             return;
         }
         if !matches!(self.screen, Screen::Setup) || self.dialog.is_some() {
@@ -559,7 +596,34 @@ impl App {
             self.screen = Screen::Setup;
             return;
         };
+        if view.filtering {
+            match key.code {
+                KeyCode::Enter => view.filtering = false,
+                KeyCode::Esc => {
+                    view.filter.clear();
+                    view.filtering = false;
+                }
+                _ => {
+                    view.filter.handle_key(&key);
+                }
+            }
+            view.keep_selection();
+            return;
+        }
         match key.code {
+            KeyCode::Char('/') => {
+                view.filtering = true;
+                view.focus = Pane::Hosts;
+            }
+            KeyCode::Char('o') => {
+                view.sort = view.sort.next();
+                view.keep_selection();
+            }
+            // Esc clears an active filter before it means "new scan".
+            KeyCode::Esc if !view.filter.is_empty() => {
+                view.filter.clear();
+                view.keep_selection();
+            }
             KeyCode::Char('q') => {
                 if view.is_running() {
                     self.confirm = Some(Confirm::QuitRunning);
@@ -590,7 +654,10 @@ impl App {
                 view.stopped = true;
                 view.log("scan stopped".into());
             }
-            KeyCode::Char('d') => view.show_down = !view.show_down,
+            KeyCode::Char('d') => {
+                view.show_down = !view.show_down;
+                view.keep_selection();
+            }
             KeyCode::Char('e') => self.open_export(),
             KeyCode::Char('c') => self.open_compare(),
             KeyCode::Down | KeyCode::Char('j') => view.move_focused(1),
@@ -686,6 +753,9 @@ impl App {
             focus: Pane::Hosts,
             port_selected: 0,
             port_offset: 0,
+            filter: TextInput::default(),
+            filtering: false,
+            sort: SortOrder::default(),
         });
         self.screen = Screen::Results;
     }
@@ -1399,6 +1469,86 @@ mod tests {
         app.form.focus = Field::Services;
         press(&mut app, KeyCode::Char(' '));
         assert!(!app.form.vuln_matching && !app.form.service_detection);
+    }
+
+    #[test]
+    fn filter_narrows_hosts_and_keeps_selection_valid() {
+        let (_rt, mut app) = app();
+        let nas = nas_host(&mut app);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        press(&mut app, KeyCode::Tab); // focus ports, select the last one
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "SMB");
+        let view = app.scan.as_ref().unwrap();
+        assert_eq!(view.visible(), [nas], "only the host with 445 open");
+        assert_eq!((view.focus, view.selected), (Pane::Hosts, Some(nas)));
+        assert_eq!(view.port_selected, 4, "same host, port selection kept");
+        for (w, h) in [(80, 24), (120, 32)] {
+            let screen = render(&mut app, w, h);
+            assert!(screen.contains("filter: /SMB"), "{w}x{h}:\n{screen}");
+            assert!(screen.contains("1 of 3"), "{w}x{h}:\n{screen}");
+            if std::env::var_os("RMAP_SHOW_RENDER").is_some() {
+                println!("{screen}");
+            }
+        }
+        // Keys type into the filter while it has focus, even q and n.
+        type_text(&mut app, "qn");
+        assert!(!app.should_quit() && matches!(app.screen, Screen::Results));
+        let view = app.scan.as_ref().unwrap();
+        assert!(view.visible().is_empty());
+        assert_eq!(view.selected, None, "nothing listed, nothing selected");
+        assert!(render(&mut app, 80, 24).contains("no hosts match"));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_paste("10.0.0.3\nignored");
+        press(&mut app, KeyCode::Enter);
+        let view = app.scan.as_ref().unwrap();
+        assert!(!view.filtering && view.filter == "10.0.0.3");
+        assert_eq!(view.visible(), [ip("10.0.0.3")]);
+        assert_eq!(
+            (view.selected, view.port_selected),
+            (Some(ip("10.0.0.3")), 0)
+        );
+        // Esc on the list clears the filter instead of leaving the results.
+        press(&mut app, KeyCode::Esc);
+        let view = app.scan.as_ref().unwrap();
+        assert!(view.filter.is_empty() && matches!(app.screen, Screen::Results));
+        assert_eq!(view.visible().len(), 3);
+        assert_eq!(
+            view.selected,
+            Some(ip("10.0.0.3")),
+            "kept when still listed"
+        );
+        // Esc while typing clears too.
+        press(&mut app, KeyCode::Char('/'));
+        type_text(&mut app, "nas");
+        press(&mut app, KeyCode::Esc);
+        let view = app.scan.as_ref().unwrap();
+        assert!(!view.filtering && view.filter.is_empty());
+        for (w, h) in [(20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn o_cycles_sort_and_shows_it() {
+        let (_rt, mut app) = app();
+        let nas = nas_host(&mut app);
+        assert!(render(&mut app, 80, 24).contains("by ip"));
+        press(&mut app, KeyCode::Char('o'));
+        let view = app.scan.as_ref().unwrap();
+        assert_eq!(view.visible()[0], nas, "most open ports first");
+        assert_eq!(view.selected, Some(nas));
+        assert!(render(&mut app, 120, 32).contains("by ports"));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(
+            app.scan.as_ref().unwrap().visible()[0],
+            nas,
+            "worst CVE first"
+        );
+        assert!(render(&mut app, 80, 24).contains("by cves"));
+        press(&mut app, KeyCode::Char('o'));
+        assert_eq!(app.scan.as_ref().unwrap().sort, SortOrder::Ip);
     }
 
     #[test]
