@@ -14,6 +14,7 @@ mod report;
 mod report_ui;
 mod tabs;
 mod theme;
+mod rescan;
 mod ui;
 
 use std::io::{self, Stdout};

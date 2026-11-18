@@ -19,7 +19,7 @@ use crate::input::{TextInput, paste_as_list};
 use crate::report::{Dialog, DiffView};
 
 /// Most engine events handled per frame, so a burst can't stall input.
-const EVENTS_PER_FRAME: usize = 5_000;
+pub(crate) const EVENTS_PER_FRAME: usize = 5_000;
 const MAX_LOG_LINES: usize = 200;
 /// Marks engine warnings in the log panel, which draws them highlighted.
 pub const WARNING_PREFIX: &str = "warning: ";
@@ -171,6 +171,8 @@ pub struct ScanView {
     pub filter: TextInput,
     pub filtering: bool,
     pub sort: SortOrder,
+    /// Re-scan of one host (`r`), run after the main scan ends.
+    pub rescan: Option<crate::rescan::Rescan>,
 }
 
 impl ScanView {
@@ -376,7 +378,7 @@ pub enum Screen {
 }
 
 pub struct App {
-    rt: Handle,
+    pub(crate) rt: Handle,
     pub screen: Screen,
     pub form: Form,
     pub scan: Option<ScanView>,
@@ -447,6 +449,7 @@ impl App {
         if view.selected.is_none() {
             view.keep_selection();
         }
+        view.drain_rescan();
         self.autosave_if_done();
     }
 
@@ -546,7 +549,12 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some((config, _)) = self.pending.take() {
                     rmap_log::info!("user confirmed scanning public addresses");
-                    self.launch(config);
+                    // Only a rescan asks from the results screen.
+                    if matches!(self.screen, Screen::Results) {
+                        self.start_rescan(config);
+                    } else {
+                        self.launch(config);
+                    }
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -697,6 +705,8 @@ impl App {
                 view.show_down = !view.show_down;
                 view.keep_selection();
             }
+            KeyCode::Char('s') if view.rescan.is_some() => view.stop_rescan(),
+            KeyCode::Char('r') => self.request_rescan(),
             KeyCode::Char('e') => self.open_export(),
             KeyCode::Char('c') => self.open_compare(),
             KeyCode::Down | KeyCode::Char('j') => view.move_focused(1),
@@ -830,6 +840,7 @@ impl App {
             filter: TextInput::default(),
             filtering: false,
             sort: SortOrder::default(),
+            rescan: None,
         });
         self.screen = Screen::Results;
     }
