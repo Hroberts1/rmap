@@ -103,6 +103,12 @@ Fill in the setup form and press **Enter**:
 | Discovery | Probe hosts first and skip the ones that don't answer |
 | Services | Identify the software and version behind each open port |
 | Vulns | Flag potential CVEs for identified services (needs Services on too) |
+| Exclude | Addresses never to probe, same syntax as Targets - for fragile gear such as PLCs, SCADA controllers and medical devices |
+| Max rate | Probes per second, or empty for unlimited - for networks with fragile devices that fall over under load |
+
+Press `Ctrl-S` to save the current form (everything except Targets) as a named profile, `Ctrl-P` to load or delete a saved one, and `Ctrl-R` to pick from the last 10 target strings that started a scan. Both persist as JSON next to the saved scans (see below); a missing or unreadable file falls back to the defaults with a warning.
+
+Mouse support (`m` on the results screen toggles it) lets you click a host or port to select it, click a setup-form field to focus it, and scroll the host or port pane with the wheel. Turn it off to select and copy text with your terminal's own mouse handling instead - rmap's own `y`/`Y` (below) cover the common case of copying an address or CVE IDs without needing the mouse at all.
 
 ### Privileged scans (SYN, UDP, ICMP/ARP discovery)
 
@@ -116,7 +122,54 @@ sudo setcap cap_net_raw+ep target/release/rmap
 
 (`setcap` has to be repeated after every rebuild.) Without raw sockets, or on Windows and macOS, rmap still runs the scan and prints a warning in the log panel saying what it fell back to: a SYN scan becomes a TCP connect scan, a UDP scan uses ordinary connected UDP sockets, and discovery uses the TCP connect ping. The raw backend covers IPv4 and IPv6 (Linux 4.5 or later for IPv6). IPv6 packets are built by rmap but routed by the kernel, which also does neighbour discovery, so there is no IPv6 equivalent of the ARP ping: discovery uses ICMPv6 echo raced against the TCP connect ping. IPv6 targets fall back to unprivileged probes (with a warning) when the host has no IPv6, for link-local addresses (zone IDs like `fe80::1%eth0` aren't accepted yet) and for IPv4-mapped addresses.
 
-Results keys: `↑↓`/`jk` select a host · `d` show/hide down hosts · `s` stop · `e` export · `c` compare with a saved scan · `n` new scan · `q` quit.
+### Results screen keys
+
+| Keys | Does |
+|---|---|
+| `↑↓` `j` `k` | Move in the focused pane |
+| `PgUp` `PgDn` | Move by 10 |
+| `Home` `End` `g` `G` | First / last |
+| `Tab` `←` `→` `h` `l` | Switch between the hosts pane and the ports pane |
+| `1` `2` `3` | Hosts / Services / Vulns tab (below) |
+| `d` | Show or hide down hosts |
+| `/` | Filter the host list (below) |
+| `o` | Cycle sort order (below) |
+| `s` | Stop the scan, or stop a rescan in progress |
+| `r` | Rescan the selected host: every port, with service detection and vuln matching on (below) |
+| `e` | Export |
+| `c` | Compare with a saved scan |
+| `L` | Full-screen scrollable log |
+| `y` / `Y` | Copy the selected address (or `ip:port`) / the selected host's CVE IDs (below) |
+| `m` | Toggle mouse capture on/off - off lets the terminal's own text selection work |
+| `n` / `Esc` | New scan |
+| `q` / `Ctrl-C` | Quit (asks first on a running scan) / quit immediately |
+| `?` | This list, as an overlay |
+
+`n`, `Esc` and `q` ask **y/n** first if a scan is still running, so a stray keypress can't lose it; `Esc` on the setup form does too, once you've typed anything. `open?` in the port table means `open|filtered` (no reply; may be open), and a `!` by a host means it has at least one potential CVE.
+
+### Tabs: Hosts, Services, Vulns
+
+`1` (Hosts, the default) shows one host at a time with its ports, as described above. `2` (Services) groups every open port across the whole scan by port and protocol - "which hosts have 445 open?" - with the service name and a count. `3` (Vulns) lists every potential finding in the scan, worst severity first, host and port alongside each one. Both rebuild from the live results every frame, so they fill in as the scan runs, and arrow keys move through whichever group or finding is selected.
+
+### Filtering and sorting the host list
+
+`/` filters the host list to addresses, hostnames, an open port's service name or product, or an exact open port number - case-insensitive, substring match except the port number. `o` cycles the sort order: by address (default), by open-port count (most first), or by worst potential CVE (severity, then CVSS score). Both apply only to the Hosts tab's list; Services and Vulns have their own grouping.
+
+### Rescanning one host
+
+`r` on a host re-scans just that one address, every port (1-65535), with service detection and vulnerability matching on regardless of the main scan's settings - it keeps the original scan's type, timing and rate cap. Only one rescan runs at a time, and only once the main scan has finished. Its results replace that host's row when it completes; stopping it (`s`) or a failure leaves the earlier results exactly as they were, so a partial rescan never hides ports the first pass already found. The scan is auto-saved again afterward as a new file - the original stays on disk as a comparison baseline.
+
+### Copying to the clipboard
+
+`y` copies the selected host's address (or `ip:port` when the ports pane is focused); `Y` copies that host's CVE IDs. This uses the terminal's OSC 52 escape sequence, not a clipboard library - supported by most modern terminals (Windows Terminal, iTerm2, kitty, WezTerm, Alacritty, foot, xterm with `allowWindowOps`), though some disable it or ask first, in which case nothing visibly happens. Inside tmux it needs `set -g allow-passthrough on` (or `set-clipboard on`); GNU screen isn't supported. Copies over 8 KiB are refused rather than silently truncated.
+
+### Colors
+
+Set `NO_COLOR` (non-empty, per [no-color.org](https://no-color.org)) to draw every frame without foreground or background colors - bold, dim and reversed still apply, so the selected row and key labels still stand out. Useful over a monochrome connection or for screen readers.
+
+## Scan profiles and recent targets
+
+A profile is every setup-form field except Targets. Three are built in (quick TCP connect, a full service-and-vuln scan, and a fast SYN sweep); save your own with `Ctrl-S`, pick one with `Ctrl-P` (`Delete` or `d` removes a saved one - the built-ins can't be deleted), and pick from your last 10 target strings with `Ctrl-R`. Both lists persist as `profiles.json` and `recent.json` next to the saved scans (see below); a missing or unreadable file falls back to the defaults with a warning, and a corrupt one is moved aside so the next save can't silently destroy it.
 
 ## Saved scans, export and comparing
 
@@ -158,6 +211,7 @@ crates/
 ├── rmap-engine   async scan engine (tokio)
 ├── rmap-detect   service detection: probes, matcher, TLS, CPEs
 ├── rmap-log      local log files and crash reports (no dependencies)
+├── rmap-oui      MAC address vendor lookup, hand-written table (no dependencies)
 ├── rmap-packet   Ethernet/ARP/IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 building and parsing (no dependencies)
 ├── rmap-report   scan reports: JSON, Nmap XML, Markdown, CSV and HTML export, saved scans, diffs
 ├── rmap-vuln     vulnerability matching: CPE -> CVE lookup against a local database (no dependencies beyond rmap-core)
@@ -199,6 +253,14 @@ The raw backend (`crates/rmap-engine/src/raw`) sends packets built by `rmap-pack
 UDP probes carry real requests for DNS, NTP, SNMPv1 (`public`, see [UDP detection](#udp-detection)), NetBIOS name service and SSDP, so those services answer instead of staying silent; other ports get an empty datagram. Linux limits how fast it sends ICMP errors, so on fast templates some closed UDP ports can show as open|filtered.
 
 Privileged discovery uses ARP for targets on a directly connected Ethernet subnet (an unanswered ARP request means the host is down) and, elsewhere, ICMP echo raced against the TCP connect ping.
+
+### Adaptive timeouts
+
+Each host keeps a smoothed round-trip time and its variation (SRTT/RTTVAR, as in RFC 6298), updated from every answered probe, so a LAN host that replies in a millisecond isn't waited on for the whole template timeout and a slow WAN host gets longer before its ports are called filtered. The adapted timeout never drops below the template's `min_rtt_timeout` (100-400 ms) - tens to hundreds of times a real LAN RTT, so a scheduling hiccup can't turn an open port filtered - and never rises above `max_rtt_timeout`. T0 and T1 fix both bounds to `connect_timeout`, so paranoid/sneaky timing is unaffected. Unanswered probes never feed the estimate, since a filtered port's timeout says nothing about the path.
+
+### MAC vendor lookup
+
+When ARP discovers a host's hardware address, the host detail pane shows it with the vendor, if known: `mac 00:11:32:aa:bb:cc · Synology`. The table (`crates/rmap-oui`) is small and hand-written - vendors common on small-business and home networks, only prefixes rmap is sure of - not the IEEE registry, so an unlisted prefix means "not in this table," not "unregistered." A locally administered address (randomised Wi-Fi MACs, most VMs and containers) is reported as "random MAC" instead of guessed, since its prefix isn't a real vendor's. A host with no hostname but a recognised vendor shows the vendor name in the host list in its place.
 
 ## Service detection
 
@@ -335,7 +397,7 @@ unshare -rn sh -c 'ip link set lo up && target/debug/deps/rmap_engine-<hash> --i
 ## Roadmap
 
 - [x] **M1: engine + TUI shell.** Target parsing, TCP connect scan, unprivileged discovery, live results.
-- [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. IPv6 SYN and UDP scans and ICMPv6 echo discovery too. (RTT-adaptive timeouts are still to do.)
+- [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. IPv6 SYN and UDP scans and ICMPv6 echo discovery too. RTT-adaptive timeouts, per RFC 6298.
 - [x] **M3: service detection.** rmap's own probe and match database, version strings, TLS certificate names, CPE identifiers.
 - [x] **M4: vulnerability matching.** Offline CPE → CVE lookup against a locally cached, hand-curated starter set of public CVEs, flagged as *potentially* vulnerable to allow for vendor backports.
 - [x] **M5: export and diffing.** JSON and XML export from the TUI, saved scans, and comparing two scans.
