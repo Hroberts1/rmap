@@ -4,7 +4,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use rmap_core::{PortResult, Protocol, VulnSeverity, Vulnerability};
+use rmap_core::{PortResult, Protocol, Service, VulnSeverity, Vulnerability};
 use rmap_log::Timestamp;
 
 use crate::model::{HostReport, ScanReport};
@@ -165,8 +165,11 @@ pub fn version_text(p: &PortResult) -> String {
     parts.join(" ")
 }
 
-pub fn service_name(p: &PortResult) -> &str {
-    p.service.as_ref().map_or("", |s| s.name.as_str())
+/// Service name for people; a port-number guess ends in `?`.
+pub fn service_name(p: &PortResult) -> String {
+    p.service
+        .as_ref()
+        .map_or_else(String::new, Service::display_name)
 }
 
 /// `10.0.0.2 (db.lan)`.

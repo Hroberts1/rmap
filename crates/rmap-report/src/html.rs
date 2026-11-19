@@ -107,7 +107,7 @@ fn write_host(o: &mut String, h: &HostReport) {
             p.port,
             p.protocol.as_str(),
             p.state.as_str(),
-            escape(service_name(p)),
+            escape(&service_name(p)),
             escape(&version_text(p)),
         );
     }

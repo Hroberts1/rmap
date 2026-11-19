@@ -24,6 +24,8 @@ enum Behaviour {
     Tls,
     /// Accept and never say anything.
     Silent,
+    /// Accept and close at once without a word.
+    Close,
 }
 
 async fn serve(behaviour: Behaviour) -> SocketAddr {
@@ -83,6 +85,7 @@ async fn handle(mut s: TcpStream, behaviour: Behaviour) {
         Behaviour::Silent => {
             let _ = tokio::time::timeout(Duration::from_secs(30), s.read(&mut chunk)).await;
         }
+        Behaviour::Close => drop(s),
     }
 }
 
@@ -114,6 +117,7 @@ async fn ssh_banner() {
     assert_eq!(s.method, DetectMethod::Banner);
     assert_eq!(s.cpes, ["cpe:2.3:a:openbsd:openssh:8.9:p1:*:*:*:*:*:*"]);
     assert!(s.confidence >= 8);
+    assert!(!s.is_silent());
 }
 
 #[tokio::test]
@@ -214,9 +218,21 @@ async fn silent_service_falls_back_to_the_port_table_within_budget() {
     assert!(started.elapsed() < crate::budget(&fast) + Duration::from_secs(2));
     assert_eq!(
         (s.name.as_str(), s.method, s.confidence),
-        ("ssh", DetectMethod::PortTable, 3)
+        ("ssh", DetectMethod::PortTable, 1)
     );
+    assert_eq!(s.info.as_deref(), Some(rmap_core::SILENT_INFO));
     assert!(s.cpes.is_empty());
+}
+
+#[tokio::test]
+async fn immediate_close_is_silent() {
+    let addr = serve(Behaviour::Close).await;
+    let s = Detector::builtin()
+        .detect(addr, Protocol::Tcp, &Timing::template(5), 445)
+        .await
+        .unwrap();
+    assert_eq!((s.name.as_str(), s.confidence), ("smb", 1));
+    assert!(s.is_silent());
 }
 
 #[tokio::test]
