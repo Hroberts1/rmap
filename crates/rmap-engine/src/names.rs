@@ -24,9 +24,17 @@ impl Naming {
     /// Settings for a scan, using `dns_server` if the user set one and the
     /// system's resolver otherwise.
     pub fn new(dns_server: Option<IpAddr>, timing: &Timing) -> Self {
-        let dns = dns_server
-            .map(|ip| SocketAddr::new(ip, rmap_names::DNS_PORT))
-            .or_else(rmap_names::system_dns_server);
+        let dns = match dns_server {
+            Some(ip) => {
+                rmap_log::debug!("reverse DNS server {ip} from the setup form");
+                Some(SocketAddr::new(ip, rmap_names::DNS_PORT))
+            }
+            None => {
+                let dns = rmap_names::system_dns_server();
+                rmap_log::debug!("reverse DNS server {dns:?} from the system");
+                dns
+            }
+        };
         Naming {
             dns,
             wait: timing
