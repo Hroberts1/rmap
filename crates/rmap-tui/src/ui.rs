@@ -6,7 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Cell, Clear, LineGauge, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Cell, Clear, LineGauge, Padding, Paragraph, Row, Table, TableState, Wrap,
+};
 use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, Vulnerability, service_name};
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
@@ -50,6 +52,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if let Some((_, public)) = &app.pending {
         draw_public_warning(frame, public);
+    }
+    if let Some(services_turned_on) = app.vuln_popup {
+        draw_vuln_popup(frame, services_turned_on, &mut hits);
     }
     if let Some(confirm) = app.confirm {
         draw_yes_no(frame, confirm);
@@ -302,7 +307,7 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     // Services off it reads as unavailable rather than as a live choice.
     let vulns_check = if app.settings.db.needs_download() {
         let tick = if form.vuln_matching { "[x]" } else { "[ ]" };
-        Span::raw(format!("{tick} no CVE data yet: F2 to download")).dim()
+        Span::raw(format!("{tick} no CVE data yet: F2 to set up")).dim()
     } else if form.vuln_matching {
         Span::raw("[x] flag potential CVEs for identified services")
     } else if form.service_detection {
@@ -1047,7 +1052,7 @@ fn draw_help(frame: &mut Frame) {
         ("L", "full log (scrollable)"),
         ("y Y", "copy IP or ip:port / CVE IDs"),
         ("m", "mouse on/off (off = select text)"),
-        ("S F2", "settings, update CVE data"),
+        ("S F2", "settings, get or refresh CVE data"),
         ("n Esc", "new scan"),
         ("q Ctrl-C", "quit / quit immediately"),
     ];
@@ -1101,6 +1106,52 @@ fn draw_yes_no(frame: &mut Frame, confirm: Confirm) {
         ),
         area,
     );
+}
+
+/// Vulns was ticked with no usable CVE data: say what that means and where
+/// to get it. Text avoids naming Settings' buttons so it survives renames.
+fn draw_vuln_popup(frame: &mut Frame, services_turned_on: bool, hits: &mut HitMap) {
+    let mut text = vec![
+        Line::from("CVE data hasn't been set up yet."),
+        Line::default(),
+        Line::from("The scan still runs without it, but ports will show"),
+        Line::from("\"no vulnerability data: not checked\"."),
+        Line::default(),
+        Line::from("Open Settings to download the project's prebuilt data,"),
+        Line::from("or to build it yourself from NVD."),
+    ];
+    if services_turned_on {
+        text.push(Line::default());
+        text.push(Line::from(
+            "Vulns needs Services, so Services was turned on too.",
+        ));
+    }
+    let full = frame.area();
+    let area = centered(
+        full,
+        60.min(full.width),
+        (text.len() as u16 + 4).min(full.height),
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .padding(Padding::horizontal(1))
+        .title(" CVE data ".bold().fg(Color::Yellow))
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [body, row] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), body);
+
+    let buttons = key_help(&[("Enter", "Open Settings"), ("Esc", "Not now")]);
+    // Where each button lands in the centered line, for mouse clicks.
+    let w = |spans: &[Span]| spans.iter().map(|s| s.width() as u16).sum::<u16>();
+    let open_w = w(&buttons.spans[..2]);
+    let x = row.x + row.width.saturating_sub(open_w + w(&buttons.spans[2..])) / 2;
+    let open = Rect::new(x, row.y, open_w, 1).intersection(row);
+    let not_now =
+        Rect::new(x.saturating_add(open_w), row.y, w(&buttons.spans[2..]), 1).intersection(row);
+    hits.vuln_popup = Some((open, not_now));
+    frame.render_widget(Paragraph::new(buttons.centered()), row);
 }
 
 fn draw_public_warning(frame: &mut Frame, public: &[String]) {

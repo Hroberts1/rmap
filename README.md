@@ -82,7 +82,7 @@ rmap
 
 ### 5. Get the CVE data (optional)
 
-Vulnerability matching needs a CVE database, which isn't built into the binary. Until you have one, the setup form's Vulns row says `no CVE data yet: F2 to download`. Press `F2` to open [Settings](#settings) and pick one of two ways to get it - both ask **y/n** first:
+Vulnerability matching needs a CVE database, which isn't built into the binary. Until you have one, the setup form's Vulns row says `no CVE data yet: F2 to set up`, and ticking Vulns opens a short pop-up explaining that ports will show `no vulnerability data: not checked` (`Enter` or `F2` opens Settings from there; `Esc` keeps Vulns ticked anyway). Press `F2` to open [Settings](#settings) and pick one of two ways to get it - both ask **y/n** first:
 
 - **Build from NVD**: rmap downloads the CVE data itself from the [NVD API](https://nvd.nist.gov/developers/vulnerabilities) and CISA's KEV list and builds the database on your computer. The first build takes about 30 minutes without an API key, or 10-15 minutes with a free [NVD API key](https://nvd.nist.gov/developers/request-an-api-key) (paste it into Settings → NVD API key). Later builds refresh only the CVEs that changed, usually in a minute or two.
 - **Download prebuilt**: fetch a ready-made file of a few MB from this repository's [`vulndb` release](https://github.com/Hroberts1/rmap/releases/tag/vulndb), rebuilt on the 1st of every month. Fast, but only as fresh as the last release, and it only exists once the maintainers' monthly job has run.
@@ -204,7 +204,7 @@ Set `NO_COLOR` (non-empty, per [no-color.org](https://no-color.org)) to draw eve
 | Warn when data is older than N days (`vuln_stale_days`) | 30 | CVE data older than this is flagged in the results header and in Settings. 1-365. |
 | Highlight actively exploited CVEs (`vuln_highlight_exploited`) | on | Shows the `actively exploited (CISA KEV, added ...)` line under such CVEs in the detail pane and the Vulns tab. Exploited CVEs are still listed first when it's off. |
 
-The screen also shows where the CVE data lives and where it came from (`built 2026-11-01 (17 days ago) · 12,345 CVEs · NVD API 2.0 + CISA KEV (built locally)`, or `... (prebuilt download)`), or that there is none yet - in which case the setup form's Vulns row says `no CVE data yet: F2 to download`.
+The screen also shows where the CVE data lives and where it came from (`built 2026-11-01 (17 days ago) · 12,345 CVEs · NVD API 2.0 + CISA KEV (built locally)`, or `... (prebuilt download)`), or that there is none yet - in which case the setup form's Vulns row says `no CVE data yet: F2 to set up`, and ticking Vulns (or picking a profile that turns it on) shows a pop-up that leads here.
 
 Only one build or download runs at a time, and neither starts while a scan or rescan is running (it reads the CVE data). Leaving Settings cancels a check or an unanswered question; a build or download already running finishes in the background and reports to the log panel. Results and errors are also written to rmap's log file.
 

@@ -442,6 +442,9 @@ pub struct App {
     pub diff: Option<DiffView>,
     /// A destructive key waiting on y/n.
     pub confirm: Option<Confirm>,
+    /// Vulns was ticked with no usable CVE data: the pop-up pointing to
+    /// Settings. `Some(true)` when the tick also turned Services on.
+    pub vuln_popup: Option<bool>,
     /// The key help overlay on the results screen.
     pub help: bool,
     /// Scan profiles, recent targets, and their pickers on the setup form.
@@ -471,6 +474,7 @@ impl App {
             dialog: None,
             diff: None,
             confirm: None,
+            vuln_popup: None,
             help: false,
             profiles,
             clipboard: None,
@@ -545,6 +549,17 @@ impl App {
             self.on_confirm_key(key);
             return;
         }
+        if self.vuln_popup.is_some() {
+            match key.code {
+                KeyCode::Enter | KeyCode::F(2) => {
+                    self.vuln_popup = None;
+                    self.open_settings();
+                }
+                KeyCode::Esc => self.vuln_popup = None,
+                _ => {}
+            }
+            return;
+        }
         if self.settings.is_open() {
             self.on_settings_key(key);
             return;
@@ -573,7 +588,11 @@ impl App {
     /// of as keypresses, so a newline in it can't submit the form.
     pub fn on_paste(&mut self, pasted: &str) {
         rmap_log::debug!("paste of {} bytes", pasted.len());
-        if self.confirm.is_some() || self.pending.is_some() || self.help {
+        if self.confirm.is_some()
+            || self.pending.is_some()
+            || self.vuln_popup.is_some()
+            || self.help
+        {
             return;
         }
         if self.settings.is_open() {
@@ -735,11 +754,24 @@ impl App {
                         // CVE matching needs detected versions; turn
                         // Services on rather than accept a no-op setting.
                         if form.vuln_matching {
+                            let services_was_on = form.service_detection;
                             form.service_detection = true;
+                            self.vulns_ticked(services_was_on);
                         }
                     }
                 }
             },
+        }
+    }
+
+    /// Vulns was just turned on: re-read the CVE data (here, not per frame)
+    /// and point to Settings when there's none to match against.
+    pub(crate) fn vulns_ticked(&mut self, services_was_on: bool) {
+        let s = &mut self.settings;
+        s.db = crate::settings_ui::DbStatus::read(s.db_path.as_deref());
+        if s.db.needs_download() {
+            rmap_log::info!("Vulns ticked without usable CVE data: {:?}", s.db);
+            self.vuln_popup = Some(!services_was_on);
         }
     }
 
@@ -1909,5 +1941,104 @@ mod tests {
         let (_rt, mut app) = app();
         // Logging isn't initialised in unit tests.
         assert!(render(&mut app, 90, 24).contains("logging off"));
+    }
+
+    /// Points the app at `vulns.db` in a fresh directory, written as a real
+    /// (empty) database when `with_data`, so tests don't see this machine's.
+    fn cve_data(app: &mut App, with_data: bool) -> crate::settings::TempDir {
+        let dir = crate::settings::TempDir::new("vuln-popup");
+        let path = dir.0.join("vulns.db");
+        if with_data {
+            let mut w = rmap_vuln::Writer::create(&path).unwrap();
+            w.set_meta("built_at", "2026-11-01").unwrap();
+            w.set_meta("source", "test").unwrap();
+            w.finish().unwrap();
+        }
+        app.settings.db_path = Some(path);
+        app.settings.db = crate::settings_ui::DbStatus::read(app.settings.db_path.as_deref());
+        dir
+    }
+
+    #[test]
+    fn ticking_vulns_without_cve_data_points_to_settings() {
+        let (_rt, mut app) = app();
+        let _dir = cve_data(&mut app, false);
+        app.form.focus = Field::Vulns;
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.vuln_popup, Some(true), "Services was off");
+        let screen = render(&mut app, 90, 30);
+        assert!(
+            screen.contains("CVE data hasn't been set up yet"),
+            "{screen}"
+        );
+        assert!(screen.contains("Services was turned on too"), "{screen}");
+
+        // Other keys don't fall through to the form; Esc keeps Vulns ticked.
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.vuln_popup.is_some() && app.form.vuln_matching);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.vuln_popup.is_none() && !app.settings.is_open());
+        assert!(app.form.vuln_matching && app.form.service_detection);
+        assert!(matches!(app.screen, Screen::Setup) && !app.should_quit());
+
+        // Unticking is quiet; ticking again asks again, now without the
+        // Services line, and Enter opens Settings.
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.vuln_popup.is_none() && !app.form.vuln_matching);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.vuln_popup, Some(false));
+        assert!(!render(&mut app, 90, 30).contains("Services was turned on"));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.vuln_popup.is_none() && app.settings.is_open());
+        assert!(app.form.vuln_matching);
+    }
+
+    #[test]
+    fn f2_from_the_vuln_popup_opens_settings() {
+        let (_rt, mut app) = app();
+        let dir = cve_data(&mut app, false);
+        // A file that isn't a CVE database counts as no data.
+        std::fs::write(dir.0.join("vulns.db"), b"not sqlite").unwrap();
+        app.form.focus = Field::Vulns;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.vuln_popup.is_some());
+        press(&mut app, KeyCode::F(2));
+        assert!(app.vuln_popup.is_none() && app.settings.is_open());
+    }
+
+    #[test]
+    fn no_vuln_popup_when_cve_data_exists() {
+        let (_rt, mut app) = app();
+        let _dir = cve_data(&mut app, true);
+        app.form.focus = Field::Vulns;
+        press(&mut app, KeyCode::Char(' '));
+        assert!(app.form.vuln_matching && app.vuln_popup.is_none());
+    }
+
+    #[test]
+    fn a_profile_that_turns_vulns_on_shows_the_vuln_popup() {
+        let (_rt, mut app) = app();
+        let _dir = cve_data(&mut app, false);
+        let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+        app.on_key(ctrl_p);
+        press(&mut app, KeyCode::Down); // "Full audit": Services and Vulns
+        press(&mut app, KeyCode::Enter);
+        assert!(app.form.vuln_matching && app.profiles.picker.is_none());
+        assert_eq!(app.vuln_popup, Some(true));
+        press(&mut app, KeyCode::Esc);
+        // Re-applying with Vulns already on doesn't ask again.
+        app.on_key(ctrl_p);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.vuln_popup.is_none());
+    }
+
+    #[test]
+    fn vuln_popup_fits_tiny_terminals() {
+        let (_rt, mut app) = app();
+        app.vuln_popup = Some(true);
+        for (w, h) in [(1, 1), (8, 3), (20, 6), (40, 10), (61, 14)] {
+            render(&mut app, w, h);
+        }
     }
 }

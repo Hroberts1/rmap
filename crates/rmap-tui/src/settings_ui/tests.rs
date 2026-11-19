@@ -719,7 +719,7 @@ fn setup_form_hints_when_there_is_no_cve_data() {
     app.settings.db = DbStatus::Missing;
     let screen = render(&mut app, 80, 24);
     assert!(
-        screen.contains("[ ] no CVE data yet: F2 to download"),
+        screen.contains("[ ] no CVE data yet: F2 to set up"),
         "{screen}"
     );
     for line in screen.lines() {
