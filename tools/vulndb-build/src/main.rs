@@ -166,6 +166,9 @@ fn fetch_nvd(
     }
 }
 
+/// Writer keeps SQLite's default rollback journal and `finish` commits and
+/// closes, so the file is complete with no `-journal`/`-wal` beside it
+/// before the workflow hashes it (rmap opens it read-only).
 fn write_db(
     path: &Path,
     entries: &BTreeMap<String, Entry>,
@@ -276,6 +279,56 @@ fn rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The published file must open read-only: committed, closed, and in
+    /// rollback-journal mode with no `-journal`/`-wal` file left beside it.
+    #[test]
+    fn written_db_is_closed_and_opens_read_only() {
+        let dir = std::env::temp_dir().join(format!("vulndb-build-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vulns.db");
+        let entry = Entry {
+            finding: rmap_core::Vulnerability {
+                id: "CVE-2024-6387".into(),
+                summary: "x".into(),
+                severity: rmap_core::VulnSeverity::High,
+                score: Some(8.1),
+                published: Some("2024-07-01".into()),
+                kev_added: None,
+            },
+            matches: vec![rmap_vuln::CpeMatch {
+                vendor: "openbsd".into(),
+                product: "openssh".into(),
+                min: None,
+                max: Some(rmap_vuln::Bound::Excluding("9.8p1".into())),
+            }],
+        };
+        let entries = BTreeMap::from([(entry.finding.id.clone(), entry)]);
+        let written = write_db(&path, &entries, "2026-11-01T06:17:00Z", Some("2026-10-31"));
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let header = std::fs::read(&path).unwrap_or_default();
+        let opened = rmap_vuln::Database::open(&path).map(|db| {
+            let found = db
+                .find("cpe:2.3:a:openbsd:openssh:9.6:p1:*:*:*:*:*:*")
+                .len();
+            (db.info().clone(), found)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        written.unwrap();
+        assert_eq!(leftovers, ["vulns.db"]);
+        // File format bytes 18/19: 1 = rollback journal, 2 = WAL.
+        assert_eq!((header[18], header[19]), (1, 1));
+        let (info, found) = opened.unwrap();
+        assert_eq!(info.cve_count, 1);
+        assert_eq!(info.source, SOURCE);
+        assert_eq!(info.built_at, "2026-11-01T06:17:00Z");
+        assert_eq!(found, 1);
+    }
 
     #[test]
     fn rfc3339_formats_utc() {
