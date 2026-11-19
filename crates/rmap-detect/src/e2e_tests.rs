@@ -20,6 +20,9 @@ enum Behaviour {
         needle: &'static [u8],
         reply: &'static [u8],
     },
+    /// Read an HTTP request and send the reply of the first route whose
+    /// needle is in it; close without a reply if none is.
+    Routes(&'static [(&'static [u8], &'static [u8])]),
     /// Wait for a TLS ClientHello and answer with this server flight.
     Tls,
     /// Accept and never say anything.
@@ -61,6 +64,20 @@ async fn handle(mut s: TcpStream, behaviour: Behaviour) {
                     let _ = s.write_all(reply).await;
                     return;
                 }
+            }
+        }
+        Behaviour::Routes(routes) => {
+            while let Ok(Ok(n)) =
+                tokio::time::timeout(Duration::from_secs(10), s.read(&mut chunk)).await
+            {
+                buf.extend_from_slice(&chunk[..n]);
+                if n == 0 || buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let has = |n: &[u8]| buf.windows(n.len()).any(|w| w == n);
+            if let Some((_, reply)) = routes.iter().find(|(n, _)| has(n)) {
+                let _ = s.write_all(reply).await;
             }
         }
         Behaviour::Tls => {
@@ -269,4 +286,53 @@ async fn plain_http_on_the_https_port() {
     .await;
     let s = detect_as(addr, 443).await;
     assert_eq!(s.version_label().as_deref(), Some("nginx 1.25.3"));
+}
+
+#[tokio::test]
+async fn http_title_goes_in_info() {
+    let addr = serve(Behaviour::Reply {
+        needle: b"\r\n\r\n",
+        reply: b"HTTP/1.1 200 OK\r\nServer: Microsoft-IIS/10.0\r\n\r\n<html><head><TITLE>IIS Windows Server</TITLE>",
+    })
+    .await;
+    let s = detect_as(addr, 80).await;
+    assert_eq!(
+        s.version_label().as_deref(),
+        Some("Microsoft IIS httpd 10.0")
+    );
+    assert_eq!(s.info.as_deref(), Some("title \"IIS Windows Server\""));
+}
+
+#[tokio::test]
+async fn http_title_after_a_same_host_redirect() {
+    let addr = serve(Behaviour::Routes(&[
+        (
+            b"GET / HTTP",
+            b"HTTP/1.1 302 Found\r\nLocation: /login?next=%2F\r\n\r\n",
+        ),
+        (
+            b"GET /login?next=%2F HTTP",
+            b"HTTP/1.1 200 OK\r\n\r\n<title>UniFi OS</title>",
+        ),
+    ]))
+    .await;
+    let s = detect_as(addr, 8080).await;
+    assert_eq!(s.name, "http");
+    assert_eq!(s.product.as_deref(), Some("UniFi OS"));
+    assert_eq!(s.info.as_deref(), Some("title \"UniFi OS\""));
+    assert!(s.cpes.is_empty(), "no CPE invented from a title");
+}
+
+#[tokio::test]
+async fn http_redirect_to_another_host_is_not_followed() {
+    let addr = serve(Behaviour::Routes(&[
+        (
+            b"GET / HTTP",
+            b"HTTP/1.1 301 Moved\r\nLocation: http://192.0.2.9/\r\n\r\n",
+        ),
+        (b"GET", b"HTTP/1.1 200 OK\r\n\r\n<title>wrong</title>"),
+    ]))
+    .await;
+    let s = detect_as(addr, 8080).await;
+    assert_eq!((s.name.as_str(), s.info), ("http", None));
 }

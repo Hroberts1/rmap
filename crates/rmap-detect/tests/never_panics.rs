@@ -4,7 +4,7 @@
 
 use rmap_detect::db::{BUILTIN, Database};
 use rmap_detect::pattern::Pattern;
-use rmap_detect::{Detector, der, tls, udp};
+use rmap_detect::{Detector, der, http, tls, udp};
 
 /// xorshift64*: small, deterministic, no dependencies.
 struct Rng(u64);
@@ -241,5 +241,39 @@ fn udp_decoders_survive_mutated_replies() {
                 }
             }
         });
+    }
+}
+
+#[test]
+fn http_title_and_redirect_survive_garbage() {
+    let seed = seed();
+    let mut rng = Rng::new(seed ^ 0x717e);
+    let addr = "192.0.2.1:80".parse().unwrap();
+    let htmlish =
+        b"<title></TITLE> \t\r\n&#x;amp;lt;9AF\x1b\x9b\xe2\x80\xae\xff:/Location301HTTP/1.1";
+    let base: &[u8] =
+        b"HTTP/1.1 302 Found\r\nLocation: /x\r\n\r\n<title lang=en>A &amp; B &#x263a;</title>";
+    for iter in 0..20_000 {
+        let input = match iter % 3 {
+            0 => rng.bytes(400),
+            1 => rng.from(htmlish, 400),
+            _ => rng.mutate(base),
+        };
+        let t = guard("http::title", seed, iter, &input, || http::title(&input));
+        if let Some(t) = t {
+            assert!(
+                t.chars().count() <= 80 && !t.chars().any(char::is_control),
+                "{t:?}"
+            );
+        }
+        let p = guard("http::redirect", seed, iter, &input, || {
+            http::redirect(&input, addr)
+        });
+        if let Some(p) = p {
+            assert!(
+                p.starts_with('/') && p.bytes().all(|b| b.is_ascii_graphic()),
+                "{p:?}"
+            );
+        }
     }
 }
