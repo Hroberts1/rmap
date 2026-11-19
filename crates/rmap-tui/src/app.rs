@@ -868,6 +868,7 @@ impl App {
             max_rate,
             resolve_names: form.resolve_names,
             dns_server,
+            vuln_db: None,
         };
         if public.is_empty() {
             self.launch(config);
@@ -1296,6 +1297,7 @@ mod tests {
                 severity: rmap_core::VulnSeverity::High,
                 score: Some(8.1),
                 published: None,
+                kev_added: None,
             }],
         });
         let host = &view.hosts[&ip];
@@ -1325,6 +1327,7 @@ mod tests {
                 severity: rmap_core::VulnSeverity::Low,
                 score: None,
                 published: None,
+                kev_added: None,
             }],
         });
     }
@@ -1479,6 +1482,7 @@ mod tests {
             severity,
             score: Some(score),
             published: None,
+            kev_added: None,
         };
         view.apply(ScanEvent::Vulnerabilities {
             ip,

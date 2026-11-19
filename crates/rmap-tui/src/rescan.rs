@@ -53,6 +53,7 @@ fn rescan_config(ip: IpAddr, original: &ConfigSummary) -> ScanConfig {
         max_rate: original.max_rate,
         resolve_names: original.resolve_names,
         dns_server: original.dns_server,
+        vuln_db: None,
     }
 }
 

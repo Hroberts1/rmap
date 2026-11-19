@@ -175,6 +175,7 @@ pub(crate) mod tests {
             severity,
             score: Some(score),
             published: Some("2024-07-01".into()),
+            kev_added: None,
         }
     }
 

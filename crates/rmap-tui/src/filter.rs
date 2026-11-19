@@ -124,6 +124,7 @@ mod tests {
             severity,
             score,
             published: None,
+            kev_added: None,
         }
     }
 

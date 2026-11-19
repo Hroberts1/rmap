@@ -242,6 +242,7 @@ mod tests {
                 severity: VulnSeverity::High,
                 score: Some(8.1),
                 published: None,
+                kev_added: None,
             }],
         });
         view.selected = Some(nas);

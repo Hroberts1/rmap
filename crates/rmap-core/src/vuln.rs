@@ -41,6 +41,13 @@ pub struct Vulnerability {
     pub score: Option<f32>,
     /// `YYYY-MM-DD`, when the database records one.
     pub published: Option<String>,
+    /// `YYYY-MM-DD` the CVE was added to CISA's Known Exploited
+    /// Vulnerabilities list; `None` if it isn't on it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub kev_added: Option<String>,
 }
 
 #[cfg(test)]

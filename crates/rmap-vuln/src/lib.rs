@@ -1,52 +1,147 @@
-//! Vulnerability matching (Milestone 4): offline CPE -> CVE lookup against
-//! a locally cached, hand-curated starter set of public CVEs.
+//! Vulnerability matching: offline CPE -> CVE lookup against a local
+//! SQLite database file (see [`SCHEMA_SQL`] and [`default_path`]).
 //!
 //! A match is reported as **potentially** vulnerable, never certain: a
 //! vendor backport can fix the real bug while leaving the version string
-//! unchanged (or bump it in a way this starter set doesn't know about),
-//! and a version this set has no data for is not evidence of safety.
-//!
-//! The database is a text file in an rmap-specific format (see
-//! [`db::BUILTIN`] and `cves.txt`), the same style as `rmap-detect`'s
-//! `probes.txt`: human-editable, no JSON, and not sourced from Nmap data.
+//! unchanged, and a version the database has no data for is not evidence
+//! of safety.
 
 mod db;
 pub mod version;
 
-pub use db::{BUILTIN, Bound, CpeMatch, DbError, Entry};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use rusqlite::config::DbConfig;
+use rusqlite::{Connection, OpenFlags};
+
+pub use db::{Bound, CpeMatch, DbError, Entry, SCHEMA_SQL, SCHEMA_VERSION, Writer};
 pub use rmap_core::{VulnSeverity, Vulnerability};
 
-/// The database shipped with rmap, parsed once.
+/// What [`Database::find`] returns per matching CVE.
+pub type Finding = Vulnerability;
+
+/// About a database file, read when it is opened. Text is cleaned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbInfo {
+    pub schema_version: u32,
+    /// RFC 3339 UTC, e.g. `2026-11-01T00:00:00Z`; empty if not recorded.
+    pub built_at: String,
+    /// Where the data came from, e.g. `NVD API 2.0 + CISA KEV`.
+    pub source: String,
+    pub cve_count: u64,
+}
+
+/// An open, read-only vulnerability database.
 pub struct Database {
-    entries: Vec<Entry>,
+    // A Mutex so one Database can be shared across scan tasks
+    // (`Connection` is `Send` but not `Sync`).
+    conn: Mutex<Connection>,
+    info: DbInfo,
 }
 
 impl Database {
-    pub fn parse(text: &str) -> Result<Database, DbError> {
+    /// Opens `path` read-only and checks its schema version. A missing,
+    /// empty, corrupt or non-SQLite file is an error, never a panic.
+    pub fn open(path: &Path) -> Result<Database, DbError> {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(DbError::NotFound),
+            Err(e) => return Err(db::invalid(e)),
+            Ok(m) if !m.is_file() => return Err(db::invalid("not a file")),
+            Ok(_) => {}
+        }
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags).map_err(db::invalid)?;
+        // The file comes from the internet: don't let its schema run
+        // functions with side effects, and refuse to follow corrupt pages.
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)
+            .and_then(|_| conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true))
+            .map_err(db::invalid)?;
+        // Real tables only: a view in their place could run arbitrary SQL.
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('meta', 'cve', 'cpe_match')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db::invalid)?;
+        if tables != 3 {
+            return Err(db::invalid("missing tables"));
+        }
+        let version = db::meta(&conn, "schema_version").map_err(db::invalid)?;
+        if version.as_deref().and_then(|v| v.parse().ok()) != Some(SCHEMA_VERSION) {
+            let found = version.map_or("none".to_string(), |v| db::clean_meta(Some(v)));
+            return Err(db::invalid(format!(
+                "schema version {found}, rmap reads {SCHEMA_VERSION}"
+            )));
+        }
+        let meta = |key| db::meta(&conn, key).map_err(db::invalid);
+        let info = DbInfo {
+            schema_version: SCHEMA_VERSION,
+            built_at: db::clean_meta(meta("built_at")?),
+            source: db::clean_meta(meta("source")?),
+            cve_count: meta("cve_count")?.and_then(|v| v.parse().ok()).unwrap_or(0),
+        };
         Ok(Database {
-            entries: db::parse(text)?,
+            conn: Mutex::new(conn),
+            info,
         })
     }
 
-    /// The database rmap ships, parsed once.
-    pub fn builtin() -> Database {
-        Database::parse(BUILTIN).unwrap_or_else(|e| panic!("cves.txt {e}"))
+    pub fn info(&self) -> &DbInfo {
+        &self.info
     }
 
-    /// Findings whose match criteria cover this CPE 2.3 string, newest
-    /// first. An unparseable CPE (not rmap's own output) matches nothing.
-    pub fn find(&self, cpe: &str) -> Vec<&Entry> {
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Findings whose match criteria cover this CPE 2.3 string, one per
+    /// CVE, newest first. An unparseable CPE (not rmap's own output), or a
+    /// read error in a damaged file, matches nothing.
+    pub fn find(&self, cpe: &str) -> Vec<Finding> {
         let Some(parsed) = ParsedCpe::parse(cpe) else {
             return Vec::new();
         };
-        let mut found: Vec<&Entry> = self
-            .entries
-            .iter()
-            .filter(|e| e.matches.iter().any(|m| m.matches(&parsed)))
-            .collect();
-        found.sort_by(|a, b| b.finding.published.cmp(&a.finding.published));
-        found
+        db::find(&self.conn(), &parsed).unwrap_or_default()
     }
+
+    /// Whether the database has any data for this product, so "no
+    /// findings" can be told apart from "nothing known".
+    pub fn knows_product(&self, vendor: &str, product: &str) -> bool {
+        self.conn()
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM cpe_match WHERE vendor = ?1 AND product = ?2)",
+                [vendor.to_ascii_lowercase(), product.to_ascii_lowercase()],
+                |r| r.get(0),
+            )
+            .unwrap_or(false)
+    }
+}
+
+/// Where rmap keeps its vulnerability database: `vulns.db` in the
+/// platform's data directory (`%LOCALAPPDATA%\rmap` on Windows,
+/// `~/Library/Application Support/rmap` on macOS, `$XDG_DATA_HOME/rmap`
+/// or `~/.local/share/rmap` elsewhere). `None` when none can be found.
+// Same lookup as rmap-report's `store::data_dir`, copied so this crate
+// depends only on rmap-core; keep the two in step.
+pub fn default_path() -> Option<PathBuf> {
+    let env = |k| {
+        std::env::var_os(k)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let dir = if cfg!(windows) {
+        env("LOCALAPPDATA").map(|p| p.join("rmap"))
+    } else if cfg!(target_os = "macos") {
+        env("HOME").map(|p| p.join("Library/Application Support/rmap"))
+    } else {
+        env("XDG_DATA_HOME")
+            .map(|p| p.join("rmap"))
+            .or_else(|| env("HOME").map(|p| p.join(".local/share/rmap")))
+    };
+    dir.map(|d| d.join("vulns.db"))
 }
 
 /// The fields of a CPE 2.3 string that matching needs. rmap only ever
@@ -84,129 +179,4 @@ impl<'a> ParsedCpe<'a> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_vendor_product_and_combines_version_with_update() {
-        let p = ParsedCpe::parse("cpe:2.3:a:openbsd:openssh:9.7:p1:*:*:*:*:*:*").unwrap();
-        assert_eq!(p.vendor, "openbsd");
-        assert_eq!(p.product, "openssh");
-        assert_eq!(p.effective_version, "9.7p1");
-    }
-
-    #[test]
-    fn a_wildcard_update_does_not_get_appended() {
-        let p = ParsedCpe::parse("cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*").unwrap();
-        assert_eq!(p.effective_version, "2.4.49");
-    }
-
-    #[test]
-    fn too_short_a_string_parses_to_nothing() {
-        assert!(ParsedCpe::parse("cpe:2.3:a:openbsd").is_none());
-        assert!(ParsedCpe::parse("not a cpe at all").is_none());
-    }
-
-    #[test]
-    fn database_finds_a_real_entry_and_nothing_for_an_unknown_cpe() {
-        let db = Database::parse(
-            r#"
-cve CVE-2024-6387
-  match    openbsd openssh >= 8.5p1 <= 9.7p1
-  severity high
-  score    8.1
-  published 2024-07-01
-  summary  "regreSSHion"
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            db.find("cpe:2.3:a:openbsd:openssh:9.6:*:*:*:*:*:*:*").len(),
-            1
-        );
-        assert!(
-            db.find("cpe:2.3:a:openbsd:openssh:9.8:*:*:*:*:*:*:*")
-                .is_empty()
-        );
-        assert!(
-            db.find("cpe:2.3:a:nginx:nginx:1.0:*:*:*:*:*:*:*")
-                .is_empty()
-        );
-        assert!(db.find("garbage").is_empty());
-    }
-
-    #[test]
-    fn the_real_shipped_database_matches_the_real_cves_it_claims_to() {
-        let db = Database::builtin();
-        let find = |cpe: &str| {
-            db.find(cpe)
-                .iter()
-                .map(|e| e.finding.id.clone())
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            find("cpe:2.3:a:openbsd:openssh:9.6:*:*:*:*:*:*:*"),
-            ["CVE-2024-6387"]
-        );
-        assert!(find("cpe:2.3:a:openbsd:openssh:9.8:*:*:*:*:*:*:*").is_empty());
-        assert!(find("cpe:2.3:a:openbsd:openssh:8.4:*:*:*:*:*:*:*").is_empty());
-
-        // 2.4.49 is both the exact path-traversal CVE and inside the
-        // broader CONTINUATION-flood range.
-        let apache_49 = find("cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*");
-        assert!(apache_49.contains(&"CVE-2021-41773".to_string()));
-        assert!(apache_49.contains(&"CVE-2024-27316".to_string()));
-        assert!(
-            !find("cpe:2.3:a:apache:http_server:2.4.50:*:*:*:*:*:*:*")
-                .contains(&"CVE-2021-41773".to_string())
-        );
-
-        assert_eq!(
-            find("cpe:2.3:a:beasts:vsftpd:2.3.4:*:*:*:*:*:*:*"),
-            ["CVE-2011-2523"]
-        );
-        assert!(find("cpe:2.3:a:beasts:vsftpd:2.3.5:*:*:*:*:*:*:*").is_empty());
-
-        // Distro-specific, matches any version.
-        assert_eq!(
-            find("cpe:2.3:a:redis:redis:7.0:*:*:*:*:*:*:*"),
-            ["CVE-2022-0543"]
-        );
-
-        assert_eq!(
-            find("cpe:2.3:a:oracle:mysql:5.1.50:*:*:*:*:*:*:*"),
-            ["CVE-2012-2122"]
-        );
-        assert!(find("cpe:2.3:a:oracle:mysql:5.1.63:*:*:*:*:*:*:*").is_empty());
-        assert_eq!(
-            find("cpe:2.3:a:mariadb:mariadb:5.5.10:*:*:*:*:*:*:*"),
-            ["CVE-2012-2122"]
-        );
-        assert!(find("cpe:2.3:a:mariadb:mariadb:5.5.23:*:*:*:*:*:*:*").is_empty());
-    }
-
-    #[test]
-    fn results_are_sorted_newest_first() {
-        let db = Database::parse(
-            r#"
-cve CVE-2011-0001
-  match    acme widget
-  severity low
-  published 2011-01-01
-  summary  "old"
-
-cve CVE-2024-0002
-  match    acme widget
-  severity low
-  published 2024-01-01
-  summary  "new"
-"#,
-        )
-        .unwrap();
-        let found = db.find("cpe:2.3:a:acme:widget:1.0:*:*:*:*:*:*:*");
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].finding.id, "CVE-2024-0002");
-        assert_eq!(found[1].finding.id, "CVE-2011-0001");
-    }
-}
+mod tests;

@@ -533,6 +533,7 @@ mod tests {
                 severity: sev,
                 score: Some(score),
                 published: None,
+                kev_added: None,
             }],
         });
     }

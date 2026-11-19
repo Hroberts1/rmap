@@ -4,7 +4,7 @@
 
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
 
-rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, and [serde](https://serde.rs)/serde_json for the JSON report format.
+rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, [serde](https://serde.rs)/serde_json for the JSON report format, and [rusqlite](https://crates.io/crates/rusqlite) (with SQLite bundled) to read the CVE database file.
 
 > **Only scan networks you own or have written permission to test.** rmap asks for confirmation before it touches public addresses.
 
@@ -215,7 +215,7 @@ crates/
 ├── rmap-names    host names: reverse DNS, NetBIOS and mDNS lookups (tokio only)
 ├── rmap-packet   Ethernet/ARP/IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 building and parsing (no dependencies)
 ├── rmap-report   scan reports: JSON, Nmap XML, Markdown, CSV and HTML export, saved scans, diffs
-├── rmap-vuln     vulnerability matching: CPE -> CVE lookup against a local database (no dependencies beyond rmap-core)
+├── rmap-vuln     vulnerability matching: CPE -> CVE lookup in a local SQLite database file (rmap-core and rusqlite only)
 └── rmap-tui      ratatui front end
 src/main.rs       starts logging, the runtime and the UI
 ```
@@ -331,32 +331,33 @@ Tick **Services** and **Vulns** on the setup form and rmap checks every identifi
               └ CVE-2024-6387 (high 8.1): regreSSHion: signal handler race condition in sshd allows unauthenticated remote code execution
 ```
 
-A match is **potentially** vulnerable, not certain: a vendor backport can fix the real bug while leaving the version string unchanged, and a version with no entry in the database is not evidence it's safe. This is an offline lookup against a database bundled in the binary, not a live query - nothing is sent anywhere.
+A match is **potentially** vulnerable, not certain: a vendor backport can fix the real bug while leaving the version string unchanged, and a version with no entry in the database is not evidence it's safe. This is an offline lookup against a local database file, not a live query - nothing is sent anywhere during a scan.
 
-How it works (`crates/rmap-vuln`):
+### The database file
 
-1. Each detected service's CPE 2.3 strings (vendor, product, and the version + update combined, e.g. `9.7p1`) are checked against every CVE's `match` lines.
-2. A version range is compared the way dpkg/rpm compare versions: split into alternating digit and text runs, compare each run in order, and treat a side that runs out of runs first as smaller - so `9.7` sorts before `9.7p1`, and that before `9.7p2`.
+The CVE data is a SQLite file, `vulns.db`, in rmap's data directory (next to the saved scans):
+
+| Platform | Path |
+|---|---|
+| Linux | `$XDG_DATA_HOME/rmap/vulns.db`, or `~/.local/share/rmap/vulns.db` |
+| macOS | `~/Library/Application Support/rmap/vulns.db` |
+| Windows | `%LOCALAPPDATA%\rmap\vulns.db` |
+
+rmap doesn't ship CVE data in the binary. If the file is missing or unreadable, the scan runs normally with one warning (`no vulnerability data at <path>; CVE matching skipped`) and no CVE lines. Downloading and updating the file from inside rmap is coming in a later change.
+
+The schema (`rmap_vuln::SCHEMA_SQL`, version 1) is rmap's own - not Nmap's `nmap-vulners` or any other scanner's database:
+
+- `meta`: `schema_version`, `built_at` (RFC 3339 UTC), `source`, `cve_count`. rmap refuses a file whose `schema_version` it doesn't know.
+- `cve`: one row per CVE - `id`, `summary`, `severity` (`low`/`medium`/`high`/`critical`), optional CVSS `score`, `published` date, and `kev_added`, the date it joined CISA's Known Exploited Vulnerabilities list.
+- `cpe_match`: which versions of which product each CVE affects - lowercase `vendor` and `product` as `crates/rmap-detect/src/cpe.rs` produces them, then either `version_exact` or a range (`start`/`end`, each inclusive or exclusive, missing = open-ended). A CVE can have several rows, for disjoint ranges across branches; a row with no version at all matches every version.
+
+`rmap_vuln::Writer` builds a file in this format. The file will come from the internet, so rmap treats it as untrusted: it opens it read-only, uses only bound query parameters, refuses views in place of its tables, skips rows that don't fit the schema, and replaces control characters in CVE text before it can reach the terminal.
+
+How matching works (`crates/rmap-vuln`):
+
+1. Each detected service's CPE 2.3 strings give a vendor, a product, and the version + update combined (e.g. `9.7p1`). The database's rows for that vendor and product are fetched by index.
+2. Each row's range is checked in Rust, comparing versions the way dpkg/rpm do: split into alternating digit and text runs, compare each run in order, and treat a side that runs out of runs first as smaller - so `9.7` sorts before `9.7p1`, and that before `9.7p2`. Versions are stored in that same combined form.
 3. Matches are deduplicated by CVE id and reported newest first.
-
-The database is [`crates/rmap-vuln/src/cves.txt`](crates/rmap-vuln/src/cves.txt), in a format specific to rmap - not Nmap's `nmap-vulners` or any other external vulnerability database. It is a hand-curated **starter set**: well-documented public CVEs, each verified against nvd.nist.gov when added, covering a sample of the products `rmap-detect` can already identify.
-
-```text
-cve CVE-2024-6387
-  match    openbsd openssh >= 8.5p1 <= 9.7p1   # vendor product, then 0-2 `<op> version` bounds (<, <=, >, >=, ==); no bounds matches any version
-  severity high                                 # low | medium | high | critical
-  score    8.1                                  # optional CVSS base score, 0.0-10.0
-  published 2024-07-01                           # optional, YYYY-MM-DD
-  summary  "regreSSHion: signal handler race condition in sshd allows unauthenticated remote code execution"
-```
-
-A `cve` block can have more than one `match` line, for CVEs with disjoint affected ranges across major versions (MySQL and MariaDB's shared auth-bypass bug, for example, needs a separate range per branch). A `match` with no bound tokens at all matches any version of that vendor/product - for a CVE that is really about packaging rather than the upstream version, like a Debian-specific build regression.
-
-When you add an entry:
-
-1. Verify the CVE id, severity, score and affected version range against [nvd.nist.gov](https://nvd.nist.gov/) (or the vendor's own advisory) rather than from memory.
-2. Use the same vendor/product strings `crates/rmap-detect/src/cpe.rs` already produces - mismatched casing or a wrong vendor name means the match silently never fires. `cargo test -p rmap-vuln` includes a test against real CPEs for every entry already in the database; extend it for a new one where practical.
-3. Run `cargo test -p rmap-vuln`.
 
 ## Logs and crash reports
 
@@ -390,7 +391,7 @@ The newest 20 logs and 20 crash reports are kept; older ones are deleted. Logs c
 cargo test --workspace
 ```
 
-The suite runs real scans against loopback listeners and the reserved, never-routed `192.0.2.0/24` block, so it needs no network access or privileges. It includes randomized parser tests that feed 100,000 generated strings through target and port parsing, and 200,000 random and mutated packets through the packet parsers, to catch inputs that could panic. If one fails, it prints the seed and the input that broke it. Service detection is tested the same way: fake SSH, HTTP, SMTP, FTP, Redis and TLS servers on loopback, a realistic reply for every match rule, and randomized garbage fed through the pattern matcher, the probe database parser and the TLS and certificate parsers. Vulnerability matching is checked against the real, shipped `cves.txt` with real CPEs (not just synthetic fixtures), and end to end through the real engine: a fake OpenSSH banner on loopback, detected for real and matched against the real database, confirms a `Vulnerabilities` event actually arrives after its `Service` event.
+The suite runs real scans against loopback listeners and the reserved, never-routed `192.0.2.0/24` block, so it needs no network access or privileges. It includes randomized parser tests that feed 100,000 generated strings through target and port parsing, and 200,000 random and mutated packets through the packet parsers, to catch inputs that could panic. If one fails, it prints the seed and the input that broke it. Service detection is tested the same way: fake SSH, HTTP, SMTP, FTP, Redis and TLS servers on loopback, a realistic reply for every match rule, and randomized garbage fed through the pattern matcher, the probe database parser and the TLS and certificate parsers. Vulnerability matching is checked against a test database built with `Writer` from nine real, NVD-verified CVEs and real CPEs, against corrupt, truncated, hostile and wrong-version database files, and end to end through the real engine: a fake OpenSSH banner on loopback, detected for real and matched against a test database, confirms a `Vulnerabilities` event actually arrives after its `Service` event, and a missing database gives one warning while the scan still completes.
 
 SYN and UDP scan tests run everywhere and accept the unprivileged fallback. Tests that insist on raw sockets are `#[ignore]`d; on Linux, run them as root or inside a user and network namespace, which grants `CAP_NET_RAW` over its own loopback without root:
 
@@ -406,7 +407,7 @@ unshare -rn sh -c 'ip link set lo up && target/debug/deps/rmap_engine-<hash> --i
 - [x] **M1: engine + TUI shell.** Target parsing, TCP connect scan, unprivileged discovery, live results.
 - [x] **M2: raw scans.** Hand-built IPv4/TCP/UDP/ICMP/ARP packets, SYN and UDP scans, ICMP and ARP discovery, rate-limited timing. Needs root or `CAP_NET_RAW`; falls back without. IPv6 SYN and UDP scans and ICMPv6 echo discovery too. RTT-adaptive timeouts, per RFC 6298.
 - [x] **M3: service detection.** rmap's own probe and match database, version strings, TLS certificate names, CPE identifiers.
-- [x] **M4: vulnerability matching.** Offline CPE → CVE lookup against a locally cached, hand-curated starter set of public CVEs, flagged as *potentially* vulnerable to allow for vendor backports.
+- [x] **M4: vulnerability matching.** Offline CPE → CVE lookup against a local SQLite CVE database, flagged as *potentially* vulnerable to allow for vendor backports.
 - [x] **M5: export and diffing.** JSON and XML export from the TUI, saved scans, and comparing two scans.
 
 ## Platform notes
