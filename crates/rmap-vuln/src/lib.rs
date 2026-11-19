@@ -112,6 +112,13 @@ impl Database {
         let Some(parsed) = ParsedCpe::parse(cpe) else {
             return Vec::new();
         };
+        // An unknown version (`*`, `-` or empty) can't be checked: `*`
+        // sorts below every number, so it would match every "before X"
+        // range and flood the result with false findings. Callers report
+        // such ports as "version hidden" instead.
+        if matches!(parsed.effective_version.as_str(), "" | "*" | "-") {
+            return Vec::new();
+        }
         db::find(&self.conn(), &parsed).unwrap_or_default()
     }
 

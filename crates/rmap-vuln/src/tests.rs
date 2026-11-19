@@ -258,6 +258,15 @@ fn the_starter_set_matches_the_real_cves_it_claims_to() {
     assert!(find("cpe:2.3:a:mariadb:mariadb:5.4:*:*:*:*:*:*:*").is_empty());
 
     assert!(find("cpe:2.3:a:nginx:nginx:1.0:*:*:*:*:*:*:*").is_empty());
+
+    // Unknown versions are never matched, not even against "any version"
+    // rows or upper-bound-only ranges: they're reported as unchecked.
+    for unknown in ["*", "-", ""] {
+        for product in ["openbsd:openssh", "redis:redis", "oracle:mysql"] {
+            let cpe = format!("cpe:2.3:a:{product}:{unknown}:*:*:*:*:*:*:*");
+            assert!(find(&cpe).is_empty(), "{cpe}");
+        }
+    }
     assert!(find("garbage").is_empty());
 }
 
