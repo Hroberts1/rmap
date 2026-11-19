@@ -8,14 +8,14 @@
 > - **You are solely responsible for how you use this software and for obtaining authorization before scanning any network or host that isn't yours.**
 > - This project is provided **"AS IS", without warranty of any kind, express or implied** - including, without limitation, fitness for a particular purpose, accuracy, or non-infringement. See [`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE).
 > - The authors and contributors **accept no liability** for damage, data loss, legal exposure, or any other consequence arising from the use or misuse of this software.
-> - CVE and vulnerability information bundled with rmap (`rmap-vuln`'s database) is a **hand-curated sample for demonstration**, not a complete or currently accurate vulnerability feed - do not rely on it for real risk decisions.
+> - CVE matches are **potential** findings based on version strings, using data downloaded from NVD and CISA that can be incomplete, out of date, or wrong for vendor-patched builds - verify before acting, and do not rely on rmap alone for real risk decisions.
 > - Nothing here is legal advice. If you're unsure whether you're authorized to scan something, **don't** - get written permission first.
 
 [![CI](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml/badge.svg)](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml)
 
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
 
-rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, [serde](https://serde.rs)/serde_json for the JSON report format, and [rusqlite](https://crates.io/crates/rusqlite) (with SQLite bundled) to read the CVE database file.
+rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, [serde](https://serde.rs)/serde_json for the JSON report format, [rusqlite](https://crates.io/crates/rusqlite) (with SQLite bundled) to read the CVE database file, and [ureq](https://crates.io/crates/ureq) (with rustls) to download that file when you ask.
 
 > **Only scan networks you own or have written permission to test.** rmap asks for confirmation before it touches public addresses.
 
@@ -80,7 +80,11 @@ cargo install --path .
 rmap
 ```
 
-### 5. Run the tests (optional)
+### 5. Download the CVE data (optional)
+
+Vulnerability matching needs a CVE database, which isn't built into the binary. Until you download one, the setup form's Vulns row says `no CVE data yet: F2 to download`. Press `F2` to open [Settings](#settings), choose **Update now** and answer `y`. rmap fetches a few MB from this repository's [`vulndb` release](https://github.com/Hroberts1/rmap/releases/tag/vulndb), checks it and installs it. Repeat this whenever the header warns that the data is old; the release is rebuilt on the 1st of every month. Everything else in rmap works without it.
+
+### 6. Run the tests (optional)
 
 ```bash
 cargo test --workspace
@@ -95,6 +99,7 @@ The tests need no network access and no root.
 | `linker 'cc' not found` | Install the C toolchain from step 1. |
 | `requires rustc 1.88` or edition 2024 errors | Your Rust is too old. Run `rustup update stable`, and check that `which cargo` points into `~/.cargo/bin`, not `/usr/bin`. |
 | Garbled boxes or missing colors | Use a terminal with UTF-8 and 256-color support. Check that `echo $LANG` ends in `UTF-8`. |
+| **Update now** fails with `the server answered HTTP 404` | Nothing is published at the Update URL. With the default URL, the repository's `vulndb` release hasn't been built yet; it appears after the first run of the **Vulnerability data** Action (see [Vulnerability data (maintainers)](#vulnerability-data-maintainers)). If you changed Update URL, check it points at a `vulns.json` manifest, or use **Reset URL to default**. |
 | Screen left in a bad state after a crash | Run `reset`. The crash report path is printed after the terminal is restored; see [Logs and crash reports](#logs-and-crash-reports). |
 
 ## Running
@@ -411,7 +416,7 @@ How matching works (`crates/rmap-vuln`):
 
 ### Updating vulnerability data
 
-`rmap_vuln::update` downloads a fresh `vulns.db`; the Settings screen's "Update now" calls it, after asking (see [Settings](#settings)). Nothing is fetched unless you ask. By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); the URL is a parameter, so you can host the two files yourself. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
+`rmap_vuln::update` downloads a fresh `vulns.db`; the Settings screen's "Update now" calls it, after asking (see [Settings](#settings)). Nothing is fetched unless you ask. By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); you can change it in Settings (Update URL) to host the two files yourself, or to use a fork's release. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
 
 Before anything replaces your current database, rmap checks that:
 
@@ -423,6 +428,8 @@ Before anything replaces your current database, rmap checks that:
 Only then is it renamed over `vulns.db` in one step. Any failure deletes the `.part` file and leaves the old database untouched. On Windows the old file can't be replaced while a scan has it open; close running scans and try again. The SHA-256 protects against corrupt or truncated downloads; authenticity rests on HTTPS to the release host (Mozilla's CA list via webpki-roots, rustls). The standard `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` and `NO_PROXY` environment variables are honored.
 
 ### Vulnerability data (maintainers)
+
+> **New repository or fork?** The `vulndb` release doesn't exist until this Action has run once, so until then **Update now** fails with HTTP 404. After pushing to `main`, go to **Actions** → **Vulnerability data** → **Run workflow** (branch `main`) and wait for it to finish; the **Releases** page should then show `vulndb` with `vulns.db` and `vulns.json`. A fork that doesn't publish its own data can leave Update URL on the default and use the upstream release.
 
 `vulns.db` is built by `tools/vulndb-build` and published by the **Vulnerability data** GitHub Action (`.github/workflows/vulndb.yml`), on the 1st of every month and on demand (Actions → Vulnerability data → Run workflow, on `main`; other branches skip the job). It:
 
