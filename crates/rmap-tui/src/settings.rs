@@ -7,6 +7,7 @@
 //! overwritten by the next save.
 
 use std::cell::Cell;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ pub const STALE_DAYS: std::ops::RangeInclusive<u32> = 1..=365;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// Where "Update now" reads the CVE data manifest (`vulns.json`).
+    /// Where "Download prebuilt" reads the CVE data manifest (`vulns.json`).
     pub vuln_update_url: String,
     /// Fetch the manifest when rmap starts and say if newer data exists.
     /// Never downloads the data itself.
@@ -32,6 +33,9 @@ pub struct Settings {
     pub vuln_stale_days: u32,
     /// Show the "actively exploited (CISA KEV)" line under such CVEs.
     pub vuln_highlight_exploited: bool,
+    /// The user's own NVD API key for "Build from NVD"; empty for none.
+    /// The `NVD_API_KEY` environment variable overrides it.
+    pub nvd_api_key: ApiKey,
 }
 
 impl Default for Settings {
@@ -41,7 +45,76 @@ impl Default for Settings {
             vuln_check_on_startup: false,
             vuln_stale_days: 30,
             vuln_highlight_exploited: true,
+            nvd_api_key: ApiKey::default(),
         }
+    }
+}
+
+/// An NVD API key. Its `Debug` hides it, since settings are logged, and
+/// logs end up in crash reports.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ApiKey(pub String);
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(if self.0.is_empty() { "none" } else { "(set)" })
+    }
+}
+
+/// NVD keys are UUIDs (36 characters); this leaves room for a format
+/// change without accepting anything that could be more than a token.
+pub const MAX_KEY_CHARS: usize = 64;
+
+pub fn key_char_ok(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Empty (no key), or a plausible API key. The message never echoes it.
+pub fn check_api_key(key: &str) -> Result<(), String> {
+    if key.chars().count() > MAX_KEY_CHARS {
+        Err(format!("too long (at most {MAX_KEY_CHARS} characters)"))
+    } else if !key.chars().all(key_char_ok) {
+        Err("only letters, digits, - and _ are allowed".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// `••••••••-…-1a2b`: enough to tell keys apart, not to use one.
+pub fn mask(key: &str) -> String {
+    let n = key.chars().count();
+    if n < 12 {
+        return "••••••••".into();
+    }
+    let last: String = key.chars().skip(n - 4).collect();
+    format!("••••••••-…-{last}")
+}
+
+/// Where the key "Build from NVD" uses comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    Env,
+    Settings,
+}
+
+/// The `NVD_API_KEY` environment variable: unset or empty, else whether
+/// it is a usable key.
+pub fn env_key() -> Option<Result<String, ()>> {
+    let v = std::env::var("NVD_API_KEY").ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| check_api_key(v).map(|_| v.to_string()).map_err(drop))
+}
+
+/// The key to build with: a valid `env` key wins over the saved one.
+pub fn effective_key(
+    saved: &ApiKey,
+    env: Option<Result<String, ()>>,
+) -> Option<(String, KeySource)> {
+    match env {
+        Some(Ok(k)) => Some((k, KeySource::Env)),
+        _ if saved.0.is_empty() => None,
+        _ => Some((saved.0.clone(), KeySource::Settings)),
     }
 }
 
@@ -61,6 +134,10 @@ impl Settings {
                 self.vuln_stale_days, default.vuln_stale_days
             ));
             self.vuln_stale_days = default.vuln_stale_days;
+        }
+        if let Err(e) = check_api_key(&self.nvd_api_key.0) {
+            notes.push(format!("nvd_api_key: {e}; ignoring the saved key"));
+            self.nvd_api_key = default.nvd_api_key;
         }
         notes
     }
@@ -144,12 +221,35 @@ pub fn load(path: Option<&Path>) -> (Settings, Option<String>) {
 
 /// Writes `settings` to `path` atomically (temp file, then rename).
 pub fn save(path: &Path, settings: &Settings) -> Result<(), String> {
-    crate::profiles::write_json(path, settings).map_err(|e| {
+    write_private(path, settings).map_err(|e| {
         rmap_log::warn!("could not write {}: {e}", path.display());
         format!("could not save {}: {e}", path.display())
     })?;
     rmap_log::info!("saved settings to {}: {settings:?}", path.display());
     Ok(())
+}
+
+/// Like `profiles::write_json`, but the file can hold an API key: on Unix
+/// it is created readable by the owner only (0600) before anything is
+/// written. On Windows it inherits the per-user `%APPDATA%` folder's
+/// access, which other ordinary users can't read.
+fn write_private(path: &Path, settings: &Settings) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(settings).map_err(io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    // A stale temp file would keep its old permissions.
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    io::Write::write_all(&mut opts.open(&tmp)?, text.as_bytes())?;
+    fs::rename(&tmp, path)
 }
 
 // The frame's display settings. `ui::draw` sets them from `App` before
@@ -224,12 +324,79 @@ mod tests {
             vuln_check_on_startup: true,
             vuln_stale_days: 7,
             vuln_highlight_exploited: false,
+            nvd_api_key: ApiKey("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0".into()),
         };
         save(&path, &s).unwrap();
         assert_eq!(load(Some(&path)), (s, None));
         assert!(
             !path.with_extension("json.tmp").exists(),
             "temp file renamed"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "owner-only: it can hold an API key");
+        }
+    }
+
+    #[test]
+    fn api_key_is_validated_masked_and_never_debug_printed() {
+        let key = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+        assert_eq!(check_api_key(key), Ok(()));
+        assert_eq!(check_api_key(""), Ok(()), "no key");
+        for bad in [
+            "has space",
+            "new\nline",
+            "esc\u{1b}[2J",
+            "é",
+            "a/b",
+            &"a".repeat(MAX_KEY_CHARS + 1),
+        ] {
+            let e = check_api_key(bad).unwrap_err();
+            assert!(!e.contains(bad), "{e}");
+        }
+        assert_eq!(mask(key), "••••••••-…-e1f0");
+        assert_eq!(mask("short"), "••••••••");
+        let s = Settings {
+            nvd_api_key: ApiKey(key.into()),
+            ..Settings::default()
+        };
+        let shown = format!("{s:?}");
+        assert!(
+            !shown.contains("0f1e") && shown.contains("(set)"),
+            "{shown}"
+        );
+
+        let saved = ApiKey(key.into());
+        assert_eq!(effective_key(&ApiKey::default(), None), None);
+        assert_eq!(
+            effective_key(&saved, None),
+            Some((key.to_string(), KeySource::Settings))
+        );
+        assert_eq!(
+            effective_key(&saved, Some(Ok("from-env".into()))),
+            Some(("from-env".to_string(), KeySource::Env))
+        );
+        assert_eq!(
+            effective_key(&saved, Some(Err(()))),
+            Some((key.to_string(), KeySource::Settings)),
+            "a bad env key is ignored"
+        );
+
+        let dir = TempDir::new("badkey");
+        let path = dir.0.join(FILE);
+        fs::write(
+            &path,
+            r#"{"nvd_api_key": "x\u001b]52;c;aGk=\u0007", "vuln_stale_days": 9}"#,
+        )
+        .unwrap();
+        let (s, warning) = load(Some(&path));
+        assert_eq!((s.nvd_api_key, s.vuln_stale_days), (ApiKey::default(), 9));
+        let warning = warning.unwrap();
+        assert!(
+            warning.contains("nvd_api_key") && !warning.contains("aGk"),
+            "{warning}"
         );
     }
 

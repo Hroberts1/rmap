@@ -15,7 +15,7 @@
 
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
 
-rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, [serde](https://serde.rs)/serde_json for the JSON report format, [rusqlite](https://crates.io/crates/rusqlite) (with SQLite bundled) to read the CVE database file, and [ureq](https://crates.io/crates/ureq) (with rustls) to download that file when you ask.
+rmap takes inspiration from Nmap's feature set but shares none of its code or data files. Scanning, packet handling, target parsing and probe databases are all written in this repository. The only outside dependencies are general-purpose infrastructure: [tokio](https://tokio.rs) for the async runtime, [ratatui](https://ratatui.rs) for the terminal, [libc](https://crates.io/crates/libc) for the Linux raw-socket syscalls, [serde](https://serde.rs)/serde_json for the JSON report format, [rusqlite](https://crates.io/crates/rusqlite) (with SQLite bundled) to read the CVE database file, and [ureq](https://crates.io/crates/ureq) (with rustls) to download that file, or the NVD and CISA data to build it from, when you ask.
 
 > **Only scan networks you own or have written permission to test.** rmap asks for confirmation before it touches public addresses.
 
@@ -80,9 +80,14 @@ cargo install --path .
 rmap
 ```
 
-### 5. Download the CVE data (optional)
+### 5. Get the CVE data (optional)
 
-Vulnerability matching needs a CVE database, which isn't built into the binary. Until you download one, the setup form's Vulns row says `no CVE data yet: F2 to download`. Press `F2` to open [Settings](#settings), choose **Update now** and answer `y`. rmap fetches a few MB from this repository's [`vulndb` release](https://github.com/Hroberts1/rmap/releases/tag/vulndb), checks it and installs it. Repeat this whenever the header warns that the data is old; the release is rebuilt on the 1st of every month. Everything else in rmap works without it.
+Vulnerability matching needs a CVE database, which isn't built into the binary. Until you have one, the setup form's Vulns row says `no CVE data yet: F2 to download`. Press `F2` to open [Settings](#settings) and pick one of two ways to get it - both ask **y/n** first:
+
+- **Build from NVD**: rmap downloads the CVE data itself from the [NVD API](https://nvd.nist.gov/developers/vulnerabilities) and CISA's KEV list and builds the database on your computer. The first build takes about 30 minutes without an API key, or 10-15 minutes with a free [NVD API key](https://nvd.nist.gov/developers/request-an-api-key) (paste it into Settings → NVD API key). Later builds refresh only the CVEs that changed, usually in a minute or two.
+- **Download prebuilt**: fetch a ready-made file of a few MB from this repository's [`vulndb` release](https://github.com/Hroberts1/rmap/releases/tag/vulndb), rebuilt on the 1st of every month. Fast, but only as fresh as the last release, and it only exists once the maintainers' monthly job has run.
+
+Repeat either whenever the header warns that the data is old. You never need GitHub, an account or any setup beyond rmap itself. Everything else in rmap works without CVE data.
 
 ### 6. Run the tests (optional)
 
@@ -99,7 +104,8 @@ The tests need no network access and no root.
 | `linker 'cc' not found` | Install the C toolchain from step 1. |
 | `requires rustc 1.88` or edition 2024 errors | Your Rust is too old. Run `rustup update stable`, and check that `which cargo` points into `~/.cargo/bin`, not `/usr/bin`. |
 | Garbled boxes or missing colors | Use a terminal with UTF-8 and 256-color support. Check that `echo $LANG` ends in `UTF-8`. |
-| **Update now** fails with `the server answered HTTP 404` | Nothing is published at the Update URL. With the default URL, the repository's `vulndb` release hasn't been built yet; it appears after the first run of the **Vulnerability data** Action (see [Vulnerability data (maintainers)](#vulnerability-data-maintainers)). If you changed Update URL, check it points at a `vulns.json` manifest, or use **Reset URL to default**. |
+| **Download prebuilt** fails with `the server answered HTTP 404` | Nothing is published at the Update URL. Use **Build from NVD** instead: it needs nothing from GitHub. With the default URL, the repository's `vulndb` release hasn't been built yet; it appears after the first run of the **Vulnerability data** Action (see [Vulnerability data (maintainers)](#vulnerability-data-maintainers)). If you changed Update URL, check it points at a `vulns.json` manifest, or use **Reset URL to default**. |
+| **Build from NVD** fails with `404 ... check the key` | NVD answers 404 to an API key it doesn't accept. Check the key in Settings (or `NVD_API_KEY`), or clear it to build without one. |
 | Screen left in a bad state after a crash | Run `reset`. The crash report path is printed after the terminal is restored; see [Logs and crash reports](#logs-and-crash-reports). |
 
 ## Running
@@ -186,23 +192,29 @@ Set `NO_COLOR` (non-empty, per [no-color.org](https://no-color.org)) to draw eve
 
 ### Settings
 
-`F2` on the setup form, or `S` (or `F2`) on the results screen, opens Settings. `Tab`/`↑↓` move between rows, `Enter`/`Space` press a button or flip a checkbox, and `Esc` goes back. A change is saved as soon as you make it - for the two text fields, when you press `Enter` or leave the field; an invalid value stays in the field with the reason shown and isn't saved (`Esc` discards it).
+`F2` on the setup form, or `S` (or `F2`) on the results screen, opens Settings. `Tab`/`↑↓` move between rows, `Enter`/`Space` press a button or flip a checkbox, and `Esc` goes back. A change is saved as soon as you make it - for the text fields, when you press `Enter` or leave the field; an invalid value stays in the field with the reason shown and isn't saved (`Esc` discards it).
 
 | Setting | Default | What it does |
 |---|---|---|
-| Update now | - | Downloads the latest CVE data, after showing what it will download and asking **y/n** (below). Disabled while a scan or rescan is running. |
-| Update URL (`vuln_update_url`) | `https://github.com/Hroberts1/rmap/releases/download/vulndb/vulns.json` | Where Update now reads the manifest. Must be `https://` (or `http://` to this computer); `Reset URL to default` puts it back. |
+| Build from NVD | - | Builds the CVE data on your computer from the NVD API and CISA KEV, after saying whether it will be a full build or a refresh and roughly how long it takes, and asking **y/n** (below). While it runs, the same button reads **Cancel build**. |
+| Download prebuilt | - | Downloads the latest prebuilt CVE data, after showing what it will download and asking **y/n** (below). |
+| NVD API key (`nvd_api_key`) | empty | Your own free [NVD API key](https://nvd.nist.gov/developers/request-an-api-key), used only by Build from NVD; it raises NVD's rate limit so a full build takes 10-15 minutes instead of about 30. Shown masked (`••••••••-…-1a2b`) except while you edit it. Letters, digits, `-` and `_` only, at most 64. The environment variable `NVD_API_KEY`, if set, overrides it, and Settings says so. **Copy key request link** puts the request page's address on the clipboard (OSC 52, as `y` does), since clicking links in terminals varies. |
+| Update URL (`vuln_update_url`) | `https://github.com/Hroberts1/rmap/releases/download/vulndb/vulns.json` | Where Download prebuilt reads the manifest. Must be `https://` (or `http://` to this computer); `Reset URL to default` puts it back. |
 | Check for updates on startup (`vuln_check_on_startup`) | off | When on, rmap fetches the manifest each time it starts and, if newer data exists, says so (`newer CVE data is available ...`). It never downloads on its own. |
 | Warn when data is older than N days (`vuln_stale_days`) | 30 | CVE data older than this is flagged in the results header and in Settings. 1-365. |
 | Highlight actively exploited CVEs (`vuln_highlight_exploited`) | on | Shows the `actively exploited (CISA KEV, added ...)` line under such CVEs in the detail pane and the Vulns tab. Exploited CVEs are still listed first when it's off. |
 
-The screen also shows where the CVE data lives and what's in it (`built 2026-11-01 (17 days ago) · 245,000 CVEs · NVD API 2.0 + CISA KEV`), or that it hasn't been downloaded yet - in which case the setup form's Vulns row says `no CVE data yet: F2 to download`.
+The screen also shows where the CVE data lives and where it came from (`built 2026-11-01 (17 days ago) · 12,345 CVEs · NVD API 2.0 + CISA KEV (built locally)`, or `... (prebuilt download)`), or that there is none yet - in which case the setup form's Vulns row says `no CVE data yet: F2 to download`.
 
-**Network use:** rmap contacts the update URL only when you press Update now, or at startup if you turned that on. Scanning never fetches anything.
+Only one build or download runs at a time, and neither starts while a scan or rescan is running (it reads the CVE data). Leaving Settings cancels a check or an unanswered question; a build or download already running finishes in the background and reports to the log panel. Results and errors are also written to rmap's log file.
 
-**Update now**, step by step: rmap fetches the manifest in the background (`checking github.com…`), then asks, e.g. `Download 4.2 MB of CVE data built 2026-11-15 (245,000 CVEs) from github.com?` - and says plainly if that build is **older** than the data you have, or the same one. On `y` it downloads with live progress, verifies and installs (see [Updating vulnerability data](#updating-vulnerability-data) for the checks). Leaving Settings cancels a check or an unanswered question; a download already running finishes in the background and reports to the log panel. Results and errors are also written to rmap's log file.
+**Network use:** rmap contacts nvd.nist.gov and cisa.gov only when you press Build from NVD, and the update URL only when you press Download prebuilt (or at startup, if you turned that on). Scanning never fetches anything.
 
-Settings live in `settings.json`, in `%APPDATA%\rmap` on Windows, `~/Library/Application Support/rmap` on macOS, and `$XDG_CONFIG_HOME/rmap` (or `~/.config/rmap`) elsewhere. It's plain JSON with the field names above; missing fields take their defaults and unknown ones are ignored. A value that fails validation falls back to its default with a warning on the setup form; a file that isn't valid JSON is moved to `settings.json.bad` (and defaults are used) rather than being overwritten.
+**Build from NVD**, step by step: rmap asks first, e.g. `Build the CVE data from NVD? Full build (no CVE data yet): every CVE, about 30 minutes without an API key, 10-15 with one. Uses your NVD API key from Settings; ...` or `Refresh: fetches only CVEs changed since the last NVD sync (3 days ago), usually a minute or two.` On `y` it builds in the background with live progress (`NVD: 120,000 of 330,000 CVEs (36%) · about 14 min left`); press the button again (**Cancel build**) to stop after the current request. Cancelling or any failure leaves your current data exactly as it was. See [Building from NVD](#building-from-nvd) for how it works.
+
+**Download prebuilt**, step by step: rmap fetches the manifest in the background (`checking github.com…`), then asks, e.g. `Download 4.2 MB of CVE data built 2026-11-15 (12,345 CVEs) from github.com?` - and says plainly if that build is **older** than the data you have, or the same one. On `y` it downloads with live progress, verifies and installs (see [Updating vulnerability data](#updating-vulnerability-data) for the checks).
+
+Settings live in `settings.json`, in `%APPDATA%\rmap` on Windows, `~/Library/Application Support/rmap` on macOS, and `$XDG_CONFIG_HOME/rmap` (or `~/.config/rmap`) elsewhere. It's plain JSON with the field names above; missing fields take their defaults and unknown ones are ignored. A value that fails validation falls back to its default with a warning on the setup form; a file that isn't valid JSON is moved to `settings.json.bad` (and defaults are used) rather than being overwritten. Because it can hold your NVD API key, on Linux and macOS rmap writes it readable by you only (mode 0600); on Windows it sits in your per-user `%APPDATA%`, which other ordinary users can't read. The key is never written to logs, crash reports or exports, and is sent only to NVD, as the `apiKey` request header (never in a URL). Prefer `NVD_API_KEY` if you'd rather not store it at all.
 
 ## Scan profiles and recent targets
 
@@ -253,6 +265,7 @@ crates/
 ├── rmap-packet   Ethernet/ARP/IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 building and parsing (no dependencies)
 ├── rmap-report   scan reports: JSON, Nmap XML, Markdown, CSV and HTML export, saved scans, diffs
 ├── rmap-vuln     vulnerability matching: CPE -> CVE lookup in a local SQLite database file and its verified download (rusqlite, ureq)
+├── rmap-nvd      builds that database from the NVD API 2.0 and CISA KEV, in full or as a refresh (ureq)
 └── rmap-tui      ratatui front end
 src/main.rs       starts logging, the runtime and the UI
 ```
@@ -398,11 +411,11 @@ The CVE data is a SQLite file, `vulns.db`, in rmap's data directory (next to the
 | macOS | `~/Library/Application Support/rmap/vulns.db` |
 | Windows | `%LOCALAPPDATA%\rmap\vulns.db` |
 
-rmap doesn't ship CVE data in the binary. If the file is missing or unreadable, the scan runs normally with one warning (`no vulnerability data at <path>; CVE matching skipped`) and no CVE lines. Updating it from inside rmap is covered [below](#updating-vulnerability-data).
+rmap doesn't ship CVE data in the binary. If the file is missing or unreadable, the scan runs normally with one warning (`no vulnerability data at <path>; CVE matching skipped`) and no CVE lines. Building or downloading it from inside rmap is covered [below](#updating-vulnerability-data).
 
 The schema (`rmap_vuln::SCHEMA_SQL`, version 1) is rmap's own - not Nmap's `nmap-vulners` or any other scanner's database:
 
-- `meta`: `schema_version`, `built_at` (RFC 3339 UTC), `source`, `cve_count`. rmap refuses a file whose `schema_version` it doesn't know.
+- `meta`: `schema_version`, `built_at` (RFC 3339 UTC), `source`, `cve_count`, plus the NVD builder's `nvd_last_modified` and `nvd_products` (used only to decide whether a refresh is possible). rmap refuses a file whose `schema_version` it doesn't know.
 - `cve`: one row per CVE - `id`, `summary`, `severity` (`low`/`medium`/`high`/`critical`), optional CVSS `score`, `published` date, and `kev_added`, the date it joined CISA's Known Exploited Vulnerabilities list.
 - `cpe_match`: which versions of which product each CVE affects - lowercase `vendor` and `product` as `crates/rmap-detect/src/cpe.rs` produces them, then either `version_exact` or a range (`start`/`end`, each inclusive or exclusive, missing = open-ended). A CVE can have several rows, for disjoint ranges across branches; a row with no version at all matches every version.
 
@@ -416,7 +429,11 @@ How matching works (`crates/rmap-vuln`):
 
 ### Updating vulnerability data
 
-`rmap_vuln::update` downloads a fresh `vulns.db`; the Settings screen's "Update now" calls it, after asking (see [Settings](#settings)). Nothing is fetched unless you ask. By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); you can change it in Settings (Update URL) to host the two files yourself, or to use a fork's release. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
+There are two ways, and you pick in Settings: **Build from NVD** builds `vulns.db` on your computer ([below](#building-from-nvd)); **Download prebuilt** fetches a file the maintainers publish monthly. Both write the new file to `vulns.db.part` next to the real one, check it, and only then rename it over `vulns.db` in one step; any failure (or a cancelled build) deletes the `.part` file and leaves the old database untouched. On Windows the old file can't be replaced while a scan has it open; close running scans and try again. Nothing is fetched unless you ask.
+
+#### Download prebuilt
+
+`rmap_vuln::update` downloads a fresh `vulns.db`; the Settings screen's "Download prebuilt" calls it, after asking (see [Settings](#settings)). By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); you can change it in Settings (Update URL) to host the two files yourself, or to use a fork's release. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
 
 Before anything replaces your current database, rmap checks that:
 
@@ -425,18 +442,19 @@ Before anything replaces your current database, rmap checks that:
 - the download, streamed to `vulns.db.part` next to the real file, is exactly the manifest's size (at most 512 MiB) and SHA-256;
 - the downloaded file opens as a valid database whose CVE count matches the manifest.
 
-Only then is it renamed over `vulns.db` in one step. Any failure deletes the `.part` file and leaves the old database untouched. On Windows the old file can't be replaced while a scan has it open; close running scans and try again. The SHA-256 protects against corrupt or truncated downloads; authenticity rests on HTTPS to the release host (Mozilla's CA list via webpki-roots, rustls). The standard `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` and `NO_PROXY` environment variables are honored.
+The SHA-256 protects against corrupt or truncated downloads; authenticity rests on HTTPS to the release host (Mozilla's CA list via webpki-roots, rustls). The standard `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` and `NO_PROXY` environment variables are honored (for building from NVD too).
 
-### Vulnerability data (maintainers)
+### Building from NVD
 
-> **New repository or fork?** The `vulndb` release doesn't exist until this Action has run once, so until then **Update now** fails with HTTP 404. After pushing to `main`, go to **Actions** → **Vulnerability data** → **Run workflow** (branch `main`) and wait for it to finish; the **Releases** page should then show `vulndb` with `vulns.db` and `vulns.json`. A fork that doesn't publish its own data can leave Update URL on the default and use the upstream release.
+`rmap_nvd::build` (crate `crates/rmap-nvd`) builds `vulns.db` straight from the sources, on your computer, with your own NVD API key if you set one. Settings → **Build from NVD** runs it on a background thread; the maintainers' monthly prebuilt file is made by the same code.
 
-`vulns.db` is built by `tools/vulndb-build` and published by the **Vulnerability data** GitHub Action (`.github/workflows/vulndb.yml`), on the 1st of every month and on demand (Actions → Vulnerability data → Run workflow, on `main`; other branches skip the job). It:
-
-1. Downloads CISA's [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) list, then every CVE from the [NVD CVE API 2.0](https://nvd.nist.gov/developers/vulnerabilities), 2000 per page, within NVD's rate limits (one request per 6 s without an API key, one per second with one), retrying rate-limit and server errors with backoff.
+1. Downloads CISA's [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) list, then CVEs from the [NVD CVE API 2.0](https://nvd.nist.gov/developers/vulnerabilities), 2000 per page, within NVD's rate limits (one request per 6 s without an API key, one per second with one), retrying rate-limit (403/429) and server errors with backoff. Cancelling stops before the next request or retry wait.
 2. Keeps only CVEs that affect a product rmap can detect (the vendor/product pairs in `crates/rmap-detect/src/cpe.rs`, via `rmap_detect::cpe::nvd_products`), which keeps the file to a few MB. Rejected CVEs are dropped.
-3. Writes `vulns.db` and `vulns.meta.json`, and refuses to finish if fewer than 500 CVEs (or 500 KEV entries) came back, so a broken response is never published.
-4. Uploads `vulns.db`, then the manifest `vulns.json` (`schema_version`, `built_at`, `cve_count`, `source`, `size`, `sha256`, `db`), to the release tagged `vulndb`, replacing the previous month's files.
+3. Writes `vulns.db.part`, checks that it opens as a valid database with the expected CVE count, and refuses to replace your data if fewer than 500 CVEs (or 500 KEV entries) came back, so a broken response never replaces good data. Then renames it over `vulns.db`.
+
+**Full build or refresh.** The file records NVD's newest `lastModified` time it has seen (`meta.nvd_last_modified`) and which product table it was built for (`meta.nvd_products`). If that sync time is less than 118 days old (NVD allows at most a 120-day `lastModStartDate`/`lastModEndDate` window) and the product table matches this rmap, the next build is a **refresh**: it copies the current file to `.part`, fetches only CVEs modified since (starting a day early, to cover clock differences and changes made during a long sync), deletes each changed CVE and re-adds it as NVD now has it (a rejected CVE, or one that no longer affects a detected product, stays deleted), re-applies the current KEV dates to every CVE, then checks and replaces the file as above. Otherwise - no data yet, a file without a sync time, an older sync, a different rmap version's product table, or a file with anything besides rmap's own tables - it does a full build. A prebuilt download made by the same rmap version can be refreshed too.
+
+Network use and privacy: only `services.nvd.nist.gov` and `www.cisa.gov` over HTTPS, no redirects followed (so the key can't be forwarded elsewhere), and the key goes only in NVD's `apiKey` request header.
 
 How NVD data is converted:
 
@@ -448,7 +466,16 @@ How NVD data is converted:
 Limitations:
 
 - **AND configurations.** NVD often says "product X is vulnerable when running on platform Y". rmap keeps X's match and ignores Y, since a scan can't verify the platform, so such CVEs can be over-reported.
-- **NVD's backlog.** Many recent CVEs have no CPE data yet (NVD enrichment lags publication), so they can't be matched to a product and aren't in the file until NVD analyses them; the next monthly build picks them up.
+- **NVD's backlog.** Many recent CVEs have no CPE data yet (NVD enrichment lags publication), so they can't be matched to a product and aren't in the file until NVD analyses them; the next build or refresh picks them up once NVD updates them.
+- **KEV on unscored CVEs.** A CVE with no CVSS data gets its placeholder severity when it is fetched; if it joins the KEV list later, a refresh updates its KEV date (and its marker) but its severity only once NVD next modifies it.
+
+### Vulnerability data (maintainers)
+
+Ordinary users never need GitHub Actions: Build from NVD works on its own. The **Vulnerability data** Action only publishes the optional prebuilt file behind **Download prebuilt**.
+
+> **New repository or fork?** The `vulndb` release doesn't exist until this Action has run once, so until then **Download prebuilt** fails with HTTP 404 (Build from NVD still works). After pushing to `main`, go to **Actions** → **Vulnerability data** → **Run workflow** (branch `main`) and wait for it to finish; the **Releases** page should then show `vulndb` with `vulns.db` and `vulns.json`. A fork that doesn't publish its own data can leave Update URL on the default and use the upstream release.
+
+The Action (`.github/workflows/vulndb.yml`) runs `tools/vulndb-build`, a thin wrapper around `rmap_nvd::build` that always does a full build, on the 1st of every month and on demand (Actions → Vulnerability data → Run workflow, on `main`; other branches skip the job). It writes `vulns.db` and `vulns.meta.json`, then uploads `vulns.db` and the manifest `vulns.json` (`schema_version`, `built_at`, `cve_count`, `source`, `size`, `sha256`, `db`) to the release tagged `vulndb`, replacing the previous month's files.
 
 Run the builder locally (it writes into `OUT_DIR`, which must not already contain `vulns.db` or `vulns.meta.json`):
 

@@ -10,6 +10,7 @@ rust-version.workspace = true
 rmap-core = { workspace = true, features = ["serde"] }
 rmap-log = { workspace = true }
 rmap-engine = { workspace = true }
+rmap-nvd = { workspace = true }
 rmap-oui = { workspace = true }
 rmap-report = { workspace = true }
 rmap-vuln = { workspace = true }

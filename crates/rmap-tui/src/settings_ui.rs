@@ -1,16 +1,23 @@
 //! The Settings screen (`S` on the results screen, F2 on the setup form)
-//! and the "Update now" flow for the CVE data.
+//! and the two ways to get CVE data: "Build from NVD" and "Download
+//! prebuilt".
 //!
-//! Nothing here touches the network unless the user presses Update now,
-//! or turned on the startup check. Update now asks before downloading:
-//! fetch the manifest on a background thread, show what it offers (and
-//! whether it is older than the installed data), then on `y` install it on
-//! another background thread with live progress. Closing the screen
-//! cancels a pending check or question; a download already running
-//! finishes in the background and reports to the log panel.
+//! Nothing here touches the network unless the user presses one of them,
+//! or turned on the startup check. Both ask before starting. Download
+//! fetches the manifest on a background thread, shows what it offers (and
+//! whether it is older than the installed data), then on `y` installs it
+//! on another background thread with live progress. Build says whether it
+//! will be a full build or a refresh and roughly how long it takes, then
+//! on `y` runs `rmap_nvd::build` on a background thread with live progress
+//! and ETA; pressing the button again cancels it. Closing the screen
+//! cancels a pending check or question; a download or build already
+//! running finishes in the background and reports to the log panel.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::Duration;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
@@ -18,12 +25,15 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use rmap_nvd::{BuildError, BuildOptions, BuildProgress, Built, Plan};
 use rmap_vuln::{DbError, DbInfo, Manifest, Progress, UpdateError};
 
 use crate::app::{App, WARNING_PREFIX};
 use crate::input::TextInput;
 use crate::mouse::HitMap;
-use crate::settings::{self, STALE_DAYS, Settings, check_update_url};
+use crate::settings::{
+    self, ApiKey, KeySource, MAX_KEY_CHARS, STALE_DAYS, Settings, check_api_key, check_update_url,
+};
 use crate::ui::{ACCENT, centered, key_help};
 
 /// The downloader's own URL limit.
@@ -34,13 +44,17 @@ const MAX_SHOWN: usize = 300;
 
 type FetchFn = fn(&str) -> Result<Manifest, UpdateError>;
 type InstallFn = fn(&Manifest, &Path, &mut dyn FnMut(Progress)) -> Result<DbInfo, UpdateError>;
+type BuildFn =
+    fn(&BuildOptions, &mut dyn FnMut(BuildProgress), &AtomicBool) -> Result<Built, BuildError>;
 
-/// The network side of an update: `rmap_vuln::{fetch_manifest, install}`.
-/// Plain function pointers, so tests drive the whole flow with fakes.
+/// The network side of getting CVE data: `rmap_vuln::{fetch_manifest,
+/// install}` and `rmap_nvd::build`. Plain function pointers, so tests
+/// drive the whole flow with fakes.
 #[derive(Clone, Copy)]
 pub struct Updater {
     pub fetch: FetchFn,
     pub install: InstallFn,
+    pub build: BuildFn,
 }
 
 impl Default for Updater {
@@ -48,6 +62,7 @@ impl Default for Updater {
         Updater {
             fetch: rmap_vuln::fetch_manifest,
             install: rmap_vuln::install,
+            build: rmap_nvd::build,
         }
     }
 }
@@ -85,7 +100,11 @@ impl DbStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Row {
+    BuildNvd,
+    /// "Download prebuilt" (the original "Update now").
     UpdateNow,
+    ApiKey,
+    CopyLink,
     Url,
     ResetUrl,
     Startup,
@@ -93,8 +112,11 @@ pub enum Row {
     Highlight,
 }
 
-const ROWS: [Row; 6] = [
+const ROWS: [Row; 9] = [
+    Row::BuildNvd,
     Row::UpdateNow,
+    Row::ApiKey,
+    Row::CopyLink,
     Row::Url,
     Row::ResetUrl,
     Row::Startup,
@@ -107,6 +129,7 @@ pub struct SettingsScreen {
     pub focus: Row,
     url: TextInput,
     days: TextInput,
+    key: TextInput,
     /// "saved", or why a change wasn't; and whether it is an error.
     message: Option<(String, bool)>,
 }
@@ -125,11 +148,36 @@ enum Job {
         rx: Receiver<InstallMsg>,
         progress: Option<Progress>,
     },
+    ConfirmBuild {
+        question: String,
+    },
+    Building {
+        rx: Receiver<BuildMsg>,
+        progress: Option<BuildProgress>,
+        cancel: Arc<AtomicBool>,
+    },
+}
+
+impl Job {
+    /// Waiting for a y/n answer.
+    fn asking(&self) -> bool {
+        matches!(self, Job::Confirm { .. } | Job::ConfirmBuild { .. })
+    }
+
+    /// A download or build that runs on even if Settings closes.
+    fn running(&self) -> bool {
+        matches!(self, Job::Installing { .. } | Job::Building { .. })
+    }
 }
 
 enum InstallMsg {
     Progress(Progress),
     Done(Result<DbInfo, UpdateError>),
+}
+
+enum BuildMsg {
+    Progress(BuildProgress),
+    Done(Result<Built, BuildError>),
 }
 
 pub struct SettingsState {
@@ -146,6 +194,8 @@ pub struct SettingsState {
     /// The latest update result, startup notice or settings warning, and
     /// whether it is an error. Shown on the setup form and this screen.
     pub notice: Option<(String, bool)>,
+    /// `NVD_API_KEY`, read once at startup (`None` in unit tests).
+    pub env_key: Option<Result<String, ()>>,
 }
 
 impl SettingsState {
@@ -163,6 +213,7 @@ impl SettingsState {
             job: Job::Idle,
             startup: None,
             notice: warning.map(|w| (clean(&w), true)),
+            env_key: None,
         }
     }
 
@@ -174,6 +225,14 @@ impl SettingsState {
             rmap_vuln::default_path()
         };
         let mut s = SettingsState::new(settings::default_path(), db_path, Updater::default());
+        if !cfg!(test) {
+            s.env_key = settings::env_key();
+        }
+        match &s.env_key {
+            Some(Ok(_)) => rmap_log::info!("NVD API key: from NVD_API_KEY"),
+            Some(Err(())) => rmap_log::warn!("NVD_API_KEY is not a valid NVD API key; ignored"),
+            None => {}
+        }
         if s.settings.vuln_check_on_startup {
             s.start_startup_check();
         }
@@ -195,9 +254,14 @@ impl SettingsState {
         self.screen.is_some()
     }
 
-    /// Whether a check or download is in progress.
+    /// Whether a check, download or build is in progress.
     pub fn is_busy(&self) -> bool {
         !matches!(self.job, Job::Idle)
+    }
+
+    /// The key "Build from NVD" would use, and where it comes from.
+    fn build_key(&self) -> Option<(String, KeySource)> {
+        settings::effective_key(&self.settings.nvd_api_key, self.env_key.clone())
     }
 
     fn persist(&mut self) {
@@ -236,9 +300,10 @@ impl App {
         let s = &mut self.settings;
         s.db = DbStatus::read(s.db_path.as_deref());
         s.screen = Some(SettingsScreen {
-            focus: Row::UpdateNow,
+            focus: Row::BuildNvd,
             url: TextInput::new(s.settings.vuln_update_url.as_str()),
             days: TextInput::new(s.settings.vuln_stale_days.to_string()),
+            key: TextInput::new(s.settings.nvd_api_key.0.as_str()),
             message: None,
         });
     }
@@ -246,7 +311,7 @@ impl App {
     fn close_settings(&mut self) {
         let rejected = self.commit_text();
         let s = &mut self.settings;
-        if matches!(s.job, Job::Checking { .. } | Job::Confirm { .. }) {
+        if matches!(s.job, Job::Checking { .. }) || s.job.asking() {
             rmap_log::info!("CVE data update cancelled: settings closed");
             s.job = Job::Idle;
         }
@@ -267,13 +332,16 @@ impl App {
     }
 
     pub(crate) fn on_settings_key(&mut self, key: KeyEvent) {
-        if matches!(self.settings.job, Job::Confirm { .. }) {
+        if self.settings.job.asking() {
+            let build = matches!(self.settings.job, Job::ConfirmBuild { .. });
             match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if build => self.start_build(),
                 KeyCode::Char('y') | KeyCode::Char('Y') => self.start_install(),
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    rmap_log::info!("CVE data download declined");
+                    let what = if build { "build" } else { "download" };
+                    rmap_log::info!("CVE data {what} declined");
                     self.settings.job = Job::Idle;
-                    self.set_message("download cancelled", false);
+                    self.set_message(&format!("{what} cancelled"), false);
                 }
                 _ => {}
             }
@@ -292,12 +360,20 @@ impl App {
             KeyCode::Tab | KeyCode::Down => self.move_settings_focus(true),
             KeyCode::BackTab | KeyCode::Up => self.move_settings_focus(false),
             _ => match focus {
-                Row::Url | Row::Days if code == KeyCode::Enter => {
+                Row::Url | Row::Days | Row::ApiKey if code == KeyCode::Enter => {
                     self.commit_text();
                 }
-                Row::Url | Row::Days => self.edit_text(focus, &key),
+                Row::Url | Row::Days | Row::ApiKey => self.edit_text(focus, &key),
                 _ if !activate => {}
+                Row::BuildNvd => self.build_nvd(),
                 Row::UpdateNow => self.update_now(),
+                Row::CopyLink => {
+                    self.clipboard = Some(rmap_nvd::API_KEY_URL.into());
+                    self.set_message(
+                        "link copied (if your terminal allows OSC 52 clipboard writes)",
+                        false,
+                    );
+                }
                 Row::ResetUrl => {
                     let default = Settings::default().vuln_update_url;
                     if let Some(sc) = self.settings.screen.as_mut() {
@@ -322,23 +398,21 @@ impl App {
     }
 
     pub(crate) fn on_settings_paste(&mut self, pasted: &str) {
-        if matches!(self.settings.job, Job::Confirm { .. }) {
+        if self.settings.job.asking() {
             return;
         }
         let Some(sc) = self.settings.screen.as_mut() else {
             return;
         };
         let line = pasted.lines().next().unwrap_or("").trim();
-        let (input, max) = match sc.focus {
-            Row::Url => (&mut sc.url, MAX_URL_CHARS),
-            Row::Days => (&mut sc.days, MAX_DAYS_CHARS),
-            _ => return,
+        let focus = sc.focus;
+        let Some((input, max)) = text_field(sc, focus) else {
+            return;
         };
         let room = max.saturating_sub(input.len_chars());
-        let digits_only = sc.focus == Row::Days;
         let text: String = line
             .chars()
-            .filter(|c| !digits_only || c.is_ascii_digit())
+            .filter(|&c| allowed(focus, c))
             .take(room)
             .collect();
         input.insert_str(&text);
@@ -346,9 +420,7 @@ impl App {
     }
 
     pub(crate) fn on_settings_mouse(&mut self, kind: MouseEventKind, pos: Position) {
-        if kind != MouseEventKind::Down(MouseButton::Left)
-            || matches!(self.settings.job, Job::Confirm { .. })
-        {
+        if kind != MouseEventKind::Down(MouseButton::Left) || self.settings.job.asking() {
             return;
         }
         let Some(&(row, _)) = self.hits.settings.iter().find(|(_, r)| r.contains(pos)) else {
@@ -362,7 +434,7 @@ impl App {
                 sc.focus = row;
             }
         }
-        if !matches!(row, Row::Url | Row::Days) {
+        if !matches!(row, Row::Url | Row::Days | Row::ApiKey) {
             let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
             self.on_settings_key(space);
         }
@@ -395,15 +467,13 @@ impl App {
         let Some(sc) = self.settings.screen.as_mut() else {
             return;
         };
-        let (input, max) = if focus == Row::Url {
-            (&mut sc.url, MAX_URL_CHARS)
-        } else {
-            (&mut sc.days, MAX_DAYS_CHARS)
+        let Some((input, max)) = text_field(sc, focus) else {
+            return;
         };
         // Ctrl keys edit (Ctrl-U clears); every other character inserts.
         if let KeyCode::Char(c) = key.code
             && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && (input.len_chars() >= max || (focus == Row::Days && !c.is_ascii_digit()))
+            && (input.len_chars() >= max || !allowed(focus, c))
         {
             return;
         }
@@ -447,6 +517,23 @@ impl App {
                     _ => "Stale after not saved: enter a number of days from 1 to 365".into(),
                 }
             }
+            Row::ApiKey => {
+                let key = sc.key.trim().to_string();
+                if key == s.settings.nvd_api_key.0 {
+                    return None;
+                }
+                match check_api_key(&key) {
+                    Ok(()) => {
+                        let what = if key.is_empty() { "cleared" } else { "saved" };
+                        rmap_log::info!("NVD API key {what}");
+                        s.settings.nvd_api_key = ApiKey(key);
+                        s.persist();
+                        return None;
+                    }
+                    // Never echoes the key.
+                    Err(e) => format!("NVD API key not saved: {e}"),
+                }
+            }
             _ => return None,
         };
         rmap_log::info!("{error}");
@@ -464,8 +551,8 @@ impl App {
             return;
         }
         let s = &mut self.settings;
-        if matches!(s.job, Job::Installing { .. }) {
-            self.set_message("an update is already running", true);
+        if s.job.running() {
+            self.set_message("a download or build is already running", true);
             return;
         }
         if s.db_path.is_none() {
@@ -521,6 +608,80 @@ impl App {
         }
     }
 
+    /// "Build from NVD": asks first (full build or refresh, how long, which
+    /// key); while a build runs, the same button cancels it.
+    fn build_nvd(&mut self) {
+        if let Job::Building { cancel, .. } = &self.settings.job {
+            cancel.store(true, Ordering::Relaxed);
+            rmap_log::info!("NVD build: cancel requested");
+            self.set_message("cancelling after the current request…", false);
+            return;
+        }
+        if self.scan_busy() {
+            self.set_message(
+                "stop the running scan first: it is reading the CVE data",
+                true,
+            );
+            return;
+        }
+        let s = &mut self.settings;
+        if s.job.running() {
+            self.set_message("a download or build is already running", true);
+            return;
+        }
+        let Some(dest) = s.db_path.clone() else {
+            self.set_message(
+                "no data directory to build into (set HOME or LOCALAPPDATA)",
+                true,
+            );
+            return;
+        };
+        let plan = rmap_nvd::plan(&dest);
+        let question = build_question(&plan, s.build_key().map(|(_, from)| from));
+        rmap_log::info!("NVD build offered: {plan:?}");
+        s.job = Job::ConfirmBuild { question };
+        if let Some(sc) = s.screen.as_mut() {
+            sc.message = None;
+        }
+    }
+
+    /// After `y`: build in the background.
+    fn start_build(&mut self) {
+        let s = &mut self.settings;
+        s.job = Job::Idle;
+        let Some(dest) = s.db_path.clone() else {
+            return;
+        };
+        let opts = BuildOptions::new(dest, s.build_key().map(|(key, _)| key));
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let build = s.updater.build;
+        let spawned = std::thread::Builder::new()
+            .name("rmap-nvd-build".into())
+            .spawn(move || {
+                let result = build(
+                    &opts,
+                    &mut |p| {
+                        let _ = tx.send(BuildMsg::Progress(p));
+                    },
+                    &flag,
+                );
+                let _ = tx.send(BuildMsg::Done(result));
+            });
+        match spawned {
+            Ok(_) => {
+                s.notice = None;
+                s.job = Job::Building {
+                    rx,
+                    progress: None,
+                    cancel,
+                };
+            }
+            Err(e) => self.set_message(&format!("could not start the build: {e}"), true),
+        }
+    }
+
     /// Called every frame: collects background check and download results.
     pub(crate) fn poll_settings(&mut self) {
         let s = &mut self.settings;
@@ -567,6 +728,32 @@ impl App {
                     Err(TryRecvError::Empty) => break None,
                     Err(TryRecvError::Disconnected) => {
                         break Some(Err("CVE data update stopped unexpectedly".into()));
+                    }
+                }
+            },
+            Job::Building { rx, progress, .. } => loop {
+                match rx.try_recv() {
+                    Ok(BuildMsg::Progress(p)) => *progress = Some(p),
+                    Ok(BuildMsg::Done(Ok(b))) => {
+                        let count = thousands(b.info.cve_count);
+                        break Some(Ok(if b.refreshed {
+                            format!(
+                                "CVE data refreshed from NVD: {} changed CVEs read, {count} CVEs",
+                                thousands(b.read)
+                            )
+                        } else {
+                            format!("CVE data built from NVD: {count} CVEs")
+                        }));
+                    }
+                    Ok(BuildMsg::Done(Err(BuildError::Cancelled))) => {
+                        break Some(Ok("NVD build cancelled; CVE data unchanged".into()));
+                    }
+                    Ok(BuildMsg::Done(Err(e))) => {
+                        break Some(Err(format!("NVD build failed: {e}")));
+                    }
+                    Err(TryRecvError::Empty) => break None,
+                    Err(TryRecvError::Disconnected) => {
+                        break Some(Err("NVD build stopped unexpectedly".into()));
                     }
                 }
             },
@@ -645,6 +832,63 @@ fn question(m: &Manifest, db: &DbStatus) -> String {
         _ => base,
     };
     clean(&q)
+}
+
+/// The y/n question before building from NVD.
+fn build_question(plan: &Plan, key: Option<KeySource>) -> String {
+    let what = match plan {
+        Plan::Full(why) => format!(
+            "Full build ({why}): every CVE, about 30 minutes without an API key, \
+             10-15 with one."
+        ),
+        Plan::Refresh { age_days, .. } => format!(
+            "Refresh: fetches only CVEs changed since the last NVD sync ({}), \
+             usually a minute or two.",
+            match age_days {
+                0 => "today".to_string(),
+                1 => "1 day ago".to_string(),
+                n => format!("{n} days ago"),
+            }
+        ),
+    };
+    let key = match key {
+        Some(KeySource::Settings) => "your NVD API key from Settings",
+        Some(KeySource::Env) => "your NVD API key from NVD_API_KEY",
+        None => "no API key (NVD's slower keyless rate)",
+    };
+    // All rmap's own text, so not cut to MAX_SHOWN like outside text.
+    format!(
+        "Build the CVE data from NVD? {what} Uses {key}; requests go to nvd.nist.gov and \
+         cisa.gov. The current data is replaced only if the new file checks out. {}",
+        rmap_nvd::NVD_NOTICE
+    )
+}
+
+/// The focused text input and its length limit, if the row is one.
+fn text_field(sc: &mut SettingsScreen, row: Row) -> Option<(&mut TextInput, usize)> {
+    match row {
+        Row::Url => Some((&mut sc.url, MAX_URL_CHARS)),
+        Row::Days => Some((&mut sc.days, MAX_DAYS_CHARS)),
+        Row::ApiKey => Some((&mut sc.key, MAX_KEY_CHARS)),
+        _ => None,
+    }
+}
+
+/// Characters a text field takes.
+fn allowed(row: Row, c: char) -> bool {
+    match row {
+        Row::Days => c.is_ascii_digit(),
+        Row::ApiKey => settings::key_char_ok(c),
+        _ => true,
+    }
+}
+
+/// "about 14 min left" for an ETA.
+fn eta_text(eta: Duration) -> String {
+    match eta.as_secs() {
+        0..60 => "under a minute left".into(),
+        s => format!("about {} min left", s.div_ceil(60)),
+    }
 }
 
 /// Replaces control characters (terminal escapes) and caps the length, for
@@ -730,17 +974,21 @@ fn status_text(db: &DbStatus, stale_days: u32, today: i64) -> (String, Style) {
                 }
             };
             text += &format!(" · {} CVEs", thousands(info.cve_count));
-            if !info.source.is_empty() {
+            if info.source == rmap_nvd::SOURCE {
+                text += &format!(" · {} (prebuilt download)", info.source);
+            } else if !info.source.is_empty() {
                 text += &format!(" · {}", info.source);
             }
             (clean(&text), style)
         }
         DbStatus::Missing => (
-            "not downloaded yet: CVE matching is off until you update".into(),
+            "none yet: build or download it to turn on CVE matching".into(),
             warn,
         ),
         DbStatus::Invalid(e) => (
-            clean(&format!("unusable ({e}); Update now replaces it")),
+            clean(&format!(
+                "unusable ({e}); building or downloading replaces it"
+            )),
             Style::new().fg(Color::Red),
         ),
         DbStatus::NoLocation => (
@@ -750,12 +998,36 @@ fn status_text(db: &DbStatus, stale_days: u32, today: i64) -> (String, Style) {
     }
 }
 
-/// The line under Update now: what the background job is doing, or the
-/// latest result.
-fn job_line(state: &SettingsState) -> Line<'static> {
+/// The line under the get-data buttons: what the background job is doing,
+/// or the latest result.
+fn job_line(state: &SettingsState, scan_busy: bool) -> Line<'static> {
     let text = match &state.job {
         Job::Checking { host, .. } => format!("checking {host}…"),
-        Job::Confirm { .. } => "waiting for your answer…".into(),
+        Job::Confirm { .. } | Job::ConfirmBuild { .. } => "waiting for your answer…".into(),
+        Job::Building { cancel, .. } if cancel.load(Ordering::Relaxed) => {
+            "cancelling after the current request…".into()
+        }
+        Job::Building { progress, .. } => match progress {
+            None | Some(BuildProgress::Kev) => "downloading the CISA KEV list…".into(),
+            Some(BuildProgress::Nvd { read, total, eta }) => {
+                let mut t = format!(
+                    "NVD: {} of {} CVEs ({}%)",
+                    thousands(*read),
+                    thousands(*total),
+                    (read.saturating_mul(100)).checked_div(*total).unwrap_or(0)
+                );
+                if let Some(eta) = eta {
+                    t += &format!(" · {}", eta_text(*eta));
+                }
+                t
+            }
+            Some(BuildProgress::Retrying { wait }) => format!(
+                "NVD is busy or rate limiting: retrying in {} s…",
+                wait.as_secs()
+            ),
+            Some(BuildProgress::Writing) => "writing the database…".into(),
+            Some(BuildProgress::Verifying) => "verifying the new database…".into(),
+        },
         Job::Installing { progress, .. } => match progress {
             Some(Progress::Downloading { done, total }) => format!(
                 "downloading {} of {} ({}%)",
@@ -767,6 +1039,10 @@ fn job_line(state: &SettingsState) -> Line<'static> {
             Some(Progress::Installing) => "installing…".into(),
             Some(Progress::Manifest) | None => "starting the download…".into(),
         },
+        Job::Idle if scan_busy => {
+            return Line::from("stop the running scan first: it is reading the CVE data")
+                .fg(Color::Yellow);
+        }
         Job::Idle => {
             return match &state.notice {
                 Some((text, true)) => Line::from(format!("✗ {text}")).fg(Color::Red),
@@ -803,6 +1079,9 @@ pub(crate) fn draw(frame: &mut Frame, state: &SettingsState, scan_busy: bool, hi
         update,
         job,
         _,
+        key,
+        link,
+        link_url,
         url,
         reset,
         startup,
@@ -825,13 +1104,29 @@ pub(crate) fn draw(frame: &mut Frame, state: &SettingsState, scan_busy: bool, hi
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .margin(1)
     .areas(inner);
+    // The two get-data buttons share a line: label (13) + "[ Build from
+    // NVD ]" (18) + 2 spaces + "[ Download prebuilt ]" (21).
+    let part = |x: u16, w: u16| {
+        let x = update.x.saturating_add(x).min(update.right());
+        Rect {
+            x,
+            width: w.min(update.right() - x),
+            ..update
+        }
+    };
     hits.settings = vec![
-        (Row::UpdateNow, update),
+        (Row::BuildNvd, part(0, 31)),
+        (Row::UpdateNow, part(33, 21)),
+        (Row::ApiKey, key),
+        (Row::CopyLink, link),
         (Row::Url, url),
         (Row::ResetUrl, reset),
         (Row::Startup, startup),
@@ -893,49 +1188,88 @@ pub(crate) fn draw(frame: &mut Frame, state: &SettingsState, scan_busy: bool, hi
         status_text_area,
     );
 
-    let updating = matches!(state.job, Job::Installing { .. });
+    let building = matches!(state.job, Job::Building { .. });
+    let free = !scan_busy && !state.job.running();
+    let get_focus = Some(sc.focus).filter(|f| matches!(f, Row::BuildNvd | Row::UpdateNow));
     let mut update_spans = vec![
-        label(Some(Row::UpdateNow), "Update"),
-        button(Row::UpdateNow, "Update now", !scan_busy && !updating),
+        label(get_focus, "Get data"),
+        if building {
+            button(Row::BuildNvd, " Cancel build ", true)
+        } else {
+            button(Row::BuildNvd, "Build from NVD", free)
+        },
+        Span::raw("  "),
+        button(Row::UpdateNow, "Download prebuilt", free),
     ];
-    if scan_busy {
-        update_spans.push(Span::raw("  stop the running scan first").fg(Color::Yellow));
-    } else if !state.is_busy() {
-        update_spans.push(Span::raw("  asks before downloading").dim());
+    if free && !state.is_busy() {
+        update_spans.push(Span::raw("  both ask first").dim());
     }
     line(frame, update, update_spans);
     let mut job_spans = vec![pad()];
-    job_spans.extend(job_line(state).spans);
+    job_spans.extend(job_line(state, scan_busy).spans);
     frame.render_widget(
         Paragraph::new(Line::from(job_spans)).wrap(Wrap { trim: false }),
         job,
     );
 
     // A focused input scrolls sideways so the cursor stays on screen; an
-    // unfocused one shows its start.
-    let input = |frame: &mut Frame, area: Rect, row: Row, name, value: &TextInput, width: usize| {
+    // unfocused one shows its start, or `shown` in its place.
+    let input = |frame: &mut Frame,
+                 area: Rect,
+                 row: Row,
+                 name,
+                 value: &TextInput,
+                 shown: Option<Span<'static>>| {
+        let width = area.width.saturating_sub(13) as usize;
         let (window, cursor) = if sc.focus == row {
-            value.window(width)
+            let (w, c) = value.window(width);
+            (Span::raw(w), c)
         } else {
-            (crate::ui::ellipsize(value, width), 0)
+            let s = shown.unwrap_or_else(|| Span::raw(crate::ui::ellipsize(value, width)));
+            (s, 0)
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![label(Some(row), name), Span::raw(window)])),
+            Paragraph::new(Line::from(vec![label(Some(row), name), window])),
             area,
         );
-        if sc.focus == row && !matches!(state.job, Job::Confirm { .. }) {
+        if sc.focus == row && !state.job.asking() {
             let x = area.x + 13 + cursor as u16;
             frame.set_cursor_position((x.min(area.right().saturating_sub(1)), area.y));
         }
     };
+    // The key is shown only while it is being edited.
+    let saved = &state.settings.nvd_api_key.0;
+    let key_shown = match &state.env_key {
+        Some(Ok(_)) => Span::raw("set by NVD_API_KEY (overrides the saved key)").fg(ACCENT),
+        Some(Err(())) => {
+            Span::raw("NVD_API_KEY is not a valid key and is ignored").fg(Color::Yellow)
+        }
+        None if saved.is_empty() => Span::raw("none: optional, makes full builds faster").dim(),
+        None => Span::raw(settings::mask(saved)),
+    };
     input(
         frame,
-        url,
-        Row::Url,
-        "Update URL",
-        &sc.url,
-        url.width.saturating_sub(13) as usize,
+        key,
+        Row::ApiKey,
+        "NVD API key",
+        &sc.key,
+        Some(key_shown),
     );
+    line(
+        frame,
+        link,
+        vec![
+            pad(),
+            button(Row::CopyLink, "Copy key request link", true),
+            Span::raw("  free from NVD").dim(),
+        ],
+    );
+    line(
+        frame,
+        link_url,
+        vec![pad(), Span::raw(rmap_nvd::API_KEY_URL).dim()],
+    );
+    input(frame, url, Row::Url, "Update URL", &sc.url, None);
     let mut reset_spans = vec![pad(), button(Row::ResetUrl, "Reset URL to default", true)];
     if state.settings.vuln_update_url == rmap_vuln::DEFAULT_MANIFEST_URL {
         reset_spans.push(Span::raw("  (using the default)").dim());
@@ -958,7 +1292,11 @@ pub(crate) fn draw(frame: &mut Frame, state: &SettingsState, scan_busy: bool, hi
             Span::raw("    contacts the update URL each time rmap starts").dim(),
         ],
     );
-    input(frame, days, Row::Days, "Stale after", &sc.days, 3);
+    let days_input = Rect {
+        width: days.width.min(16),
+        ..days
+    };
+    input(frame, days_input, Row::Days, "Stale after", &sc.days, None);
     frame.render_widget(
         Paragraph::new(Line::from("days: warn when CVE data is older than this")).dim(),
         Rect {
@@ -990,14 +1328,17 @@ pub(crate) fn draw(frame: &mut Frame, state: &SettingsState, scan_busy: bool, hi
     };
     frame.render_widget(Paragraph::new(shown), message);
 
-    if let Job::Confirm { question, .. } = &state.job {
-        draw_question(frame, question);
+    match &state.job {
+        Job::Confirm { question, .. } => draw_question(frame, question, "download"),
+        Job::ConfirmBuild { question } => draw_question(frame, question, "build"),
+        _ => {}
     }
 }
 
-fn draw_question(frame: &mut Frame, question: &str) {
+fn draw_question(frame: &mut Frame, question: &str, yes: &'static str) {
     let width = 64.min(frame.area().width);
-    let text_w = usize::from(width.saturating_sub(4)).max(1);
+    // Narrower than the box, since word wrapping leaves ragged lines.
+    let text_w = usize::from(width.saturating_sub(10)).max(1);
     let lines = question.chars().count().div_ceil(text_w) as u16 + 1;
     let area = centered(frame.area(), width, (lines + 4).min(frame.area().height));
     frame.render_widget(Clear, area);
@@ -1005,7 +1346,7 @@ fn draw_question(frame: &mut Frame, question: &str) {
         Paragraph::new(vec![
             Line::from(question.to_string()),
             Line::default(),
-            key_help(&[("y", "download"), ("n", "cancel")]).centered(),
+            key_help(&[("y", yes), ("n", "cancel")]).centered(),
         ])
         .wrap(Wrap { trim: true })
         .block(

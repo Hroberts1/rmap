@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs::OpenOptions;
 use std::path::Path;
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, Row, params};
 
 use crate::ParsedCpe;
@@ -19,7 +20,9 @@ use rmap_core::{VulnSeverity, Vulnerability};
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// Schema v1. `meta` keys: `schema_version`, `built_at` (RFC 3339 UTC),
-/// `source` (free text) and `cve_count`. Versions are stored in the
+/// `source` (free text) and `cve_count`; builders may add their own (the
+/// NVD builder records `nvd_last_modified` and `nvd_products`), which
+/// readers ignore. Versions are stored in the
 /// combined form `version.rs` compares (`9.7p1`); SQL only selects rows by
 /// vendor and product, and Rust decides range membership.
 pub const SCHEMA_SQL: &str = "
@@ -245,9 +248,10 @@ pub(crate) fn find(conn: &Connection, cpe: &ParsedCpe) -> rusqlite::Result<Vec<V
     Ok(found)
 }
 
-/// Builds a new database file. Everything goes in one transaction that
+/// Builds a new database file, or changes a copy of one
+/// ([`Writer::open_existing`]). Everything goes in one transaction that
 /// [`Writer::finish`] commits; dropping a `Writer` without finishing
-/// leaves an empty file that [`crate::Database::open`] rejects.
+/// leaves an empty (or unchanged) file.
 pub struct Writer {
     conn: Connection,
 }
@@ -267,6 +271,80 @@ impl Writer {
         conn.execute_batch(&format!("BEGIN;{SCHEMA_SQL}"))
             .map_err(write_err)?;
         Ok(Writer { conn })
+    }
+
+    /// Opens an existing schema-v1 file for changes, for refreshing a copy
+    /// in place. The file may have been downloaded, so anything besides
+    /// rmap's own tables and index (a trigger or view that would run on
+    /// our writes) makes it [`DbError::Invalid`].
+    pub fn open_existing(path: &Path) -> Result<Writer, DbError> {
+        if !path.is_file() {
+            return Err(DbError::NotFound);
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(invalid)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)
+            .and_then(|_| conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true))
+            .map_err(invalid)?;
+        let (ours, other): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                   count(*) FILTER (WHERE type = 'table' AND name IN ('meta', 'cve', 'cpe_match')),
+                   count(*) FILTER (WHERE NOT (
+                     (type = 'table' AND name IN ('meta', 'cve', 'cpe_match'))
+                     OR (type = 'index' AND (name = 'cpe_match_product'
+                                             OR substr(name, 1, 17) = 'sqlite_autoindex_'))))
+                 FROM sqlite_master",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(invalid)?;
+        if ours != 3 || other != 0 {
+            return Err(invalid("unexpected tables, views or triggers"));
+        }
+        if meta(&conn, "schema_version").map_err(invalid)?.as_deref()
+            != Some(SCHEMA_VERSION.to_string().as_str())
+        {
+            return Err(invalid(format!("not schema version {SCHEMA_VERSION}")));
+        }
+        conn.execute_batch("BEGIN").map_err(write_err)?;
+        Ok(Writer { conn })
+    }
+
+    /// Removes a CVE and its match rows, if present.
+    pub fn remove(&mut self, id: &str) -> Result<(), DbError> {
+        for sql in [
+            "DELETE FROM cpe_match WHERE cve_id = ?1",
+            "DELETE FROM cve WHERE id = ?1",
+        ] {
+            self.conn
+                .prepare_cached(sql)
+                .and_then(|mut s| s.execute([id]))
+                .map_err(write_err)?;
+        }
+        Ok(())
+    }
+
+    /// Replaces every CVE's `kev_added` with `dates` (CVE id -> date);
+    /// CVEs not in `dates` get none.
+    pub fn replace_kev<'a>(
+        &mut self,
+        dates: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<(), DbError> {
+        self.conn
+            .execute("UPDATE cve SET kev_added = NULL", [])
+            .map_err(write_err)?;
+        let mut stmt = self
+            .conn
+            .prepare_cached("UPDATE cve SET kev_added = ?2 WHERE id = ?1")
+            .map_err(write_err)?;
+        for (id, date) in dates {
+            stmt.execute([id, date]).map_err(write_err)?;
+        }
+        Ok(())
     }
 
     /// Adds one CVE. A duplicate id is an error.

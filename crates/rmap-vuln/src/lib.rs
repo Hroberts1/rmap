@@ -6,7 +6,9 @@
 //! unchanged, and a version the database has no data for is not evidence
 //! of safety.
 //!
-//! [`update`] downloads a new database file and installs it safely.
+//! [`update`] downloads a new database file and installs it safely;
+//! [`PartFile`] is the temporary-file-then-rename step it shares with the
+//! NVD builder (`rmap-nvd`).
 
 mod db;
 mod sha256;
@@ -22,8 +24,8 @@ use rusqlite::{Connection, OpenFlags};
 pub use db::{Bound, CpeMatch, DbError, Entry, SCHEMA_SQL, SCHEMA_VERSION, Writer};
 pub use rmap_core::{VulnSeverity, Vulnerability};
 pub use update::{
-    DEFAULT_MANIFEST_URL, MAX_DB_BYTES, Manifest, Progress, UpdateError, check_url, fetch_manifest,
-    install, update,
+    DEFAULT_MANIFEST_URL, MAX_DB_BYTES, Manifest, PartFile, Progress, UpdateError, check_url,
+    fetch_manifest, install, update,
 };
 
 /// What [`Database::find`] returns per matching CVE.
@@ -99,6 +101,15 @@ impl Database {
 
     pub fn info(&self) -> &DbInfo {
         &self.info
+    }
+
+    /// Any `meta` value, cleaned and capped like the others; `None` when
+    /// absent or unreadable.
+    pub fn meta(&self, key: &str) -> Option<String> {
+        db::meta(&self.conn(), key)
+            .ok()
+            .flatten()
+            .map(|v| db::clean_meta(Some(v)))
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {

@@ -395,6 +395,7 @@ fn pages_and_kev() {
     });
     let p = convert_page(&page, &products(), &HashMap::new()).unwrap();
     assert_eq!((p.total_results, p.returned, p.entries.len()), (10, 3, 1));
+    assert_eq!(p.ids, ["CVE-2024-6387", "CVE-2024-9"], "kept or not");
     assert_eq!(p.last_modified.as_deref(), Some("2025-01-02T00:00:00.000"));
     assert!(
         convert_page(

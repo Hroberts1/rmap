@@ -75,7 +75,7 @@ fn settle(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while matches!(
         app.settings.job,
-        Job::Checking { .. } | Job::Installing { .. }
+        Job::Checking { .. } | Job::Installing { .. } | Job::Building { .. }
     ) || app.settings.startup.is_some()
     {
         assert!(Instant::now() < deadline, "update job did not finish");
@@ -141,6 +141,66 @@ fn install_never(
 ) -> Result<DbInfo, UpdateError> {
     panic!("must not download")
 }
+fn build_never(
+    _: &BuildOptions,
+    _: &mut dyn FnMut(BuildProgress),
+    _: &AtomicBool,
+) -> Result<Built, BuildError> {
+    panic!("must not build")
+}
+/// The API keys `build_ok` was called with.
+static BUILD_KEYS: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(Vec::new());
+fn build_ok(
+    o: &BuildOptions,
+    progress: &mut dyn FnMut(BuildProgress),
+    _: &AtomicBool,
+) -> Result<Built, BuildError> {
+    BUILD_KEYS.lock().unwrap().push(o.api_key.clone());
+    progress(BuildProgress::Kev);
+    progress(BuildProgress::Nvd {
+        read: 2000,
+        total: 4000,
+        eta: Some(Duration::from_secs(90)),
+    });
+    progress(BuildProgress::Writing);
+    let path = o.dest.with_extension("db.fake");
+    let _ = std::fs::remove_file(&path);
+    let mut w = rmap_vuln::Writer::create(&path).unwrap();
+    w.set_meta("built_at", "2026-11-19T00:00:00Z").unwrap();
+    w.set_meta("source", &o.source).unwrap();
+    w.finish().unwrap();
+    std::fs::rename(&path, &o.dest).unwrap();
+    let info = rmap_vuln::Database::open(&o.dest).unwrap().info().clone();
+    Ok(Built {
+        info,
+        refreshed: false,
+        read: 4000,
+    })
+}
+/// Runs until cancelled (or 10 s pass).
+fn build_until_cancelled(
+    _: &BuildOptions,
+    progress: &mut dyn FnMut(BuildProgress),
+    cancel: &AtomicBool,
+) -> Result<Built, BuildError> {
+    progress(BuildProgress::Kev);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cancel.load(Ordering::Relaxed) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err(BuildError::Cancelled)
+}
+
+/// Tabs to `row` on the open Settings screen.
+fn focus(app: &mut App, row: Row) {
+    for _ in 0..ROWS.len() {
+        if app.settings.screen.as_ref().unwrap().focus == row {
+            return;
+        }
+        press(app, KeyCode::Tab);
+    }
+    panic!("could not reach {row:?}");
+}
 
 #[test]
 fn keys_open_and_close_settings() {
@@ -174,8 +234,11 @@ fn renders_at_80x24_wide_and_tiny() {
     for needle in [
         "Vulnerability data",
         "vulns.db",
-        "not downloaded yet: CVE matching is off until you update",
-        "[ Update now ]",
+        "none yet: build or download it to turn on CVE matching",
+        "[ Build from NVD ]  [ Download prebuilt ]",
+        "NVD API key  none: optional",
+        "[ Copy key request link ]",
+        rmap_nvd::API_KEY_URL,
         "https://github.com/",
         "Reset URL to default",
         "[ ] check for updates on startup",
@@ -216,6 +279,36 @@ fn renders_at_80x24_wide_and_tiny() {
     for (w, h) in [(1, 1), (20, 6), (40, 12)] {
         render(&mut app, w, h);
     }
+    let (_tx, rx) = mpsc::channel();
+    app.settings.job = Job::Building {
+        rx,
+        progress: Some(BuildProgress::Nvd {
+            read: 120_000,
+            total: 330_000,
+            eta: Some(Duration::from_secs(14 * 60)),
+        }),
+        cancel: Arc::default(),
+    };
+    let screen = render(&mut app, 80, 24);
+    assert!(
+        screen.contains("NVD: 120,000 of 330,000 CVEs (36%) · about 14 min left")
+            && screen.contains("[  Cancel build  ]  [ Download prebuilt ]"),
+        "{screen}"
+    );
+    for (w, h) in [(1, 1), (20, 6), (40, 12)] {
+        render(&mut app, w, h);
+    }
+    app.settings.job = Job::ConfirmBuild {
+        question: build_question(&Plan::Full("no CVE data yet".into()), None),
+    };
+    let screen = render(&mut app, 80, 24);
+    assert!(
+        screen.contains("Full build (no CVE data yet)") && screen.contains("build   n"),
+        "{screen}"
+    );
+    for (w, h) in [(1, 1), (20, 6), (40, 12), (200, 60)] {
+        render(&mut app, w, h);
+    }
     let m = manifest("2026-11-15T00:00:00Z");
     app.settings.job = Job::Confirm {
         question: question(&m, &app.settings.db),
@@ -241,9 +334,11 @@ fn update_now_downloads_after_asking() {
         Updater {
             fetch: fetch_new,
             install: install_ok,
+            build: build_never,
         },
     );
     press(&mut app, KeyCode::F(2));
+    focus(&mut app, Row::UpdateNow);
     press(&mut app, KeyCode::Enter);
     assert!(render(&mut app, 80, 24).contains("checking github.com…"));
     settle(&mut app);
@@ -281,9 +376,11 @@ fn failures_are_reported_in_the_screen_and_log() {
         Updater {
             fetch: fetch_404,
             install: install_never,
+            build: build_never,
         },
     );
     press(&mut app, KeyCode::Char('S'));
+    focus(&mut app, Row::UpdateNow);
     press(&mut app, KeyCode::Enter);
     settle(&mut app);
     let (notice, error) = app.settings.notice.clone().unwrap();
@@ -293,6 +390,7 @@ fn failures_are_reported_in_the_screen_and_log() {
     app.settings.updater = Updater {
         fetch: fetch_new,
         install: install_bad_hash,
+        build: build_never,
     };
     press(&mut app, KeyCode::Enter);
     settle(&mut app);
@@ -320,9 +418,11 @@ fn older_or_same_data_is_called_out_and_n_declines() {
         Updater {
             fetch: fetch_old,
             install: install_never,
+            build: build_never,
         },
     );
     press(&mut app, KeyCode::F(2));
+    focus(&mut app, Row::UpdateNow);
     press(&mut app, KeyCode::Enter);
     settle(&mut app);
     let screen = render(&mut app, 80, 24);
@@ -366,13 +466,17 @@ fn update_is_refused_while_a_scan_runs() {
         Updater {
             fetch: fetch_never,
             install: install_never,
+            build: build_never,
         },
     );
     press(&mut app, KeyCode::Char('S'));
     assert!(render(&mut app, 80, 24).contains("stop the running scan first"));
-    press(&mut app, KeyCode::Enter);
-    assert!(matches!(app.settings.job, Job::Idle), "nothing fetched");
-    assert!(message(&app).starts_with("stop the running scan first"));
+    for row in [Row::BuildNvd, Row::UpdateNow] {
+        focus(&mut app, row);
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.settings.job, Job::Idle), "nothing fetched");
+        assert!(message(&app).starts_with("stop the running scan first"));
+    }
     app.scan.as_mut().unwrap().scan.stop();
 }
 
@@ -386,15 +490,18 @@ fn closing_cancels_a_check_but_a_download_finishes() {
         Updater {
             fetch: fetch_new,
             install: install_ok,
+            build: build_never,
         },
     );
     press(&mut app, KeyCode::F(2));
+    focus(&mut app, Row::UpdateNow);
     press(&mut app, KeyCode::Enter);
     press(&mut app, KeyCode::Esc);
     assert!(!app.settings.is_open() && matches!(app.settings.job, Job::Idle));
     app.drain_events(); // a late answer goes nowhere
 
     press(&mut app, KeyCode::F(2));
+    focus(&mut app, Row::UpdateNow);
     press(&mut app, KeyCode::Enter);
     settle(&mut app);
     press(&mut app, KeyCode::Char('y'));
@@ -420,8 +527,7 @@ fn url_field_validates_saves_and_resets() {
     use_dir(&mut app, &dir, Updater::default());
     let file = dir.0.join("settings.json");
     press(&mut app, KeyCode::F(2));
-    press(&mut app, KeyCode::Tab);
-    assert_eq!(app.settings.screen.as_ref().unwrap().focus, Row::Url);
+    focus(&mut app, Row::Url);
 
     ctrl(&mut app, 'u');
     type_text(&mut app, "http://example.com/vulns.json");
@@ -485,8 +591,7 @@ fn url_field_validates_saves_and_resets() {
     );
 
     press(&mut app, KeyCode::F(2));
-    press(&mut app, KeyCode::Tab);
-    press(&mut app, KeyCode::Tab);
+    focus(&mut app, Row::ResetUrl);
     press(&mut app, KeyCode::Enter);
     assert_eq!(
         settings::load(Some(&file)).0.vuln_update_url,
@@ -501,9 +606,7 @@ fn days_field_takes_1_to_365() {
     use_dir(&mut app, &dir, Updater::default());
     let file = dir.0.join("settings.json");
     press(&mut app, KeyCode::F(2));
-    for _ in 0..4 {
-        press(&mut app, KeyCode::Tab);
-    }
+    focus(&mut app, Row::Days);
     assert_eq!(app.settings.screen.as_ref().unwrap().focus, Row::Days);
     let days = |app: &App| app.settings.screen.as_ref().unwrap().days.to_string();
 
@@ -542,9 +645,7 @@ fn toggles_save_and_mouse_clicks_them() {
     use_dir(&mut app, &dir, Updater::default());
     let file = dir.0.join("settings.json");
     press(&mut app, KeyCode::F(2));
-    for _ in 0..3 {
-        press(&mut app, KeyCode::Tab);
-    }
+    focus(&mut app, Row::Startup);
     press(&mut app, KeyCode::Char(' '));
     assert!(settings::load(Some(&file)).0.vuln_check_on_startup);
     press(&mut app, KeyCode::Left);
@@ -577,6 +678,7 @@ fn startup_check_only_reports_newer_data() {
     let updater = Updater {
         fetch: fetch_new,
         install: install_never,
+        build: build_never,
     };
     let (_rt, mut app) = app();
     app.settings = SettingsState::new(None, Some(dir.0.join("vulns.db")), updater);
@@ -675,4 +777,174 @@ fn formatting_helpers() {
     assert_eq!(style, Style::new());
     let (_, style) = status_text(&ready("2026-11-01"), 10, today);
     assert_eq!(style.fg, Some(Color::Yellow), "stale per the setting");
+}
+
+const KEY: &str = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+
+#[test]
+fn build_from_nvd_asks_then_builds_with_the_saved_key() {
+    let dir = TempDir::new("build");
+    let (_rt, mut app) = app();
+    use_dir(
+        &mut app,
+        &dir,
+        Updater {
+            fetch: fetch_never,
+            install: install_never,
+            build: build_ok,
+        },
+    );
+    app.settings.settings.nvd_api_key = ApiKey(KEY.into());
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(app.settings.screen.as_ref().unwrap().focus, Row::BuildNvd);
+    press(&mut app, KeyCode::Enter);
+    let Job::ConfirmBuild { question } = &app.settings.job else {
+        panic!("expected a question")
+    };
+    for needle in [
+        "Full build (no CVE data yet)",
+        "about 30 minutes without an API key",
+        "your NVD API key from Settings",
+        "nvd.nist.gov and cisa.gov",
+        rmap_nvd::NVD_NOTICE,
+    ] {
+        assert!(question.contains(needle), "{needle}: {question}");
+    }
+    assert!(!question.contains(KEY));
+    press(&mut app, KeyCode::Char('n'));
+    assert!(matches!(app.settings.job, Job::Idle));
+    assert_eq!(message(&app), "build cancelled");
+
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(matches!(app.settings.job, Job::Building { .. }));
+    settle(&mut app);
+    assert!(BUILD_KEYS.lock().unwrap().contains(&Some(KEY.to_string())));
+    let (notice, error) = app.settings.notice.clone().unwrap();
+    assert_eq!(notice, "CVE data built from NVD: 0 CVEs");
+    assert!(!error);
+    let screen = render(&mut app, 120, 40);
+    assert!(
+        screen.contains("NVD API 2.0 + CISA KEV") && screen.contains("(built locally)"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("••••••••-…-e1f0") && !screen.contains(KEY),
+        "{screen}"
+    );
+
+    // The fake wrote no NVD sync time, so the next build is full again,
+    // and the reason says why.
+    press(&mut app, KeyCode::Enter);
+    let Job::ConfirmBuild { question } = &app.settings.job else {
+        panic!("expected a question")
+    };
+    assert!(question.contains("has no NVD sync time"), "{question}");
+    press(&mut app, KeyCode::Esc);
+}
+
+#[test]
+fn build_questions_say_full_or_refresh_and_which_key() {
+    let q = build_question(
+        &Plan::Refresh {
+            watermark: 0,
+            age_days: 3,
+        },
+        Some(KeySource::Env),
+    );
+    assert!(
+        q.contains("Refresh: fetches only CVEs changed since the last NVD sync (3 days ago)")
+            && q.contains("from NVD_API_KEY"),
+        "{q}"
+    );
+    let q = build_question(&Plan::Full("x".into()), None);
+    assert!(q.contains("no API key (NVD's slower keyless rate)"), "{q}");
+    assert_eq!(eta_text(Duration::from_secs(59)), "under a minute left");
+    assert_eq!(eta_text(Duration::from_secs(61)), "about 2 min left");
+}
+
+#[test]
+fn a_running_build_can_be_cancelled_and_blocks_a_download() {
+    let dir = TempDir::new("cancel");
+    let (_rt, mut app) = app();
+    use_dir(
+        &mut app,
+        &dir,
+        Updater {
+            fetch: fetch_never,
+            install: install_never,
+            build: build_until_cancelled,
+        },
+    );
+    app.settings.env_key = Some(Ok("from-env".into()));
+    press(&mut app, KeyCode::F(2));
+    assert!(render(&mut app, 80, 24).contains("set by NVD_API_KEY"));
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('y'));
+    assert!(matches!(app.settings.job, Job::Building { .. }));
+    focus(&mut app, Row::UpdateNow);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(message(&app), "a download or build is already running");
+    focus(&mut app, Row::BuildNvd);
+    press(&mut app, KeyCode::Enter);
+    assert!(render(&mut app, 80, 24).contains("cancelling after the current request"));
+    settle(&mut app);
+    let (notice, error) = app.settings.notice.clone().unwrap();
+    assert_eq!(notice, "NVD build cancelled; CVE data unchanged");
+    assert!(!error);
+    assert_eq!(app.settings.db, DbStatus::Missing);
+}
+
+#[test]
+fn api_key_field_validates_masks_and_saves() {
+    let dir = TempDir::new("key");
+    let (_rt, mut app) = app();
+    use_dir(&mut app, &dir, Updater::default());
+    let file = dir.0.join("settings.json");
+    let typed = |app: &App| app.settings.screen.as_ref().unwrap().key.to_string();
+    press(&mut app, KeyCode::F(2));
+    focus(&mut app, Row::ApiKey);
+    type_text(&mut app, "bad key!\u{e9}");
+    assert_eq!(typed(&app), "badkey", "only key characters are typed");
+    ctrl(&mut app, 'u');
+    app.on_paste(&format!("  {KEY}\u{1b}[2J\nsecond line"));
+    assert_eq!(typed(&app), format!("{KEY}2J"));
+    ctrl(&mut app, 'u');
+    app.on_paste(&"a".repeat(1000));
+    assert_eq!(typed(&app).len(), MAX_KEY_CHARS);
+    ctrl(&mut app, 'u');
+    type_text(&mut app, KEY);
+    assert!(
+        render(&mut app, 80, 24).contains(KEY),
+        "shown while editing"
+    );
+    press(&mut app, KeyCode::Tab);
+    assert_eq!(message(&app), "saved");
+    assert_eq!(
+        settings::load(Some(&file)).0.nvd_api_key,
+        ApiKey(KEY.into())
+    );
+    let screen = render(&mut app, 80, 24);
+    assert!(
+        !screen.contains(KEY) && screen.contains("••••••••-…-e1f0"),
+        "{screen}"
+    );
+
+    // Clearing it saves "no key".
+    press(&mut app, KeyCode::BackTab);
+    ctrl(&mut app, 'u');
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(settings::load(Some(&file)).0.nvd_api_key, ApiKey::default());
+    press(&mut app, KeyCode::Tab);
+    assert!(render(&mut app, 80, 24).contains("none: optional"));
+}
+
+#[test]
+fn copy_link_puts_the_key_request_url_on_the_clipboard() {
+    let (_rt, mut app) = app();
+    press(&mut app, KeyCode::F(2));
+    focus(&mut app, Row::CopyLink);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.clipboard.take().as_deref(), Some(rmap_nvd::API_KEY_URL));
+    assert!(message(&app).starts_with("link copied"));
 }

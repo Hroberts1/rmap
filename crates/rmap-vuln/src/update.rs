@@ -14,7 +14,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -241,30 +241,12 @@ pub fn install(
     if manifest.size > MAX_DB_BYTES {
         return Err(UpdateError::TooLarge(manifest.size));
     }
-    let name = dest
-        .file_name()
-        .ok_or_else(|| io_err("the destination has no file name"))?;
-    let part_path = dest.with_file_name(format!("{}.part", name.to_string_lossy()));
-    if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
-        fs::create_dir_all(dir).map_err(io_err)?;
-    }
-    // Two updates at once in this process would share the .part file.
-    // shortcut: another rmap process updating the same file at the same
-    // moment is not guarded; add a lock file if that ever happens.
-    static INSTALLING: Mutex<()> = Mutex::new(());
-    let _one_at_a_time = INSTALLING.lock().unwrap_or_else(|e| e.into_inner());
-
-    // Remove a stale .part from an interrupted run, then create ours fresh.
-    match fs::remove_file(&part_path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_err(e)),
-        _ => {}
-    }
-    let part = Part(part_path);
+    let part = PartFile::new(dest)?;
     let reader = get(&agent(), &manifest.db_url, DB_TIMEOUT)?.into_reader();
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&part.0)
+        .open(part.path())
         .map_err(io_err)?;
 
     let hash = download(reader, &mut file, manifest.size, progress)?;
@@ -276,7 +258,7 @@ pub fn install(
         return Err(UpdateError::HashMismatch);
     }
     // Closed again before the rename: Windows can't rename an open file.
-    let info = Database::open(&part.0)
+    let info = Database::open(part.path())
         .map_err(UpdateError::InvalidDb)?
         .info()
         .clone();
@@ -288,17 +270,7 @@ pub fn install(
     }
 
     progress(Progress::Installing);
-    fs::rename(&part.0, dest).map_err(|e| {
-        // Windows: SQLite opens without FILE_SHARE_DELETE, so an open
-        // database can't be replaced (access denied / sharing violation).
-        if cfg!(windows)
-            && (e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32))
-        {
-            UpdateError::InUse
-        } else {
-            io_err(e)
-        }
-    })?;
+    part.install(dest)?;
     rmap_log::info!(
         "installed vulnerability database ({} CVEs, built {}) at {}",
         info.cve_count,
@@ -343,15 +315,67 @@ fn download(
     Ok(sha.finish())
 }
 
-/// The temporary download; removed (with any SQLite side files) when
-/// dropped. After a successful rename there is nothing left to remove.
-struct Part(PathBuf);
+/// `<dest>.part`, where a new database is written before it replaces
+/// `dest`: removed (with any SQLite side files) when dropped; after
+/// [`PartFile::install`] there is nothing left to remove. Holding one also
+/// keeps any other update or build in this process off the same path.
+pub struct PartFile {
+    path: PathBuf,
+    _one_at_a_time: MutexGuard<'static, ()>,
+}
 
-impl Drop for Part {
+impl PartFile {
+    /// Creates `dest`'s directory if needed and removes a stale `.part`
+    /// from an interrupted run; creating the file is left to the caller.
+    /// Waits while another `PartFile` is alive in this process.
+    pub fn new(dest: &Path) -> Result<PartFile, UpdateError> {
+        let name = dest
+            .file_name()
+            .ok_or_else(|| io_err("the destination has no file name"))?;
+        let path = dest.with_file_name(format!("{}.part", name.to_string_lossy()));
+        if let Some(dir) = dest.parent().filter(|d| !d.as_os_str().is_empty()) {
+            fs::create_dir_all(dir).map_err(io_err)?;
+        }
+        // shortcut: another rmap process updating the same file at the same
+        // moment is not guarded; add a lock file if that ever happens.
+        static INSTALLING: Mutex<()> = Mutex::new(());
+        let guard = INSTALLING.lock().unwrap_or_else(|e| e.into_inner());
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_err(e)),
+            _ => {}
+        }
+        Ok(PartFile {
+            path,
+            _one_at_a_time: guard,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Renames the finished, closed file over `dest` in one step (Windows
+    /// can't rename an open file).
+    pub fn install(self, dest: &Path) -> Result<(), UpdateError> {
+        fs::rename(&self.path, dest).map_err(|e| {
+            // Windows: SQLite opens without FILE_SHARE_DELETE, so an open
+            // database can't be replaced (access denied / sharing violation).
+            if cfg!(windows)
+                && (e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32))
+            {
+                UpdateError::InUse
+            } else {
+                io_err(e)
+            }
+        })
+    }
+}
+
+impl Drop for PartFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = fs::remove_file(&self.path);
         for suffix in ["-journal", "-wal", "-shm"] {
-            let mut side = self.0.clone().into_os_string();
+            let mut side = self.path.clone().into_os_string();
             side.push(suffix);
             let _ = fs::remove_file(side);
         }
