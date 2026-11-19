@@ -20,6 +20,8 @@
 
 mod backend;
 pub mod exclude;
+#[cfg(windows)]
+mod icmp_win;
 mod names;
 pub mod rate;
 pub mod raw;
