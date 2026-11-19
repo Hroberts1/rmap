@@ -125,9 +125,12 @@ fn page(total: usize, cves: Vec<Value>) -> String {
     json!({"totalResults": total, "vulnerabilities": cves}).to_string()
 }
 
-/// NVD's `lastModified` form, `days` ago.
+/// NVD's `lastModified` form, `days` ago. Measured from one instant per
+/// test run, so a fake server's stamp and the test's expected value
+/// can't land on either side of a second boundary.
 fn modified(days: u64) -> String {
-    let s = time::rfc3339(time::now() - days * DAY);
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let s = time::rfc3339(*START.get_or_init(time::now) - days * DAY);
     format!("{}.000", &s[..19])
 }
 
