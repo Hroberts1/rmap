@@ -1,5 +1,16 @@
 # rmap
 
+> [!CAUTION]
+> ## **THIS IS FOR EDUCATIONAL PURPOSES**
+>
+> **rmap is a network scanning and vulnerability-matching tool. Scanning or probing a computer system or network you do not own and do not have explicit, documented authorization to test is illegal in most jurisdictions (for example, the U.S. Computer Fraud and Abuse Act and equivalent laws elsewhere), even when no harm is intended or done.**
+>
+> - **You are solely responsible for how you use this software and for obtaining authorization before scanning any network or host that isn't yours.**
+> - This project is provided **"AS IS", without warranty of any kind, express or implied** - including, without limitation, fitness for a particular purpose, accuracy, or non-infringement. See [`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE).
+> - The authors and contributors **accept no liability** for damage, data loss, legal exposure, or any other consequence arising from the use or misuse of this software.
+> - CVE and vulnerability information bundled with rmap (`rmap-vuln`'s database) is a **hand-curated sample for demonstration**, not a complete or currently accurate vulnerability feed - do not rely on it for real risk decisions.
+> - Nothing here is legal advice. If you're unsure whether you're authorized to scan something, **don't** - get written permission first.
+
 [![CI](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml/badge.svg)](https://github.com/Hroberts1/rmap/actions/workflows/ci.yml)
 
 A network scanner written from scratch in Rust, driven by an interactive terminal UI.
