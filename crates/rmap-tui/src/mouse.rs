@@ -25,6 +25,8 @@ pub struct HitMap {
     pub ports: Option<ListHit<usize>>,
     /// Settings screen rows.
     pub settings: Vec<(crate::settings_ui::Row, Rect)>,
+    /// The CVE data pop-up's Open Settings and Not now buttons.
+    pub vuln_popup: Option<(Rect, Rect)>,
 }
 
 /// A scrolled list on screen.
@@ -56,12 +58,25 @@ impl<T: Copy> ListHit<T> {
 impl App {
     pub fn on_mouse(&mut self, ev: MouseEvent) {
         rmap_log::trace!("mouse {:?} at {},{}", ev.kind, ev.column, ev.row);
+        let pos = Position::new(ev.column, ev.row);
+        // Its buttons answer like their keys; any other click is swallowed.
+        if self.vuln_popup.is_some() {
+            if ev.kind == MouseEventKind::Down(MouseButton::Left)
+                && let Some((open, not_now)) = self.hits.vuln_popup
+            {
+                if open.contains(pos) {
+                    self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                } else if not_now.contains(pos) {
+                    self.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                }
+            }
+            return;
+        }
         // Overlays are keyboard-only; a stray click must not reach the
         // screen underneath (or answer a y/n prompt).
         if self.confirm.is_some() || self.pending.is_some() || self.help || self.dialog.is_some() {
             return;
         }
-        let pos = Position::new(ev.column, ev.row);
         if self.settings.is_open() {
             self.on_settings_mouse(ev.kind, pos);
             return;
@@ -370,6 +385,22 @@ mod tests {
             // Events from outside the frame (a resize race) are ignored.
             click(&mut app, (u16::MAX, u16::MAX));
         }
+    }
+
+    #[test]
+    fn vuln_popup_buttons_are_clickable() {
+        let (_rt, mut app) = app();
+        app.vuln_popup = Some(false);
+        let screen = render(&mut app, 80, 24);
+        // A click elsewhere is swallowed.
+        click(&mut app, (0, 0));
+        assert!(app.vuln_popup.is_some());
+        click(&mut app, find(&screen, "Not now"));
+        assert!(app.vuln_popup.is_none() && !app.settings.is_open());
+        app.vuln_popup = Some(false);
+        let screen = render(&mut app, 80, 24);
+        click(&mut app, find(&screen, "Open Settings  ")); // the button, not the text
+        assert!(app.vuln_popup.is_none() && app.settings.is_open());
     }
 
     #[test]

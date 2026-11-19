@@ -82,7 +82,7 @@ rmap
 
 ### 5. Download the CVE data (optional)
 
-Vulnerability matching needs a CVE database, which isn't built into the binary. Until you download one, the setup form's Vulns row says `no CVE data yet: F2 to download`. Press `F2` to open [Settings](#settings), choose **Update now** and answer `y`. rmap fetches a few MB from this repository's [`vulndb` release](https://github.com/Hroberts1/rmap/releases/tag/vulndb), checks it and installs it. Repeat this whenever the header warns that the data is old; the release is rebuilt on the 1st of every month. Everything else in rmap works without it.
+Vulnerability matching needs a CVE database, which isn't built into the binary. Until you download one, the setup form's Vulns row says `no CVE data yet: F2 to download`, and ticking Vulns opens a short pop-up explaining that ports will show `no vulnerability data: not checked`; `Enter` (or `F2`) opens Settings from there and `Esc` keeps Vulns ticked anyway. Press `F2` to open [Settings](#settings), choose **Update now** and answer `y`. rmap fetches a few MB from this repository's [`vulndb` release](https://github.com/Hroberts1/rmap/releases/tag/vulndb), checks it and installs it. Repeat this whenever the header warns that the data is old; the release is rebuilt on the 1st of every month. Everything else in rmap works without it.
 
 ### 6. Run the tests (optional)
 
@@ -196,7 +196,7 @@ Set `NO_COLOR` (non-empty, per [no-color.org](https://no-color.org)) to draw eve
 | Warn when data is older than N days (`vuln_stale_days`) | 30 | CVE data older than this is flagged in the results header and in Settings. 1-365. |
 | Highlight actively exploited CVEs (`vuln_highlight_exploited`) | on | Shows the `actively exploited (CISA KEV, added ...)` line under such CVEs in the detail pane and the Vulns tab. Exploited CVEs are still listed first when it's off. |
 
-The screen also shows where the CVE data lives and what's in it (`built 2026-11-01 (17 days ago) · 245,000 CVEs · NVD API 2.0 + CISA KEV`), or that it hasn't been downloaded yet - in which case the setup form's Vulns row says `no CVE data yet: F2 to download`.
+The screen also shows where the CVE data lives and what's in it (`built 2026-11-01 (17 days ago) · 245,000 CVEs · NVD API 2.0 + CISA KEV`), or that it hasn't been downloaded yet - in which case the setup form's Vulns row says `no CVE data yet: F2 to download`, and ticking Vulns (or picking a profile that turns it on) shows a pop-up that leads here.
 
 **Network use:** rmap contacts the update URL only when you press Update now, or at startup if you turned that on. Scanning never fetches anything.
 

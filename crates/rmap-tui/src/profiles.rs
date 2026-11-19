@@ -402,6 +402,8 @@ impl App {
 
     pub(crate) fn apply_profile(&mut self, p: &Profile) {
         rmap_log::info!("applied profile {:?}", p.name);
+        let (vulns_was_on, services_was_on) =
+            (self.form.vuln_matching, self.form.service_detection);
         let f = &mut self.form;
         f.ports = TextInput::new(p.ports.as_str());
         f.scan_type = p.scan_type;
@@ -410,6 +412,9 @@ impl App {
         f.service_detection = p.service_detection || p.vuln_matching;
         f.vuln_matching = p.vuln_matching;
         f.error = None;
+        if p.vuln_matching && !vulns_was_on {
+            self.vulns_ticked(services_was_on);
+        }
     }
 }
 
