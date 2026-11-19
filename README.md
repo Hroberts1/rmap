@@ -386,6 +386,8 @@ Reverse DNS uses the **DNS server** field if set, otherwise the system resolver 
 
 Tick **Services** on the setup form and rmap identifies the software behind each open TCP port, and each open or open|filtered UDP port. The port table shows the service and version, and the details pane adds a line per port with extra information, the OS the service revealed, and a [CPE 2.3](https://nvd.nist.gov/products/cpe) name:
 
+> **Printers are safe to scan.** Raw-print ports (JetDirect/AppSocket 9100-9107) and LPD (515) print whatever bytes arrive, so a probe sent there comes out of the printer as a page of garbage. rmap only *listens* on those ports and never sends them a byte; they show as `jetdirect` or `printer` with `not probed: data sent here would print`. IPP (631) is HTTP and is probed normally.
+
 ```
 22/tcp  open  ssh   OpenSSH 8.9p1
                     └ protocol 2.0; Ubuntu-3ubuntu0.6 · os: Ubuntu Linux · cpe:2.3:a:openbsd:openssh:8.9:p1

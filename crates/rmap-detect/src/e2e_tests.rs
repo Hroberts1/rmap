@@ -284,7 +284,15 @@ async fn closed_port_gives_up_quickly() {
 
 #[tokio::test]
 async fn udp_uses_the_port_table_for_now() {
-    let s = crate::detect([192, 0, 2, 1].into(), 53, Protocol::Udp, &timing())
+    // A closed loopback port, not 192.0.2.1: networks that intercept DNS
+    // answer queries to any address, which made this test depend on where
+    // it ran.
+    let closed = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let s = Detector::builtin()
+        .detect(closed, Protocol::Udp, &timing(), 53)
         .await
         .unwrap();
     assert_eq!(
@@ -351,4 +359,87 @@ async fn http_redirect_to_another_host_is_not_followed() {
     .await;
     let s = detect_as(addr, 8080).await;
     assert_eq!((s.name.as_str(), s.info), ("http", None));
+}
+
+/// A fake printer that counts every byte it is sent, across all
+/// connections. Real raw-print ports print whatever arrives.
+async fn counting_printer() -> (SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let received = std::sync::Arc::new(AtomicUsize::new(0));
+    let total = received.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            let total = total.clone();
+            tokio::spawn(async move {
+                let mut chunk = [0u8; 2048];
+                while let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_secs(10), s.read(&mut chunk)).await
+                {
+                    if n == 0 {
+                        break;
+                    }
+                    total.fetch_add(n, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    (addr, received)
+}
+
+#[tokio::test]
+async fn print_ports_are_never_sent_a_byte() {
+    use std::sync::atomic::Ordering;
+    for port in [9100, 9103, 9107, 515] {
+        let (addr, received) = counting_printer().await;
+        let s = detect_as(addr, port).await;
+        // Give in-flight writes time to land before counting.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            0,
+            "port {port} was sent data"
+        );
+        assert_eq!(s.method, DetectMethod::PortTable, "port {port}");
+        assert_eq!(
+            s.info.as_deref(),
+            Some(crate::PRINT_PORT_INFO),
+            "port {port}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_print_ports_still_get_probes() {
+    use std::sync::atomic::Ordering;
+    let (addr, received) = counting_printer().await;
+    detect_as(addr, 9108).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        received.load(Ordering::SeqCst) > 0,
+        "the control port should be probed"
+    );
+}
+
+#[test]
+fn print_port_plans_send_nothing() {
+    let d = Detector::builtin();
+    for port in [515, 9100, 9101, 9102, 9103, 9104, 9105, 9106, 9107] {
+        let plan = d.plan(port, Protocol::Tcp);
+        assert!(
+            !plan.is_empty(),
+            "port {port} should still get the banner wait"
+        );
+        for i in plan {
+            assert_eq!(
+                d.database().probes[i].payload,
+                crate::db::Payload::None,
+                "port {port} plans probe {}",
+                d.database().probes[i].name
+            );
+        }
+    }
+    assert!(!crate::is_print_port(631), "IPP is HTTP and safe to probe");
+    assert!(!crate::is_print_port(9108));
 }
