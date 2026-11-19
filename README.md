@@ -215,7 +215,7 @@ crates/
 ├── rmap-names    host names: reverse DNS, NetBIOS and mDNS lookups (tokio only)
 ├── rmap-packet   Ethernet/ARP/IPv4/IPv6/TCP/UDP/ICMP/ICMPv6 building and parsing (no dependencies)
 ├── rmap-report   scan reports: JSON, Nmap XML, Markdown, CSV and HTML export, saved scans, diffs
-├── rmap-vuln     vulnerability matching: CPE -> CVE lookup in a local SQLite database file (rmap-core and rusqlite only)
+├── rmap-vuln     vulnerability matching: CPE -> CVE lookup in a local SQLite database file and its verified download (rusqlite, ureq)
 └── rmap-tui      ratatui front end
 src/main.rs       starts logging, the runtime and the UI
 ```
@@ -343,7 +343,7 @@ The CVE data is a SQLite file, `vulns.db`, in rmap's data directory (next to the
 | macOS | `~/Library/Application Support/rmap/vulns.db` |
 | Windows | `%LOCALAPPDATA%\rmap\vulns.db` |
 
-rmap doesn't ship CVE data in the binary. If the file is missing or unreadable, the scan runs normally with one warning (`no vulnerability data at <path>; CVE matching skipped`) and no CVE lines. Downloading and updating the file from inside rmap is coming in a later change.
+rmap doesn't ship CVE data in the binary. If the file is missing or unreadable, the scan runs normally with one warning (`no vulnerability data at <path>; CVE matching skipped`) and no CVE lines. Updating it from inside rmap is covered [below](#updating-vulnerability-data).
 
 The schema (`rmap_vuln::SCHEMA_SQL`, version 1) is rmap's own - not Nmap's `nmap-vulners` or any other scanner's database:
 
@@ -358,6 +358,19 @@ How matching works (`crates/rmap-vuln`):
 1. Each detected service's CPE 2.3 strings give a vendor, a product, and the version + update combined (e.g. `9.7p1`). The database's rows for that vendor and product are fetched by index.
 2. Each row's range is checked in Rust, comparing versions the way dpkg/rpm do: split into alternating digit and text runs, compare each run in order, and treat a side that runs out of runs first as smaller - so `9.7` sorts before `9.7p1`, and that before `9.7p2`. Versions are stored in that same combined form.
 3. Matches are deduplicated by CVE id and reported newest first.
+
+### Updating vulnerability data
+
+`rmap_vuln::update` downloads a fresh `vulns.db`; a Settings screen with an "Update now" item will call it (coming in a later change). Nothing is fetched unless you ask. By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); the URL is a parameter, so you can host the two files yourself. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
+
+Before anything replaces your current database, rmap checks that:
+
+- every URL, including each redirect, is `https://` (plain `http://` only to `localhost`/`127.0.0.1`/`[::1]`), with no user name or password in it;
+- the manifest is under 64 KiB, well-formed, and in a schema this rmap reads (a newer one asks you to update rmap);
+- the download, streamed to `vulns.db.part` next to the real file, is exactly the manifest's size (at most 512 MiB) and SHA-256;
+- the downloaded file opens as a valid database whose CVE count matches the manifest.
+
+Only then is it renamed over `vulns.db` in one step. Any failure deletes the `.part` file and leaves the old database untouched. On Windows the old file can't be replaced while a scan has it open; close running scans and try again. The SHA-256 protects against corrupt or truncated downloads; authenticity rests on HTTPS to the release host (Mozilla's CA list via webpki-roots, rustls). The standard `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` and `NO_PROXY` environment variables are honored.
 
 ## Logs and crash reports
 

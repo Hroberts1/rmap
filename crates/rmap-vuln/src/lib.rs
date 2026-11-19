@@ -5,8 +5,12 @@
 //! vendor backport can fix the real bug while leaving the version string
 //! unchanged, and a version the database has no data for is not evidence
 //! of safety.
+//!
+//! [`update`] downloads a new database file and installs it safely.
 
 mod db;
+mod sha256;
+mod update;
 pub mod version;
 
 use std::path::{Path, PathBuf};
@@ -17,6 +21,10 @@ use rusqlite::{Connection, OpenFlags};
 
 pub use db::{Bound, CpeMatch, DbError, Entry, SCHEMA_SQL, SCHEMA_VERSION, Writer};
 pub use rmap_core::{VulnSeverity, Vulnerability};
+pub use update::{
+    DEFAULT_MANIFEST_URL, MAX_DB_BYTES, Manifest, Progress, UpdateError, fetch_manifest, install,
+    update,
+};
 
 /// What [`Database::find`] returns per matching CVE.
 pub type Finding = Vulnerability;
