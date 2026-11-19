@@ -1944,6 +1944,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vulndb-build"
+version = "0.1.0"
+dependencies = [
+ "rmap-core",
+ "rmap-detect",
+ "rmap-vuln",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
