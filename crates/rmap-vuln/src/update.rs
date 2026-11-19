@@ -23,7 +23,14 @@ use ureq::Agent;
 use crate::sha256::Sha256;
 use crate::{Database, DbError, DbInfo, SCHEMA_VERSION};
 
-pub const DEFAULT_MANIFEST_URL: &str =
+/// The project's manifest on GitHub Pages. Its `db` points at that
+/// month's immutable `vulndb-YYYY-MM-DD` release (see vulndb.yml).
+pub const DEFAULT_MANIFEST_URL: &str = "https://hroberts1.github.io/rmap/vulns.json";
+
+/// The default before the data moved to immutable monthly releases. That
+/// release can never be filled again, so saved settings still naming it
+/// are moved to [`DEFAULT_MANIFEST_URL`].
+pub const OLD_DEFAULT_MANIFEST_URL: &str =
     "https://github.com/Hroberts1/rmap/releases/download/vulndb/vulns.json";
 
 /// Largest database rmap will download.

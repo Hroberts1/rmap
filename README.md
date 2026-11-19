@@ -82,12 +82,7 @@ rmap
 
 ### 5. Get the CVE data (optional)
 
-Vulnerability matching needs a CVE database, which isn't built into the binary. Until you have one, the setup form's Vulns row says `no CVE data yet: F2 to set up`, and ticking Vulns opens a short pop-up explaining that ports will show `no vulnerability data: not checked` (`Enter` or `F2` opens Settings from there; `Esc` keeps Vulns ticked anyway). Press `F2` to open [Settings](#settings) and pick one of two ways to get it - both ask **y/n** first:
-
-- **Build from NVD**: rmap downloads the CVE data itself from the [NVD API](https://nvd.nist.gov/developers/vulnerabilities) and CISA's KEV list and builds the database on your computer. The first build takes about 30 minutes without an API key, or 10-15 minutes with a free [NVD API key](https://nvd.nist.gov/developers/request-an-api-key) (paste it into Settings → NVD API key). Later builds refresh only the CVEs that changed, usually in a minute or two.
-- **Download prebuilt**: fetch a ready-made file of a few MB from this repository's [`vulndb` release](https://github.com/Hroberts1/rmap/releases/tag/vulndb), rebuilt on the 1st of every month. Fast, but only as fresh as the last release, and it only exists once the maintainers' monthly job has run.
-
-Repeat either whenever the header warns that the data is old. You never need GitHub, an account or any setup beyond rmap itself. Everything else in rmap works without CVE data.
+Vulnerability matching needs a CVE database, which isn't built into the binary. Press `F2` in rmap and choose **Build from NVD** or **Download prebuilt**; [Getting CVE data](#getting-cve-data) explains the difference. Everything else in rmap works without it.
 
 ### 6. Run the tests (optional)
 
@@ -104,9 +99,33 @@ The tests need no network access and no root.
 | `linker 'cc' not found` | Install the C toolchain from step 1. |
 | `requires rustc 1.88` or edition 2024 errors | Your Rust is too old. Run `rustup update stable`, and check that `which cargo` points into `~/.cargo/bin`, not `/usr/bin`. |
 | Garbled boxes or missing colors | Use a terminal with UTF-8 and 256-color support. Check that `echo $LANG` ends in `UTF-8`. |
-| **Download prebuilt** fails with `the server answered HTTP 404` | Nothing is published at the Update URL. Use **Build from NVD** instead: it needs nothing from GitHub. With the default URL, the repository's `vulndb` release hasn't been built yet; it appears after the first run of the **Vulnerability data** Action (see [Vulnerability data (maintainers)](#vulnerability-data-maintainers)). If you changed Update URL, check it points at a `vulns.json` manifest, or use **Reset URL to default**. |
+| **Download prebuilt** fails with `the server answered HTTP 404` | Nothing is published at the Update URL. Use **Build from NVD** instead: it needs nothing from GitHub. With the default URL, the project hasn't published data yet; it appears after the first successful run of the **Vulnerability data** Action (see [Vulnerability data (maintainers)](#vulnerability-data-maintainers)). If you changed Update URL, check it points at a `vulns.json` manifest, or use **Reset URL to default**. |
 | **Build from NVD** fails with `404 ... check the key` | NVD answers 404 to an API key it doesn't accept. Check the key in Settings (or `NVD_API_KEY`), or clear it to build without one. |
 | Screen left in a bad state after a crash | Run `reset`. The crash report path is printed after the terminal is restored; see [Logs and crash reports](#logs-and-crash-reports). |
+
+## Getting CVE data
+
+rmap matches services against a local CVE database file, `vulns.db`. It isn't built into the binary, and nothing is downloaded unless you ask. Until you have one, the setup form's Vulns row says `no CVE data yet: F2 to set up`, and ticking Vulns opens a short pop-up that leads to Settings (`Enter` or `F2` opens it; `Esc` keeps Vulns ticked and scans without CVE checks, showing `no vulnerability data: not checked` on each port).
+
+There are three ways to get the file. Most people only ever use the first two, both from the **Get data** row in [Settings](#settings) (`F2`), and both ask **y/n** first:
+
+| | **Build from NVD** | **Download prebuilt** | **Your own copy** |
+|---|---|---|---|
+| Who it's for | Anyone who wants data straight from the source | Anyone who wants it working in seconds | Organisations, offline networks |
+| Where the data comes from | The [NVD API](https://nvd.nist.gov/developers/vulnerabilities) and CISA's [KEV list](https://www.cisa.gov/known-exploited-vulnerabilities-catalog), built on your computer | This project's monthly release, built the same way by a GitHub Action | Built by you with `tools/vulndb-build`, hosted wherever you like |
+| First time | About 30 minutes without an API key, 10-15 with a free [NVD API key](https://nvd.nist.gov/developers/request-an-api-key) (Settings → NVD API key) | Seconds (a few MB) | As for Build from NVD |
+| Later updates | Only the CVEs that changed, usually a minute or two | The whole file again | Your schedule |
+| How fresh | Up to the minute | Up to a month old | Your schedule |
+| Who you trust | NVD and CISA only | This project's build (each month's file is an [immutable release](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases), checked by size and SHA-256 over HTTPS) | Yourself |
+
+You can mix them: download prebuilt to start quickly, then use Build from NVD to keep it fresh. Settings always shows where the current file came from (`built locally` or `prebuilt download`). Press the same button again whenever the results header warns that the data is old (30 days by default, adjustable in Settings). None of this needs a GitHub account or any setup beyond rmap.
+
+**Your own copy**, for teams that don't want to depend on NVD's rate limits on every machine or on this project's release:
+
+1. Build the file once: `OUT_DIR=/some/dir cargo run --release -p vulndb-build` (set `NVD_API_KEY` to make it faster). See [Vulnerability data (maintainers)](#vulnerability-data-maintainers).
+2. Either copy `vulns.db` into each machine's [data folder](#the-database-file) (rmap opens any valid file there), or host `vulns.db` plus a `vulns.json` manifest on any HTTPS server and point each machine's Settings → Update URL at the manifest; **Download prebuilt** then fetches from your server.
+
+Whichever way you choose, a match is a *potential* finding to verify, not proof: see [Vulnerability matching](#vulnerability-matching).
 
 ## Running
 
@@ -199,7 +218,7 @@ Set `NO_COLOR` (non-empty, per [no-color.org](https://no-color.org)) to draw eve
 | Build from NVD | - | Builds the CVE data on your computer from the NVD API and CISA KEV, after saying whether it will be a full build or a refresh and roughly how long it takes, and asking **y/n** (below). While it runs, the same button reads **Cancel build**. |
 | Download prebuilt | - | Downloads the latest prebuilt CVE data, after showing what it will download and asking **y/n** (below). |
 | NVD API key (`nvd_api_key`) | empty | Your own free [NVD API key](https://nvd.nist.gov/developers/request-an-api-key), used only by Build from NVD; it raises NVD's rate limit so a full build takes 10-15 minutes instead of about 30. Shown masked (`••••••••-…-1a2b`) except while you edit it. Letters, digits, `-` and `_` only, at most 64. The environment variable `NVD_API_KEY`, if set, overrides it, and Settings says so. **Copy key request link** puts the request page's address on the clipboard (OSC 52, as `y` does), since clicking links in terminals varies. |
-| Update URL (`vuln_update_url`) | `https://github.com/Hroberts1/rmap/releases/download/vulndb/vulns.json` | Where Download prebuilt reads the manifest. Must be `https://` (or `http://` to this computer); `Reset URL to default` puts it back. |
+| Update URL (`vuln_update_url`) | `https://hroberts1.github.io/rmap/vulns.json` | Where Download prebuilt reads the manifest. A setting still holding the old default (`.../releases/download/vulndb/vulns.json`) is moved to the new one automatically. Must be `https://` (or `http://` to this computer); `Reset URL to default` puts it back. |
 | Check for updates on startup (`vuln_check_on_startup`) | off | When on, rmap fetches the manifest each time it starts and, if newer data exists, says so (`newer CVE data is available ...`). It never downloads on its own. |
 | Warn when data is older than N days (`vuln_stale_days`) | 30 | CVE data older than this is flagged in the results header and in Settings. 1-365. |
 | Highlight actively exploited CVEs (`vuln_highlight_exploited`) | on | Shows the `actively exploited (CISA KEV, added ...)` line under such CVEs in the detail pane and the Vulns tab. Exploited CVEs are still listed first when it's off. |
@@ -433,7 +452,7 @@ There are two ways, and you pick in Settings: **Build from NVD** builds `vulns.d
 
 #### Download prebuilt
 
-`rmap_vuln::update` downloads a fresh `vulns.db`; the Settings screen's "Download prebuilt" calls it, after asking (see [Settings](#settings)). By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); you can change it in Settings (Update URL) to host the two files yourself, or to use a fork's release. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
+`rmap_vuln::update` downloads a fresh `vulns.db`; the Settings screen's "Download prebuilt" calls it, after asking (see [Settings](#settings)). By default it reads the manifest `vulns.json` from this project's GitHub Pages site (`rmap_vuln::DEFAULT_MANIFEST_URL`, `https://hroberts1.github.io/rmap/vulns.json`), whose `db` field names the current month's release file; you can change it in Settings (Update URL) to host the files yourself, or to use a fork's data. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
 
 Before anything replaces your current database, rmap checks that:
 
@@ -473,9 +492,19 @@ Limitations:
 
 Ordinary users never need GitHub Actions: Build from NVD works on its own. The **Vulnerability data** Action only publishes the optional prebuilt file behind **Download prebuilt**.
 
-> **New repository or fork?** The `vulndb` release doesn't exist until this Action has run once, so until then **Download prebuilt** fails with HTTP 404 (Build from NVD still works). After pushing to `main`, go to **Actions** → **Vulnerability data** → **Run workflow** (branch `main`) and wait for it to finish; the **Releases** page should then show `vulndb` with `vulns.db` and `vulns.json`. A fork that doesn't publish its own data can leave Update URL on the default and use the upstream release.
+> **New repository or fork? One-time setup** (ordinary users never need this; it only publishes the optional prebuilt file):
+> 1. Settings → **Pages** → Build and deployment → Source: **GitHub Actions**.
+> 2. Optional: Settings → Secrets and variables → Actions → add `NVD_API_KEY` (a full keyless build takes about 25 minutes).
+> 3. Actions → **Vulnerability data** → **Run workflow** on `main`. When it's green, Releases shows `vulndb-YYYY-MM-DD` with `vulns.db` and `vulns.json`, and `https://<owner>.github.io/<repo>/vulns.json` serves the manifest.
+>
+> A fork that doesn't publish its own data can leave Update URL on the default and use the upstream data. Turning on **release immutability** (Settings → General → Releases) is supported and recommended.
 
-The Action (`.github/workflows/vulndb.yml`) runs `tools/vulndb-build`, a thin wrapper around `rmap_nvd::build` that always does a full build, on the 1st of every month and on demand (Actions → Vulnerability data → Run workflow, on `main`; other branches skip the job). It writes `vulns.db` and `vulns.meta.json`, then uploads `vulns.db` and the manifest `vulns.json` (`schema_version`, `built_at`, `cve_count`, `source`, `size`, `sha256`, `db`) to the release tagged `vulndb`, replacing the previous month's files.
+The Action (`.github/workflows/vulndb.yml`) runs `tools/vulndb-build`, a thin wrapper around `rmap_nvd::build` that always does a full build, on the 1st of every month and on demand (Actions → Vulnerability data → Run workflow, on `main`; other branches skip the job). It writes `vulns.db` and `vulns.meta.json`, then publishes them:
+
+1. A new release tagged `vulndb-YYYY-MM-DD` (a second run on the same day adds the run number) is created as a **draft** with `vulns.db` and the manifest `vulns.json` (`schema_version`, `built_at`, `cve_count`, `source`, `size`, `sha256`, and `db`, the full URL of that release's `vulns.db`) attached, then published. Attaching before publishing is what makes it work with GitHub's [immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases): once published, a month's file can't be replaced, so a compromised token can't quietly swap the data people already downloaded. Each month adds a release; old ones stay as a record.
+2. The job downloads the published `vulns.db` back and checks its SHA-256, and only then deploys `vulns.json` to GitHub Pages, so the manifest never points at a missing or different file. Pages is the one place that changes each month; the deploy runs in its own job, the only one with Pages permissions.
+
+Earlier versions used a single release tagged `vulndb` whose files were replaced each month. That breaks once release immutability is on (`HTTP 422: Cannot upload assets to an immutable release`), and an immutable release's tag can never be reused, so that tag is retired.
 
 Run the builder locally (it writes into `OUT_DIR`, which must not already contain `vulns.db` or `vulns.meta.json`):
 

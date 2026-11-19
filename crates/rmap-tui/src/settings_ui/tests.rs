@@ -239,7 +239,7 @@ fn renders_at_80x24_wide_and_tiny() {
         "NVD API key  none: optional",
         "[ Copy key request link ]",
         rmap_nvd::API_KEY_URL,
-        "https://github.com/",
+        "https://hroberts1.github.io/rmap/vulns.json",
         "Reset URL to default",
         "[ ] check for updates on startup",
         "contacts the update URL each time rmap starts",
@@ -340,7 +340,7 @@ fn update_now_downloads_after_asking() {
     press(&mut app, KeyCode::F(2));
     focus(&mut app, Row::UpdateNow);
     press(&mut app, KeyCode::Enter);
-    assert!(render(&mut app, 80, 24).contains("checking github.com…"));
+    assert!(render(&mut app, 80, 24).contains("checking hroberts1.github.io…"));
     settle(&mut app);
     assert!(matches!(app.settings.job, Job::Confirm { .. }));
     let Job::Confirm { question, .. } = &app.settings.job else {

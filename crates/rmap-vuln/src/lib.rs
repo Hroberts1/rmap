@@ -24,8 +24,8 @@ use rusqlite::{Connection, OpenFlags};
 pub use db::{Bound, CpeMatch, DbError, Entry, SCHEMA_SQL, SCHEMA_VERSION, Writer};
 pub use rmap_core::{VulnSeverity, Vulnerability};
 pub use update::{
-    DEFAULT_MANIFEST_URL, MAX_DB_BYTES, Manifest, PartFile, Progress, UpdateError, check_url,
-    fetch_manifest, install, update,
+    DEFAULT_MANIFEST_URL, MAX_DB_BYTES, Manifest, OLD_DEFAULT_MANIFEST_URL, PartFile, Progress,
+    UpdateError, check_url, fetch_manifest, install, update,
 };
 
 /// What [`Database::find`] returns per matching CVE.

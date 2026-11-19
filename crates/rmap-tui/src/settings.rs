@@ -124,6 +124,10 @@ impl Settings {
     fn validate(&mut self) -> Vec<String> {
         let mut notes = Vec::new();
         let default = Settings::default();
+        // Not a user's choice, just the old default: follow it silently.
+        if self.vuln_update_url == rmap_vuln::OLD_DEFAULT_MANIFEST_URL {
+            self.vuln_update_url = default.vuln_update_url.clone();
+        }
         if let Err(e) = check_update_url(&self.vuln_update_url) {
             notes.push(format!("vuln_update_url: {e}; using the default"));
             self.vuln_update_url = default.vuln_update_url;
@@ -414,6 +418,20 @@ mod tests {
         assert_eq!(s.vuln_stale_days, 90);
         assert_eq!(s.vuln_update_url, rmap_vuln::DEFAULT_MANIFEST_URL);
         assert!(s.vuln_highlight_exploited && !s.vuln_check_on_startup);
+    }
+
+    #[test]
+    fn the_old_default_url_moves_to_the_new_one() {
+        let dir = TempDir::new("old-url");
+        let path = dir.0.join(FILE);
+        let json = format!(
+            r#"{{"vuln_update_url": "{}"}}"#,
+            rmap_vuln::OLD_DEFAULT_MANIFEST_URL
+        );
+        fs::write(&path, json).unwrap();
+        let (s, warning) = load(Some(&path));
+        assert_eq!(warning, None);
+        assert_eq!(s.vuln_update_url, rmap_vuln::DEFAULT_MANIFEST_URL);
     }
 
     #[test]

@@ -1,6 +1,9 @@
-# Rebuilds rmap's vulnerability database from NVD + CISA KEV once a month
-# and publishes it as assets of the fixed `vulndb` release, where rmap's
-# downloader fetches it. See "Vulnerability data" in README.md.
+# Rebuilds rmap's vulnerability database from NVD + CISA KEV once a month.
+# Each build becomes its own release (`vulndb-YYYY-MM-DD`), created as a
+# draft with its files attached and then published, so it works with
+# GitHub's immutable releases: once out, a month's file can't be changed.
+# The manifest rmap reads (`vulns.json`) is deployed to GitHub Pages and
+# names the current month's file. See "Vulnerability data" in README.md.
 # Third-party actions are pinned to full commit SHAs (version in the comment).
 name: Vulnerability data
 
@@ -51,27 +54,58 @@ jobs:
         run: |
           mkdir dist
           target/release/vulndb-build
-      - name: Write the manifest
-        working-directory: dist
-        run: |
-          size=$(stat -c%s vulns.db)
-          sha256=$(sha256sum vulns.db | cut -d' ' -f1)
-          jq --argjson size "$size" --arg sha256 "$sha256" \
-            '{schema_version, built_at, cve_count, source, size: $size, sha256: $sha256, db: "vulns.db"}' \
-            vulns.meta.json > vulns.json
-          jq -e '.schema_version == 1 and .cve_count >= 500 and .size > 0
-                 and (.sha256 | test("^[0-9a-f]{64}$"))' vulns.json
-          cat vulns.json
-      - name: Publish to the vulndb release
+      - name: Publish this month's release
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if ! gh release view vulndb > /dev/null 2>&1; then
-            gh release create vulndb --title "Vulnerability data" --latest=false \
-              --notes "rmap's CVE database, rebuilt monthly by .github/workflows/vulndb.yml from the NVD API 2.0 and CISA KEV. This product uses the NVD API but is not endorsed or certified by the NVD."
+          tag="vulndb-$(date -u +%Y-%m-%d)"
+          # A second run on the same day gets its own tag: published
+          # releases are immutable and their tags can never be reused.
+          if gh release view "$tag" > /dev/null 2>&1; then
+            tag="$tag-${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           fi
-          # The database first, so a manifest never describes a missing file.
-          gh release upload vulndb vulns.db --clobber
-          gh release upload vulndb vulns.json --clobber
+          db_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag/vulns.db"
+          size=$(stat -c%s vulns.db)
+          sha256=$(sha256sum vulns.db | cut -d' ' -f1)
+          jq --argjson size "$size" --arg sha256 "$sha256" --arg db "$db_url" \
+            '{schema_version, built_at, cve_count, source, size: $size, sha256: $sha256, db: $db}' \
+            vulns.meta.json > vulns.json
+          jq -e '.schema_version == 1 and .cve_count >= 500 and .size > 0
+                 and (.sha256 | test("^[0-9a-f]{64}$"))' vulns.json
+          cat vulns.json
+          # Draft first with every file attached, then publish: an
+          # immutable release refuses files added after publishing.
+          gh release create "$tag" vulns.db vulns.json --draft --latest=false \
+            --target "$GITHUB_SHA" --title "Vulnerability data $(date -u +%Y-%m-%d)" \
+            --notes "rmap's CVE database, built by .github/workflows/vulndb.yml from the NVD API 2.0 and CISA KEV. rmap finds the current month's file through https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/vulns.json. This product uses the NVD API but is not endorsed or certified by the NVD."
+          gh release edit "$tag" --draft=false --latest=false
+          # The pointer goes live only once the file it names downloads
+          # and matches, so rmap is never sent to a missing or wrong file.
+          for i in 1 2 3 4 5; do
+            got=$(curl -fsSL "$db_url" | sha256sum | cut -d' ' -f1) && [ "$got" = "$sha256" ] && break
+            sleep 10
+          done
+          [ "$got" = "$sha256" ] || { echo "published vulns.db does not download or match"; exit 1; }
+          mkdir ../site
+          cp vulns.json ../site/vulns.json
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: point rmap at the new release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Separate job so only this step holds the Pages permissions.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}vulns.json
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
