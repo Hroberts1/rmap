@@ -124,10 +124,13 @@ impl Detector {
     }
 
     /// Probe indices to try on `port`, in order: probes that list the port,
-    /// then generic probes.
+    /// then generic probes. Print ports only get probes that send nothing.
     pub fn plan(&self, port: u16, protocol: Protocol) -> Vec<usize> {
         let probes = &self.db.probes;
-        let ours = |i: &usize| probes[*i].protocol == protocol;
+        let printing = protocol == Protocol::Tcp && is_print_port(port);
+        let ours = |i: &usize| {
+            probes[*i].protocol == protocol && !(printing && probes[*i].payload != Payload::None)
+        };
         let mut plan: Vec<usize> = (0..probes.len())
             .filter(ours)
             .filter(|&i| probes[i].likely_on(port))
@@ -285,11 +288,19 @@ impl Detector {
         }
         rmap_log::debug!("service {addr}: no rule matched; using the port table");
         // UDP silence is normal (open|filtered), so only TCP is marked.
-        let silent = protocol == Protocol::Tcp && connected && !answered;
-        Detected {
-            service: port_table(port, unmatched.as_deref(), silent),
-            answered,
+        let printing = protocol == Protocol::Tcp && is_print_port(port);
+        let silent = protocol == Protocol::Tcp && connected && !answered && !printing;
+        let mut service = port_table(port, unmatched.as_deref(), silent);
+        if printing && service.as_ref().is_none_or(|s| s.info.is_none()) {
+            let s = service.get_or_insert_with(|| Service {
+                name: if port == 515 { "printer" } else { "jetdirect" }.to_string(),
+                method: DetectMethod::PortTable,
+                confidence: 3,
+                ..Default::default()
+            });
+            s.info = Some(PRINT_PORT_INFO.to_string());
         }
+        Detected { service, answered }
     }
 }
 
@@ -410,6 +421,16 @@ fn tls_service(info: &tls::TlsInfo, port: u16) -> Service {
 
 /// The guess from the port number, noting any reply nothing recognised,
 /// or that the port accepted connections but stayed `silent`.
+/// Shown on print ports that were listened to but sent no probes.
+pub const PRINT_PORT_INFO: &str = "not probed: data sent here would print";
+
+/// Ports that print whatever bytes arrive: raw/AppSocket (JetDirect) 9100-9107
+/// and LPD 515. Sending any probe payload there wastes paper on the client's
+/// printer, so detection only listens on them.
+pub fn is_print_port(port: u16) -> bool {
+    matches!(port, 515 | 9100..=9107)
+}
+
 fn port_table(port: u16, unmatched: Option<&[u8]>, silent: bool) -> Option<Service> {
     let name = service_name(port);
     if name.is_none() && unmatched.is_none() && !silent {
