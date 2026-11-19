@@ -244,7 +244,7 @@ struct Shared {
     /// Present when service detection is on.
     services: Option<service::Detection>,
     /// Present when vulnerability matching is on and there is a service
-    /// detector to feed it CPEs.
+    /// detector to feed it CPEs, even if the database didn't open.
     vulns: Option<vuln::Matching>,
     /// Present when name lookup is on.
     naming: Option<names::Naming>,
@@ -344,18 +344,8 @@ async fn run(
         }
     }
 
-    let vulns = if config.service_detection && config.vuln_matching {
-        match vuln::Matching::open(config.vuln_db.clone()) {
-            Ok(m) => Some(m),
-            Err(msg) => {
-                rmap_log::info!("{msg}");
-                let _ = tx.send(ScanEvent::Warning(msg));
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let vulns = (config.service_detection && config.vuln_matching)
+        .then(|| vuln::Matching::start(config.vuln_db.clone(), &tx));
 
     let host_slots = Arc::new(Semaphore::new(config.timing.host_parallelism));
     let shared = Arc::new(Shared {
@@ -618,7 +608,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                     if let Some(service) = service
                         && let Some(vulns) = sh.vulns.as_ref()
                     {
-                        vulns.check(ip, protocol, port, &service.cpes, &sh.tx);
+                        vulns.check(ip, protocol, port, &service, &sh.tx);
                     }
                 }
                 PortState::Closed => {

@@ -188,7 +188,7 @@ Set `RMAP_SCAN_DIR` to keep scans somewhere else; exports then default to `$RMAP
 - **JSON:** rmap's own report format, the same one used for saved scans. It carries a `format_version` so later versions of rmap can keep reading old files. It records the rmap version, start and end times, how the scan ended (`completed`, `stopped`, `failed`), the configuration, and every host with its open and open|filtered ports, detected services and CPEs, and closed/filtered counts.
 - **Nmap XML:** the commonly used subset of Nmap's documented XML output (`nmaprun`, `scaninfo`, `host`, `status`, `address`, `hostnames`, `ports`, `extraports`, `port`, `state`, `service` with product/version/extrainfo/CPE, `times`, `runstats`), so tools that import Nmap results can read rmap scans. It's written by rmap's own small XML writer; times are in UTC, and CPEs are converted to the `cpe:/` form Nmap uses.
 - **Markdown:** a readable summary for pasting into a ticket: scope, times, hosts up, open ports and potential CVE counts by severity, then a ports table and findings per host, then all findings by severity.
-- **CSV:** one row per open or open|filtered port (`ip, hostname, port, protocol, state, service, product, version, cves, worst_severity`). Every field is quoted per RFC 4180, and fields a spreadsheet would treat as a formula (starting with `=`, `+`, `-`, `@`, tab or CR) get a leading `'`, since banners and hostnames come from the scanned devices.
+- **CSV:** one row per open or open|filtered port (`ip, hostname, port, protocol, state, service, product, version, cves, worst_severity, cve_check, exploited`). Every field is quoted per RFC 4180, and fields a spreadsheet would treat as a formula (starting with `=`, `+`, `-`, `@`, tab or CR) get a leading `'`, since banners and hostnames come from the scanned devices.
 - **HTML:** one self-contained, printable page for handing to a client: inline CSS only, no JavaScript or external requests (a Content-Security-Policy blocks them), light and dark friendly.
 
 Every scanned string is escaped for its format, and control characters (terminal escape sequences) and bidirectional overrides are replaced with `�`. CVE matches are version-based, so the Markdown and HTML reports call them *potential* findings to verify before acting.
@@ -332,6 +332,24 @@ Tick **Services** and **Vulns** on the setup form and rmap checks every identifi
 ```
 
 A match is **potentially** vulnerable, not certain: a vendor backport can fix the real bug while leaving the version string unchanged, and a version with no entry in the database is not evidence it's safe. This is an offline lookup against a local database file, not a live query - nothing is sent anywhere during a scan.
+
+### Was the port actually checked?
+
+"No CVEs listed" must never be confused with "safe", so every port with a detected service gets a CVE check status. It shows as a dim line under the port in the detail pane, and in every export:
+
+| Status | Shown as | What it means for you |
+|---|---|---|
+| checked | `no known CVEs for nginx 1.24.0` / `2 potential CVEs (nginx 1.24.0)` | The product and version were looked up. No matches means the database knows of nothing for that version, not that the service is secure. |
+| version hidden | `nginx detected, version unknown: can't check` | The product was identified but not its version (banner hidden or unversioned). rmap does **not** guess: a hidden version is never matched against "before version X" CVEs. Check the version on the device. |
+| no product | `product not identified: can't check` | The service is known only by its protocol or port number, so there is nothing to look up. |
+| not covered | `no CVE data for vsftpd: not checked` | The product was identified, but the CVE database (or rmap's product-to-CPE table) has nothing on it. |
+| no database | `no vulnerability data: not checked` | Matching was on but no usable database was found. |
+
+Everything except "checked" counts as **unchecked**: the header's bottom border shows how many (`4 unchecked`), the Markdown and HTML reports give a "Not checked for CVEs: N of M ports" line, and `/` with the filter text `unchecked` lists the hosts that have any. When a service carries several CPEs, the port gets the best outcome among them (checked, else version hidden, else not covered).
+
+**Actively exploited.** CVEs on CISA's [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) list carry a bold red `actively exploited (CISA KEV, added YYYY-MM-DD)` marker in the detail pane and the Vulns tab, where they sort first, and the same text in the Markdown, HTML and CSV exports. These are being used in real attacks: fix them first.
+
+**Data age.** The header's bottom border also shows when the CVE data was built (`CVE data 2026-11-01`); once it is more than 30 days old that turns into a warning (`CVE data 45 days old`), since anything published after that date can't be matched. Reports record the same thing ("Vulnerability data: built 2026-11-01, 245000 CVEs").
 
 ### The database file
 

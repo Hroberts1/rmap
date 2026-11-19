@@ -21,6 +21,7 @@ mod rescan;
 mod tabs;
 mod theme;
 mod ui;
+mod vuln_status;
 
 use std::io::{self, Stdout, Write};
 use std::time::{Duration, Instant};

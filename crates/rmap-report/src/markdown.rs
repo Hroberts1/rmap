@@ -2,10 +2,12 @@
 
 use std::fmt::Write as _;
 
+use rmap_core::Vulnerability;
+
 use crate::model::ScanReport;
 use crate::summary::{
-    FINDINGS_NOTE, SEVERITIES, findings, host_label, one_line, service_name, severity_line, utc,
-    version_text, worst,
+    FINDINGS_NOTE, SEVERITIES, findings, host_label, kev_note, no_findings_text, one_line,
+    service_name, severity_line, unchecked_counts, utc, version_text, vuln_data_line, worst,
 };
 
 /// Scanned text made safe for a Markdown table cell or list item: one
@@ -23,6 +25,11 @@ pub fn escape(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// ` · **actively exploited (CISA KEV, added …)**`, or nothing.
+fn kev(v: &Vulnerability) -> String {
+    kev_note(v).map_or(String::new(), |n| format!(" · **{}**", escape(&n)))
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -70,6 +77,12 @@ pub fn to_string(r: &ScanReport) -> String {
     let _ = writeln!(o, "- **Hosts up:** {} of {}", r.hosts_up(), r.hosts.len());
     let _ = writeln!(o, "- **Open ports:** {}", r.open_ports());
     let _ = writeln!(o, "- **Potential CVEs:** {}", severity_line(r));
+    if let Some(line) = vuln_data_line(r) {
+        let _ = writeln!(o, "- **Vulnerability data:** {}", escape(&line));
+    }
+    if let (n, total @ 1..) = unchecked_counts(r) {
+        let _ = writeln!(o, "- **Not checked for CVEs:** {n} of {total} ports");
+    }
     let _ = writeln!(o, "- **rmap version:** {}\n", escape(&r.rmap_version));
 
     let all = findings(r);
@@ -84,12 +97,15 @@ pub fn to_string(r: &ScanReport) -> String {
             let _ = writeln!(o, "No open ports found.\n");
             continue;
         }
-        let _ = writeln!(o, "| Port | State | Service | Version | Potential CVEs |");
+        let _ = writeln!(o, "| Port | State | Service | Version | CVE check |");
         let _ = writeln!(o, "|---|---|---|---|---|");
         for p in &h.ports {
-            let cves = match worst(p) {
-                Some(s) => format!("{} (worst: {})", p.vulnerabilities.len(), s.as_str()),
-                None => String::new(),
+            let check = p.vuln_check.as_ref().map(|c| escape(&c.to_string()));
+            let cves = match (check, worst(p)) {
+                (Some(c), Some(s)) => format!("{c}, worst: {}", s.as_str()),
+                (Some(c), None) => c,
+                (None, Some(s)) => format!("{} (worst: {})", p.vulnerabilities.len(), s.as_str()),
+                (None, None) => String::new(),
             };
             let _ = writeln!(
                 o,
@@ -109,12 +125,13 @@ pub fn to_string(r: &ScanReport) -> String {
                 let score = f.vuln.score.map_or(String::new(), |s| format!(", {s:.1}"));
                 let _ = writeln!(
                     o,
-                    "- **{}** ({}{score}) on {}/{}: {}",
+                    "- **{}** ({}{score}) on {}/{}: {}{}",
                     escape(&f.vuln.id),
                     f.vuln.severity.as_str(),
                     f.port,
                     f.protocol.as_str(),
-                    escape(&f.vuln.summary)
+                    escape(&f.vuln.summary),
+                    kev(f.vuln)
                 );
             }
             let _ = writeln!(o);
@@ -123,12 +140,7 @@ pub fn to_string(r: &ScanReport) -> String {
 
     let _ = writeln!(o, "## Potential findings by severity\n");
     if all.is_empty() {
-        let why = if c.service_detection {
-            "No potential CVEs matched the detected services."
-        } else {
-            "Service detection was off, so no CVE matching was done."
-        };
-        let _ = writeln!(o, "{why}");
+        let _ = writeln!(o, "{}", no_findings_text(r));
     }
     for sev in SEVERITIES {
         let group: Vec<_> = all.iter().filter(|f| f.vuln.severity == sev).collect();
@@ -140,12 +152,13 @@ pub fn to_string(r: &ScanReport) -> String {
             let score = f.vuln.score.map_or(String::new(), |s| format!(" ({s:.1})"));
             let _ = writeln!(
                 o,
-                "- **{}**{score}: {} {}/{}: {}",
+                "- **{}**{score}: {} {}/{}: {}{}",
                 escape(&f.vuln.id),
                 f.ip,
                 f.port,
                 f.protocol.as_str(),
-                escape(&f.vuln.summary)
+                escape(&f.vuln.summary),
+                kev(f.vuln)
             );
         }
         let _ = writeln!(o);
