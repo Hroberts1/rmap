@@ -18,6 +18,7 @@ pub(crate) const ACCENT: Color = Color::Cyan;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let mut hits = HitMap::default();
+    crate::settings::set_display(&app.settings.settings);
     match app.screen {
         Screen::Setup => {
             draw_setup(frame, app, &mut hits);
@@ -36,6 +37,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 crate::report_ui::draw_diff(frame, diff);
             }
         }
+    }
+    if app.settings.is_open() {
+        let busy = app
+            .scan
+            .as_ref()
+            .is_some_and(|v| v.is_running() || v.rescan.is_some());
+        crate::settings_ui::draw(frame, &app.settings, busy, &mut hits);
     }
     if let Some(dialog) = &app.dialog {
         crate::report_ui::draw_dialog(frame, dialog);
@@ -85,7 +93,15 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     );
     let block = Block::bordered()
         .title(Line::from(" rmap · new scan ").bold().fg(ACCENT))
-        .title_bottom(key_help(&[("Tab", "next"), ("Enter", "scan"), ("Esc", "quit")]).centered());
+        .title_bottom(
+            key_help(&[
+                ("Tab", "next"),
+                ("Enter", "scan"),
+                ("F2", "settings"),
+                ("Esc", "quit"),
+            ])
+            .centered(),
+        );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -284,7 +300,10 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
 
     // Vulns depends on Services (ticking it turns Services on), so with
     // Services off it reads as unavailable rather than as a live choice.
-    let vulns_check = if form.vuln_matching {
+    let vulns_check = if app.settings.db.needs_download() {
+        let tick = if form.vuln_matching { "[x]" } else { "[ ]" };
+        Span::raw(format!("{tick} no CVE data yet: F2 to download")).dim()
+    } else if form.vuln_matching {
         Span::raw("[x] flag potential CVEs for identified services")
     } else if form.service_detection {
         Span::raw("[ ] don't check for known vulnerabilities")
@@ -307,6 +326,12 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
     if let Some(err) = &form.error {
         frame.render_widget(
             Paragraph::new(Line::from(format!("✗ {err}")).fg(Color::Red)).wrap(Wrap { trim: true }),
+            error,
+        );
+    } else if let Some((notice, is_error)) = &app.settings.notice {
+        let color = if *is_error { Color::Yellow } else { ACCENT };
+        frame.render_widget(
+            Paragraph::new(Line::from(notice.clone()).fg(color)).wrap(Wrap { trim: true }),
             error,
         );
     }
@@ -387,7 +412,7 @@ fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
     if !view.is_running() {
         wanted.push(("r", "rescan"));
     }
-    wanted.push(("d", "down hosts"));
+    wanted.extend([("d", "down hosts"), ("S", "settings")]);
     let always = [("?", "help"), ("q", "quit")];
     // key_help draws each pair as " key " + " what  ".
     let cost = |(k, w): &(&str, &str)| k.chars().count() + w.chars().count() + 5;
@@ -891,7 +916,11 @@ pub(crate) fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
             Line::from(vec![lead, Span::raw(line).fg(color)])
         })
         .collect::<Vec<_>>();
-    if let Some(date) = &v.kev_added {
+    if let Some(date) = v
+        .kev_added
+        .as_ref()
+        .filter(|_| crate::settings::highlight_exploited())
+    {
         let note = format!("actively exploited (CISA KEV, added {date})");
         for line in wrap(&note, width.saturating_sub(indent), 0) {
             lines.push(Line::from(vec![
@@ -1018,6 +1047,7 @@ fn draw_help(frame: &mut Frame) {
         ("L", "full log (scrollable)"),
         ("y Y", "copy IP or ip:port / CVE IDs"),
         ("m", "mouse on/off (off = select text)"),
+        ("S F2", "settings, update CVE data"),
         ("n Esc", "new scan"),
         ("q Ctrl-C", "quit / quit immediately"),
     ];

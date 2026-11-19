@@ -1321,6 +1321,7 @@ dependencies = [
  "rmap-log",
  "rmap-oui",
  "rmap-report",
+ "rmap-vuln",
  "serde",
  "serde_json",
  "tokio",

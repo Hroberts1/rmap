@@ -452,6 +452,8 @@ pub struct App {
     pub mouse_capture: bool,
     /// Clickable areas of the last frame, written by the renderer.
     pub hits: HitMap,
+    /// Settings, the CVE data status and the Settings screen (`settings_ui.rs`).
+    pub settings: crate::settings_ui::SettingsState,
     quit: bool,
 }
 
@@ -474,6 +476,7 @@ impl App {
             clipboard: None,
             mouse_capture: true,
             hits: HitMap::default(),
+            settings: crate::settings_ui::SettingsState::from_env(),
             quit: false,
         }
     }
@@ -488,6 +491,7 @@ impl App {
 
     /// Pull whatever the engine has produced since the last frame.
     pub fn drain_events(&mut self) {
+        self.poll_settings();
         let Some(view) = self.scan.as_mut() else {
             return;
         };
@@ -541,6 +545,10 @@ impl App {
             self.on_confirm_key(key);
             return;
         }
+        if self.settings.is_open() {
+            self.on_settings_key(key);
+            return;
+        }
         if self.help {
             // Any key closes the overlay; it doesn't fall through.
             self.help = false;
@@ -566,6 +574,10 @@ impl App {
     pub fn on_paste(&mut self, pasted: &str) {
         rmap_log::debug!("paste of {} bytes", pasted.len());
         if self.confirm.is_some() || self.pending.is_some() || self.help {
+            return;
+        }
+        if self.settings.is_open() {
+            self.on_settings_paste(pasted);
             return;
         }
         if self.profiles.picker.is_some() {
@@ -656,6 +668,7 @@ impl App {
         }
         let form = &mut self.form;
         match key.code {
+            KeyCode::F(2) => self.open_settings(),
             KeyCode::Esc => self.confirm = Some(Confirm::Quit),
             KeyCode::Enter => self.submit(),
             KeyCode::Tab | KeyCode::Down => form.focus = form.focus.step(true),
@@ -783,6 +796,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('S') | KeyCode::F(2) => self.open_settings(),
             KeyCode::Tab | KeyCode::BackTab => {
                 view.focus = match view.focus {
                     Pane::Hosts => Pane::Ports,

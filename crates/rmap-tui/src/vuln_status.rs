@@ -7,10 +7,10 @@ use rmap_core::{VulnCheck, VulnData};
 
 use crate::app::ScanView;
 
-/// CVE data older than this many days is flagged in the header.
-// The Settings screen will make this configurable; keep it the one source.
+/// CVE data older than this many days is flagged in the header; set in
+/// Settings (`vuln_stale_days`).
 pub(crate) fn stale_after_days() -> i64 {
-    30
+    i64::from(crate::settings::stale_days())
 }
 
 /// The detail pane's status line for a port and its style, or `None` for
@@ -67,7 +67,7 @@ fn data_span(data: &VulnData, today: i64) -> Span<'static> {
 }
 
 /// Days since 1970-01-01 of a string starting `YYYY-MM-DD`.
-fn date_days(s: &str) -> Option<i64> {
+pub(crate) fn date_days(s: &str) -> Option<i64> {
     let date = s.get(..10)?;
     let mut parts = date.split('-');
     let mut num = |len: usize| {
@@ -309,6 +309,41 @@ mod tests {
         for line in screen.lines() {
             assert_eq!(line.chars().count(), 80, "{line:?}");
         }
+    }
+
+    #[test]
+    fn kev_line_follows_the_setting() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = App::new(rt.handle().clone());
+        audited(&mut app, &today());
+        app.settings.settings.vuln_highlight_exploited = false;
+        let screen = render(&mut app, 160, 40);
+        assert!(screen.contains("CVE-2024-6387"), "{screen}");
+        assert!(!screen.contains("actively exploited"), "{screen}");
+        app.on_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        let screen = render(&mut app, 160, 40);
+        assert!(screen.contains("CVE-2024-6387"), "{screen}");
+        assert!(!screen.contains("actively exploited (CISA KEV"), "{screen}");
+    }
+
+    #[test]
+    fn stale_threshold_follows_the_setting() {
+        let data = VulnData {
+            built_at: "2026-10-04".into(),
+            cve_count: 1,
+            source: "test".into(),
+        };
+        let today = date_days("2026-11-18").unwrap();
+        crate::settings::set_display(&crate::settings::Settings {
+            vuln_stale_days: 60,
+            ..Default::default()
+        });
+        assert_eq!(data_span(&data, today).content, "CVE data 2026-10-04");
+        crate::settings::set_display(&crate::settings::Settings {
+            vuln_stale_days: 7,
+            ..Default::default()
+        });
+        assert_eq!(data_span(&data, today).content, "CVE data 45 days old");
     }
 
     #[test]

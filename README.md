@@ -152,6 +152,7 @@ sudo setcap cap_net_raw+ep target/release/rmap
 | `L` | Full-screen scrollable log |
 | `y` / `Y` | Copy the selected address (or `ip:port`) / the selected host's CVE IDs (below) |
 | `m` | Toggle mouse capture on/off - off lets the terminal's own text selection work |
+| `S` / `F2` | Settings, including updating the CVE data (below) |
 | `n` / `Esc` | New scan |
 | `q` / `Ctrl-C` | Quit (asks first on a running scan) / quit immediately |
 | `?` | This list, as an overlay |
@@ -177,6 +178,26 @@ sudo setcap cap_net_raw+ep target/release/rmap
 ### Colors
 
 Set `NO_COLOR` (non-empty, per [no-color.org](https://no-color.org)) to draw every frame without foreground or background colors - bold, dim and reversed still apply, so the selected row and key labels still stand out. Useful over a monochrome connection or for screen readers.
+
+### Settings
+
+`F2` on the setup form, or `S` (or `F2`) on the results screen, opens Settings. `Tab`/`↑↓` move between rows, `Enter`/`Space` press a button or flip a checkbox, and `Esc` goes back. A change is saved as soon as you make it - for the two text fields, when you press `Enter` or leave the field; an invalid value stays in the field with the reason shown and isn't saved (`Esc` discards it).
+
+| Setting | Default | What it does |
+|---|---|---|
+| Update now | - | Downloads the latest CVE data, after showing what it will download and asking **y/n** (below). Disabled while a scan or rescan is running. |
+| Update URL (`vuln_update_url`) | `https://github.com/Hroberts1/rmap/releases/download/vulndb/vulns.json` | Where Update now reads the manifest. Must be `https://` (or `http://` to this computer); `Reset URL to default` puts it back. |
+| Check for updates on startup (`vuln_check_on_startup`) | off | When on, rmap fetches the manifest each time it starts and, if newer data exists, says so (`newer CVE data is available ...`). It never downloads on its own. |
+| Warn when data is older than N days (`vuln_stale_days`) | 30 | CVE data older than this is flagged in the results header and in Settings. 1-365. |
+| Highlight actively exploited CVEs (`vuln_highlight_exploited`) | on | Shows the `actively exploited (CISA KEV, added ...)` line under such CVEs in the detail pane and the Vulns tab. Exploited CVEs are still listed first when it's off. |
+
+The screen also shows where the CVE data lives and what's in it (`built 2026-11-01 (17 days ago) · 245,000 CVEs · NVD API 2.0 + CISA KEV`), or that it hasn't been downloaded yet - in which case the setup form's Vulns row says `no CVE data yet: F2 to download`.
+
+**Network use:** rmap contacts the update URL only when you press Update now, or at startup if you turned that on. Scanning never fetches anything.
+
+**Update now**, step by step: rmap fetches the manifest in the background (`checking github.com…`), then asks, e.g. `Download 4.2 MB of CVE data built 2026-11-15 (245,000 CVEs) from github.com?` - and says plainly if that build is **older** than the data you have, or the same one. On `y` it downloads with live progress, verifies and installs (see [Updating vulnerability data](#updating-vulnerability-data) for the checks). Leaving Settings cancels a check or an unanswered question; a download already running finishes in the background and reports to the log panel. Results and errors are also written to rmap's log file.
+
+Settings live in `settings.json`, in `%APPDATA%\rmap` on Windows, `~/Library/Application Support/rmap` on macOS, and `$XDG_CONFIG_HOME/rmap` (or `~/.config/rmap`) elsewhere. It's plain JSON with the field names above; missing fields take their defaults and unknown ones are ignored. A value that fails validation falls back to its default with a warning on the setup form; a file that isn't valid JSON is moved to `settings.json.bad` (and defaults are used) rather than being overwritten.
 
 ## Scan profiles and recent targets
 
@@ -390,7 +411,7 @@ How matching works (`crates/rmap-vuln`):
 
 ### Updating vulnerability data
 
-`rmap_vuln::update` downloads a fresh `vulns.db`; a Settings screen with an "Update now" item will call it (coming in a later change). Nothing is fetched unless you ask. By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); the URL is a parameter, so you can host the two files yourself. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
+`rmap_vuln::update` downloads a fresh `vulns.db`; the Settings screen's "Update now" calls it, after asking (see [Settings](#settings)). Nothing is fetched unless you ask. By default it reads the manifest `vulns.json` from the `vulndb` release of this repository (`rmap_vuln::DEFAULT_MANIFEST_URL`); the URL is a parameter, so you can host the two files yourself. The manifest gives the database's schema version, build time, CVE count, size and SHA-256.
 
 Before anything replaces your current database, rmap checks that:
 

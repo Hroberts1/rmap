@@ -275,7 +275,7 @@ fn read_list(path: &Path) -> Vec<Value> {
 
 /// Write through a temp file and rename, so a crash mid-write can't leave
 /// a half-written file behind.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }

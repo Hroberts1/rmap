@@ -18,6 +18,8 @@ mod rate;
 mod report;
 mod report_ui;
 mod rescan;
+mod settings;
+mod settings_ui;
 mod tabs;
 mod theme;
 mod ui;

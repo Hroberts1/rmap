@@ -417,9 +417,10 @@ fn origin(url: &str) -> String {
     split_url(url).map_or_else(String::new, |(s, a, _)| format!("{s}://{a}"))
 }
 
-/// Allows `https://`, and `http://` only to a loopback host. Returns
-/// whether the host is loopback.
-fn check_url(url: &str) -> Result<bool, UpdateError> {
+/// Whether rmap would fetch `url`: `https://`, or `http://` only to a
+/// loopback host. Returns whether the host is loopback. Every URL rmap
+/// fetches (given, from a manifest, or a redirect) passes through this.
+pub fn check_url(url: &str) -> Result<bool, UpdateError> {
     let insecure = |m: &str| Err(UpdateError::Insecure(m.to_string()));
     if url.len() > MAX_URL_LEN {
         return insecure("too long");

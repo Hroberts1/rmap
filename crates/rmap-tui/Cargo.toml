@@ -12,6 +12,7 @@ rmap-log = { workspace = true }
 rmap-engine = { workspace = true }
 rmap-oui = { workspace = true }
 rmap-report = { workspace = true }
+rmap-vuln = { workspace = true }
 ratatui = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

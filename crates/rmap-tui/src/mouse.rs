@@ -23,6 +23,8 @@ pub struct HitMap {
     pub hosts: Option<ListHit<IpAddr>>,
     /// Port pane; items are indices into the selected host's open ports.
     pub ports: Option<ListHit<usize>>,
+    /// Settings screen rows.
+    pub settings: Vec<(crate::settings_ui::Row, Rect)>,
 }
 
 /// A scrolled list on screen.
@@ -60,6 +62,10 @@ impl App {
             return;
         }
         let pos = Position::new(ev.column, ev.row);
+        if self.settings.is_open() {
+            self.on_settings_mouse(ev.kind, pos);
+            return;
+        }
         match self.screen {
             Screen::Setup => self.on_setup_mouse(ev.kind, pos),
             Screen::Results => self.on_results_mouse(ev.kind, pos),
