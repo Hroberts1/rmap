@@ -195,6 +195,15 @@ pub async fn ping(ip: IpAddr, timing: &Timing, stats: &std::sync::Arc<Stats>) ->
         let stats = stats.clone();
         tries.spawn(async move { (port, attempt(ip, port, limit, &stats).await) });
     }
+    // Windows has no raw-socket ICMP, so race an IP Helper echo; port 0 marks it.
+    #[cfg(windows)]
+    tries.spawn({
+        let t = *timing;
+        async move {
+            let rtt = crate::icmp_win::ping(ip, &t).await;
+            (0, rtt.map_or(Outcome::TimedOut, Outcome::Open))
+        }
+    });
     while let Some(done) = tries.join_next().await {
         match done {
             Ok((port, Outcome::Open(rtt) | Outcome::Refused(rtt))) => {
