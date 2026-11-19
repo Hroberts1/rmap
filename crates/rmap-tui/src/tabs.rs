@@ -101,8 +101,9 @@ pub fn service_groups(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<ServiceGroup<'_>
         .collect()
 }
 
-/// Every finding in the scan, worst first: severity, then score, unscored
-/// last. Ties keep address and port order.
+/// Every finding in the scan, worst first: actively exploited (CISA KEV),
+/// then severity, then score, unscored last. Ties keep address and port
+/// order.
 pub fn findings(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<Finding<'_>> {
     let mut all: Vec<Finding> = hosts
         .iter()
@@ -117,10 +118,11 @@ pub fn findings(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<Finding<'_>> {
         })
         .collect();
     let score = |f: &Finding| f.vuln.score.unwrap_or(-1.0);
+    let exploited = |f: &Finding| f.vuln.kev_added.is_some();
     all.sort_by(|a, b| {
-        b.vuln
-            .severity
-            .cmp(&a.vuln.severity)
+        exploited(b)
+            .cmp(&exploited(a))
+            .then(b.vuln.severity.cmp(&a.vuln.severity))
             .then(score(b).total_cmp(&score(a)))
     });
     all
@@ -533,6 +535,7 @@ mod tests {
                 severity: sev,
                 score: Some(score),
                 published: None,
+                kev_added: None,
             }],
         });
     }

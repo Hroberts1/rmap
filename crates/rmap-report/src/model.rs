@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rmap_core::{HostName, HostState, MacAddr, PortResult, PortState, ScanType};
+use rmap_core::{HostName, HostState, MacAddr, PortResult, PortState, ScanType, VulnData};
 use rmap_log::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -144,6 +144,10 @@ pub struct ScanReport {
     pub config: ConfigSummary,
     /// Hosts in address order.
     pub hosts: Vec<HostReport>,
+    /// The CVE database matched against; `None` when matching was off or
+    /// no database opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vuln_data: Option<VulnData>,
 }
 
 impl ScanReport {
@@ -157,6 +161,7 @@ impl ScanReport {
             status: RunStatus::Running,
             config,
             hosts: Vec::new(),
+            vuln_data: None,
         }
     }
 

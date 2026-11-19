@@ -1,71 +1,196 @@
 //! Vulnerability matching hook (Milestone 4).
 //!
-//! The engine calls [`Matching::check`] right after service detection
-//! identifies a service on an open port, with that service's CPEs. It is
-//! a plain local lookup against the database already loaded in memory -
-//! no I/O, so there is no separate concurrency limit the way detection
-//! has one for its network probes.
+//! The engine opens the local CVE database once per scan with
+//! [`Matching::start`], then calls [`Matching::check`] right after service
+//! detection identifies a service on an open port. Each check is an
+//! indexed lookup in a local SQLite file - quick enough that there is no
+//! separate concurrency limit the way detection has one for its network
+//! probes.
+//!
+//! Every checked port also gets a [`VulnCheck`] status, so a port that
+//! couldn't be checked says so instead of looking clean.
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 
-use rmap_core::{Protocol, ScanEvent, Vulnerability};
-use rmap_vuln::Database;
+use rmap_core::{Protocol, ScanEvent, Service, VulnCheck, VulnData, Vulnerability};
+use rmap_vuln::{Database, DbError};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub(crate) struct Matching {
-    db: Database,
+    /// `None` when matching was asked for but no usable database opened;
+    /// every port then gets [`VulnCheck::NoDatabase`].
+    db: Option<Database>,
 }
 
 impl Matching {
-    pub fn new() -> Matching {
-        Matching {
-            db: Database::builtin(),
+    /// Opens `path`, or [`rmap_vuln::default_path`] when `None`. Sends
+    /// `VulnData` if it opened, else one warning saying why matching is
+    /// skipped.
+    pub fn start(path: Option<PathBuf>, tx: &UnboundedSender<ScanEvent>) -> Matching {
+        match open(path) {
+            Ok(db) => {
+                let info = db.info();
+                let _ = tx.send(ScanEvent::VulnData(VulnData {
+                    built_at: info.built_at.clone(),
+                    cve_count: info.cve_count,
+                    source: info.source.clone(),
+                }));
+                Matching { db: Some(db) }
+            }
+            Err(msg) => {
+                rmap_log::info!("{msg}");
+                let _ = tx.send(ScanEvent::Warning(msg));
+                Matching { db: None }
+            }
         }
     }
 
-    /// Looks up every CPE a detected service carries and reports any
-    /// matches, deduplicated by CVE id (more than one CPE, or more than
-    /// one match rule, can name the same CVE). Sends nothing when there
-    /// are none, so a clean service doesn't flood the UI with empty events.
+    /// Looks up the CPEs a detected service carries and reports any
+    /// matches, then the port's status. `Vulnerabilities` is skipped when
+    /// there are none, so a clean service doesn't flood the UI with empty
+    /// events.
     pub fn check(
         &self,
         ip: IpAddr,
         protocol: Protocol,
         port: u16,
-        cpes: &[String],
+        service: &Service,
         tx: &UnboundedSender<ScanEvent>,
     ) {
-        let mut findings: Vec<Vulnerability> = Vec::new();
-        for cpe in cpes {
-            for entry in self.db.find(cpe) {
-                if !findings.iter().any(|f| f.id == entry.finding.id) {
-                    findings.push(entry.finding.clone());
+        let status = match &self.db {
+            None => VulnCheck::NoDatabase,
+            Some(db) => {
+                let (findings, status) = lookup(db, service);
+                if !findings.is_empty() {
+                    rmap_log::debug!(
+                        "{} potential {} for {ip}:{port}/{}: {}",
+                        findings.len(),
+                        if findings.len() == 1 {
+                            "vulnerability"
+                        } else {
+                            "vulnerabilities"
+                        },
+                        protocol.as_str(),
+                        findings
+                            .iter()
+                            .map(|f| f.id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    let _ = tx.send(ScanEvent::Vulnerabilities {
+                        ip,
+                        protocol,
+                        port,
+                        findings,
+                    });
                 }
+                status
             }
-        }
-        if findings.is_empty() {
-            return;
-        }
-        rmap_log::debug!(
-            "{} potential {} for {ip}:{port}/{}: {}",
-            findings.len(),
-            if findings.len() == 1 {
-                "vulnerability"
-            } else {
-                "vulnerabilities"
-            },
-            protocol.as_str(),
-            findings
-                .iter()
-                .map(|f| f.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let _ = tx.send(ScanEvent::Vulnerabilities {
+        };
+        rmap_log::debug!("vuln check {ip}:{port}/{}: {status}", protocol.as_str());
+        let _ = tx.send(ScanEvent::VulnCheck {
             ip,
             protocol,
             port,
-            findings,
+            status,
         });
     }
+}
+
+fn open(path: Option<PathBuf>) -> Result<Database, String> {
+    let path = path
+        .or_else(rmap_vuln::default_path)
+        .ok_or("no data directory for the vulnerability database; CVE matching skipped")?;
+    let db = Database::open(&path).map_err(|e| match e {
+        DbError::NotFound => format!(
+            "no vulnerability data at {}; CVE matching skipped",
+            path.display()
+        ),
+        e => format!("{}: {e}; CVE matching skipped", path.display()),
+    })?;
+    let info = db.info();
+    rmap_log::info!(
+        "vulnerability database {}: {} CVEs, built {}, source {}",
+        path.display(),
+        info.cve_count,
+        info.built_at,
+        info.source
+    );
+    Ok(db)
+}
+
+/// Matches every checkable CPE the service carries, deduplicated by CVE id
+/// (more than one CPE, or more than one match rule, can name the same
+/// CVE), and one status for the port: `Checked` if any CPE could be looked
+/// up, else `VersionHidden`, else `NotCovered`.
+///
+/// A CPE with no version is not looked up at all: its `*` would fall
+/// inside every "before version X" range and match CVEs it can't be shown
+/// to have.
+fn lookup(db: &Database, service: &Service) -> (Vec<Vulnerability>, VulnCheck) {
+    // Prefer detection's human-readable names over the CPE's.
+    let product = |cpe_product: &str| {
+        service
+            .product
+            .clone()
+            .unwrap_or_else(|| cpe_product.to_string())
+    };
+    let unset = |field: &str| matches!(field, "" | "*" | "-");
+    let mut findings: Vec<Vulnerability> = Vec::new();
+    let mut best: Option<(u8, VulnCheck)> = None;
+    for cpe in &service.cpes {
+        // cpe : 2.3 : part : vendor : product : version : update : ...
+        let f: Vec<&str> = cpe.split(':').collect();
+        let (Some(vendor), Some(name), Some(version)) = (f.get(3), f.get(4), f.get(5)) else {
+            continue;
+        };
+        let candidate = if !db.knows_product(vendor, name) {
+            (
+                1,
+                VulnCheck::NotCovered {
+                    product: product(name),
+                },
+            )
+        } else if unset(version) {
+            (
+                2,
+                VulnCheck::VersionHidden {
+                    product: product(name),
+                },
+            )
+        } else {
+            for finding in db.find(cpe) {
+                if !findings.iter().any(|f| f.id == finding.id) {
+                    findings.push(finding);
+                }
+            }
+            let version = match (&service.version, f.get(6)) {
+                (Some(v), _) => v.clone(),
+                (None, Some(update)) if !unset(update) => format!("{version}{update}"),
+                (None, _) => version.to_string(),
+            };
+            (
+                3,
+                VulnCheck::Checked {
+                    product: product(name),
+                    version,
+                    matches: 0,
+                },
+            )
+        };
+        if best.as_ref().is_none_or(|(rank, _)| candidate.0 > *rank) {
+            best = Some(candidate);
+        }
+    }
+    let mut status = match (best, &service.product) {
+        (Some((_, status)), _) => status,
+        // A named product rmap has no CPE for: no data to check it with.
+        (None, Some(p)) => VulnCheck::NotCovered { product: p.clone() },
+        (None, None) => VulnCheck::NoProduct,
+    };
+    if let VulnCheck::Checked { matches, .. } = &mut status {
+        *matches = u32::try_from(findings.len()).unwrap_or(u32::MAX);
+    }
+    (findings, status)
 }

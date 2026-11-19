@@ -57,7 +57,8 @@ pub struct DiffView {
 
 pub enum Dialog {
     Export(ExportDialog),
-    Compare(ComparePicker),
+    // Boxed: it holds a whole ScanReport.
+    Compare(Box<ComparePicker>),
 }
 
 /// Where scans are saved: the real data directory, except in unit tests,
@@ -192,11 +193,11 @@ impl App {
             ));
             return;
         };
-        self.dialog = Some(Dialog::Compare(ComparePicker {
+        self.dialog = Some(Dialog::Compare(Box::new(ComparePicker {
             scans,
             selected,
             current,
-        }));
+        })));
     }
 
     /// Keys while a dialog is open. Returns after handling every key, so

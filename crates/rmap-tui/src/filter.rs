@@ -58,6 +58,10 @@ pub fn matches(ip: IpAddr, host: &HostRow, query: &str) -> bool {
             };
             port == Some(p.port)
                 || name.to_lowercase().contains(&q)
+                || (q == "unchecked"
+                    && p.vuln_check
+                        .as_ref()
+                        .is_some_and(rmap_core::VulnCheck::is_unchecked))
                 || p.service
                     .as_ref()
                     .and_then(|s| s.product.as_deref())
@@ -124,6 +128,7 @@ mod tests {
             severity,
             score,
             published: None,
+            kev_added: None,
         }
     }
 

@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
-use rmap_core::{Protocol, ScanEvent, Service, Vulnerability};
+use rmap_core::{Protocol, ScanEvent, Service, VulnData, Vulnerability};
 
 use crate::model::{ConfigSummary, HostReport, RunStatus, ScanReport};
 
@@ -142,6 +142,23 @@ impl ReportBuilder {
                     }
                 }
             }
+            ScanEvent::VulnCheck {
+                ip,
+                protocol,
+                port,
+                status,
+            } => {
+                // Sent after its Service, so the port is already here.
+                match self.hosts.get_mut(ip).and_then(|h| {
+                    h.ports
+                        .iter_mut()
+                        .find(|p| p.port == *port && p.protocol == *protocol)
+                }) {
+                    Some(p) => p.vuln_check = Some(status.clone()),
+                    None => self.orphans += 1,
+                }
+            }
+            ScanEvent::VulnData(data) => self.report.vuln_data = Some(data.clone()),
             ScanEvent::HostDone {
                 ip,
                 closed,
@@ -180,6 +197,11 @@ impl ReportBuilder {
             self.report.status = status;
             self.report.finished_ms = Some(now_ms.max(self.report.started_ms));
         }
+    }
+
+    /// The CVE database the scan matched against, once known.
+    pub fn vuln_data(&self) -> Option<&VulnData> {
+        self.report.vuln_data.as_ref()
     }
 
     /// The report as it stands.
@@ -298,6 +320,35 @@ pub(crate) mod tests {
             "down hosts are done"
         );
         assert_eq!((r.hosts_up(), r.open_ports()), (1, 3));
+    }
+
+    #[test]
+    fn vuln_check_and_data_are_kept() {
+        let mut b = ReportBuilder::new(config(), 1_000);
+        let data = VulnData {
+            built_at: "2026-11-01".into(),
+            cve_count: 7,
+            source: "test".into(),
+        };
+        b.apply(&ScanEvent::VulnData(data.clone()));
+        assert_eq!(b.vuln_data(), Some(&data));
+        host(&mut b, "10.0.0.2", HostState::Up);
+        port(&mut b, "10.0.0.2", 22, Protocol::Tcp);
+        let check = |port| ScanEvent::VulnCheck {
+            ip: ip("10.0.0.2"),
+            protocol: Protocol::Tcp,
+            port,
+            status: rmap_core::VulnCheck::NoProduct,
+        };
+        b.apply(&check(22));
+        b.apply(&check(23)); // no such port
+        assert_eq!(b.orphans(), 1);
+        let r = b.report();
+        assert_eq!(r.vuln_data, Some(data));
+        assert_eq!(
+            r.hosts[0].ports[0].vuln_check,
+            Some(rmap_core::VulnCheck::NoProduct)
+        );
     }
 
     #[test]

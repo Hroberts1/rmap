@@ -100,6 +100,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn vuln_check_and_data_round_trip() {
+        let mut report = crate::summary::tests::fixture();
+        report.hosts[0].ports[1].vuln_check = Some(rmap_core::VulnCheck::VersionHidden {
+            product: "Net-SNMP".into(),
+        });
+        let text = to_string(&report).unwrap();
+        assert!(text.contains("\"status\": \"version_hidden\""), "{text}");
+        assert!(text.contains("\"kev_added\": \"2024-07-15\""), "{text}");
+        assert!(text.contains("\"cve_count\": 245000"), "{text}");
+        assert_eq!(from_str(&text).unwrap(), report);
+        // Absent statuses and data aren't written, so older files look the same.
+        let text = to_string(&sample()).unwrap();
+        assert!(!text.contains("vuln_check") && !text.contains("vuln_data"));
+    }
+
+    #[test]
     fn empty_report_round_trips() {
         let report = ScanReport::new(config(), 0);
         assert_eq!(from_str(&to_string(&report).unwrap()).unwrap(), report);

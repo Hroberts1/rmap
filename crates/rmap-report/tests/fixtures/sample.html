@@ -35,6 +35,7 @@ th { font-size: 13px; color: var(--muted); font-weight: 600; }
 .sev { font-weight: 700; text-transform: uppercase; font-size: 12px; letter-spacing: .03em; }
 .critical { color: var(--critical); } .high { color: var(--high); }
 .medium { color: var(--medium); } .low { color: var(--low); }
+.kev { font-weight: 700; color: var(--critical); } .unchecked { color: var(--medium); }
 footer { margin-top: 40px; font-size: 13px; color: var(--muted); }
 @media print { main { max-width: none; padding: 0; } h2 { break-after: avoid; } tr { break-inside: avoid; } }
 </style>
@@ -62,15 +63,17 @@ footer { margin-top: 40px; font-size: 13px; color: var(--muted); }
 <tr><th>Duration</th><td>4.3 s</td></tr>
 <tr><th>Status</th><td>completed</td></tr>
 <tr><th>rmap version</th><td>0.1.0</td></tr>
+<tr><th>Vulnerability data</th><td>built 2025-11-01, 245000 CVEs (NVD + CISA KEV)</td></tr>
+<tr><th>Not checked for CVEs</th><td>0 of 1 ports</td></tr>
 </tbody>
 </table>
 <h2>Hosts</h2>
 <section class="host">
 <h3>10.0.0.2 <span class="muted">db.lan</span></h3>
 <table>
-<thead><tr><th>Port</th><th>State</th><th>Service</th><th>Version</th><th>Potential CVEs</th></tr></thead>
+<thead><tr><th>Port</th><th>State</th><th>Service</th><th>Version</th><th>CVE check</th></tr></thead>
 <tbody>
-<tr><td>22/tcp</td><td>open</td><td>ssh</td><td>OpenSSH 9.6p1 (Ubuntu Linux; protocol 2.0)</td><td>2 <span class="sev high">worst high</span></td></tr>
+<tr><td>22/tcp</td><td>open</td><td>ssh</td><td>OpenSSH 9.6p1 (Ubuntu Linux; protocol 2.0)</td><td>2 potential CVEs (OpenSSH 9.6p1) <span class="sev high">worst high</span></td></tr>
 <tr><td>161/udp</td><td>open|filtered</td><td></td><td></td><td></td></tr>
 </tbody>
 </table>
@@ -83,7 +86,7 @@ footer { margin-top: 40px; font-size: 13px; color: var(--muted); }
 <table>
 <thead><tr><th>Severity</th><th>CVE</th><th>Score</th><th>Host</th><th>Port</th><th>Summary</th></tr></thead>
 <tbody>
-<tr><td><span class="sev high">high</span></td><td>CVE-2024-6387</td><td>8.1</td><td>10.0.0.2</td><td>22/tcp</td><td>Signal handler race condition (regreSSHion).</td></tr>
+<tr><td><span class="sev high">high</span></td><td>CVE-2024-6387</td><td>8.1</td><td>10.0.0.2</td><td>22/tcp</td><td>Signal handler race condition (regreSSHion). <span class="kev">actively exploited (CISA KEV, added 2024-07-15)</span></td></tr>
 <tr><td><span class="sev medium">medium</span></td><td>CVE-2023-51385</td><td>6.5</td><td>10.0.0.2</td><td>22/tcp</td><td>Shell metacharacters in user names may be expanded.</td></tr>
 </tbody>
 </table>

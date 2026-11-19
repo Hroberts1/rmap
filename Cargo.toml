@@ -12,7 +12,7 @@ rmap-tui = { path = "crates/rmap-tui" }
 tokio = { workspace = true }
 
 [workspace]
-members = ["crates/*"]
+members = ["crates/*", "tools/*"]
 resolver = "3"
 
 [workspace.package]
@@ -37,6 +37,11 @@ ratatui = "0.30"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The CVE database file (rmap-vuln). Bundled so no system SQLite is needed.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Downloading the CVE database (rmap-vuln). rustls on ring (no cmake/NASM)
+# with the webpki-roots Mozilla CA bundle; no gzip, cookies or json.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 
 [profile.release]
 lto = "thin"

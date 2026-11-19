@@ -14,20 +14,22 @@
 - **Hosts up:** 2 of 2
 - **Open ports:** 1
 - **Potential CVEs:** 2 (high 1, medium 1)
+- **Vulnerability data:** built 2025-11-01, 245000 CVEs (NVD + CISA KEV)
+- **Not checked for CVEs:** 0 of 1 ports
 - **rmap version:** 0.1.0
 
 ## Hosts
 
 ### 10.0.0.2 (db.lan)
 
-| Port | State | Service | Version | Potential CVEs |
+| Port | State | Service | Version | CVE check |
 |---|---|---|---|---|
-| 22/tcp | open | ssh | OpenSSH 9.6p1 (Ubuntu Linux; protocol 2.0) | 2 (worst: high) |
+| 22/tcp | open | ssh | OpenSSH 9.6p1 (Ubuntu Linux; protocol 2.0) | 2 potential CVEs (OpenSSH 9.6p1), worst: high |
 | 161/udp | open\|filtered |  |  |  |
 
 Potential findings:
 
-- **CVE-2024-6387** (high, 8.1) on 22/tcp: Signal handler race condition (regreSSHion).
+- **CVE-2024-6387** (high, 8.1) on 22/tcp: Signal handler race condition (regreSSHion). · **actively exploited (CISA KEV, added 2024-07-15)**
 - **CVE-2023-51385** (medium, 6.5) on 22/tcp: Shell metacharacters in user names may be expanded.
 
 ### ::1
@@ -38,7 +40,7 @@ No open ports found.
 
 ### high (1)
 
-- **CVE-2024-6387** (8.1): 10.0.0.2 22/tcp: Signal handler race condition (regreSSHion).
+- **CVE-2024-6387** (8.1): 10.0.0.2 22/tcp: Signal handler race condition (regreSSHion). · **actively exploited (CISA KEV, added 2024-07-15)**
 
 ### medium (1)
 

@@ -32,6 +32,7 @@ mod vuln;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -74,6 +75,8 @@ pub struct ScanConfig {
     /// DNS server for reverse lookups. `None` uses the system's resolver
     /// where it can be read (Unix); without one, reverse DNS is skipped.
     pub dns_server: Option<IpAddr>,
+    /// The CVE database file. `None` uses `rmap_vuln::default_path()`.
+    pub vuln_db: Option<PathBuf>,
 }
 
 impl ScanConfig {
@@ -241,7 +244,7 @@ struct Shared {
     /// Present when service detection is on.
     services: Option<service::Detection>,
     /// Present when vulnerability matching is on and there is a service
-    /// detector to feed it CPEs.
+    /// detector to feed it CPEs, even if the database didn't open.
     vulns: Option<vuln::Matching>,
     /// Present when name lookup is on.
     naming: Option<names::Naming>,
@@ -341,6 +344,9 @@ async fn run(
         }
     }
 
+    let vulns = (config.service_detection && config.vuln_matching)
+        .then(|| vuln::Matching::start(config.vuln_db.clone(), &tx));
+
     let host_slots = Arc::new(Semaphore::new(config.timing.host_parallelism));
     let shared = Arc::new(Shared {
         ports: config.ports.as_slice().into(),
@@ -353,7 +359,7 @@ async fn run(
         services: config
             .service_detection
             .then(|| service::Detection::new(config.timing)),
-        vulns: (config.service_detection && config.vuln_matching).then(vuln::Matching::new),
+        vulns,
         naming,
         tx,
         progress,
@@ -602,7 +608,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                     if let Some(service) = service
                         && let Some(vulns) = sh.vulns.as_ref()
                     {
-                        vulns.check(ip, protocol, port, &service.cpes, &sh.tx);
+                        vulns.check(ip, protocol, port, &service, &sh.tx);
                     }
                 }
                 PortState::Closed => {

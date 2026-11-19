@@ -106,6 +106,13 @@ pub fn known_products() -> impl Iterator<Item = &'static str> {
     TABLE.iter().map(|e| e.product)
 }
 
+/// Every NVD (vendor, product) pair rmap can put in a CPE, so tools that
+/// build the vulnerability database can keep only products rmap detects.
+/// May repeat a pair that several product names share.
+pub fn nvd_products() -> impl Iterator<Item = (&'static str, &'static str)> {
+    TABLE.iter().map(|e| (e.vendor, e.name))
+}
+
 /// CPE names for a detected service; empty when the product is unknown.
 pub fn for_service(s: &Service) -> Vec<String> {
     let Some(product) = &s.product else {
@@ -156,7 +163,8 @@ pub fn split_version(raw: &str) -> (Option<String>, Option<String>) {
 
 /// Quote characters CPE 2.3 formatted strings reserve. Letters, digits,
 /// `.`, `-` and `_` pass through; spaces and non-ASCII are dropped.
-fn escape(s: &str) -> String {
+/// Public so the vulnerability database stores versions in this same form.
+pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -365,6 +373,19 @@ mod tests {
         for p in known_products() {
             assert!(cpe(p, Some("1.0")).is_some(), "{p}");
         }
+    }
+
+    #[test]
+    fn nvd_products_match_the_cpes_rmap_emits() {
+        for p in known_products() {
+            let cpe = cpe(p, None).unwrap();
+            let fields: Vec<&str> = cpe.split(':').collect();
+            assert!(
+                nvd_products().any(|(v, n)| (v, n) == (fields[3], fields[4])),
+                "{cpe}"
+            );
+        }
+        assert!(nvd_products().any(|p| p == ("openbsd", "openssh")));
     }
 
     #[test]

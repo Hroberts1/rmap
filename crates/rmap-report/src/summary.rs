@@ -95,6 +95,61 @@ pub fn worst(p: &PortResult) -> Option<VulnSeverity> {
     p.vulnerabilities.iter().map(|v| v.severity).max()
 }
 
+/// `actively exploited (CISA KEV, added 2024-07-01)` for a CVE on CISA's
+/// Known Exploited Vulnerabilities list. Unescaped.
+pub fn kev_note(v: &Vulnerability) -> Option<String> {
+    v.kev_added
+        .as_ref()
+        .map(|d| format!("actively exploited (CISA KEV, added {d})"))
+}
+
+/// `built 2026-11-01, 245000 CVEs (NVD)`; `none available` when matching
+/// ran without a database; `None` when matching never ran. Unescaped.
+pub fn vuln_data_line(r: &ScanReport) -> Option<String> {
+    match &r.vuln_data {
+        Some(d) => Some(format!(
+            "built {}, {} CVEs ({})",
+            d.built_at.get(..10).unwrap_or(&d.built_at),
+            d.cve_count,
+            d.source
+        )),
+        None if checked_ports(r) > 0 => Some("none available".into()),
+        None => None,
+    }
+}
+
+/// `(unchecked, total)`: ports with a CVE check status, and how many of
+/// them could not be checked (version unknown, no product, no data).
+pub fn unchecked_counts(r: &ScanReport) -> (usize, usize) {
+    let unchecked = ports(r)
+        .filter(|p| p.vuln_check.as_ref().is_some_and(|c| c.is_unchecked()))
+        .count();
+    (unchecked, checked_ports(r))
+}
+
+/// What to say when no CVE matched: never just "none" if some ports
+/// couldn't be checked.
+pub fn no_findings_text(r: &ScanReport) -> String {
+    match unchecked_counts(r) {
+        _ if !r.config.service_detection => {
+            "Service detection was off, so no CVE matching was done.".into()
+        }
+        (0, _) => "No potential CVEs matched the detected services.".into(),
+        (n, total) => format!(
+            "No potential CVEs matched, but {n} of {total} ports could not be checked \
+             (see each port's CVE check); that is not the same as no vulnerabilities."
+        ),
+    }
+}
+
+fn ports(r: &ScanReport) -> impl Iterator<Item = &PortResult> {
+    r.hosts.iter().flat_map(|h| &h.ports)
+}
+
+fn checked_ports(r: &ScanReport) -> usize {
+    ports(r).filter(|p| p.vuln_check.is_some()).count()
+}
+
 /// `OpenSSH 9.6p1 (Ubuntu Linux)`, from whatever detection found.
 pub fn version_text(p: &PortResult) -> String {
     let Some(s) = &p.service else {
@@ -175,12 +230,24 @@ pub(crate) mod tests {
             severity,
             score: Some(score),
             published: Some("2024-07-01".into()),
+            kev_added: None,
         }
     }
 
-    /// The JSON sample with findings on its SSH port.
+    /// The JSON sample with findings (one on CISA's KEV list) and a CVE
+    /// check status on its SSH port, and the CVE data it was matched with.
     pub(crate) fn fixture() -> ScanReport {
         let mut r = sample();
+        r.vuln_data = Some(rmap_core::VulnData {
+            built_at: "2025-11-01T03:00:00Z".into(),
+            cve_count: 245_000,
+            source: "NVD + CISA KEV".into(),
+        });
+        r.hosts[0].ports[0].vuln_check = Some(rmap_core::VulnCheck::Checked {
+            product: "OpenSSH".into(),
+            version: "9.6p1".into(),
+            matches: 2,
+        });
         r.hosts[0].ports[0].vulnerabilities = vec![
             vuln(
                 "CVE-2023-51385",
@@ -195,6 +262,7 @@ pub(crate) mod tests {
                 "Signal handler race condition (regreSSHion).",
             ),
         ];
+        r.hosts[0].ports[0].vulnerabilities[1].kev_added = Some("2024-07-15".into());
         r
     }
 
@@ -212,7 +280,36 @@ pub(crate) mod tests {
         s.version = Some("@SUM(1+1)".into());
         s.info = Some("-2+3".into());
         p.vulnerabilities[0].summary = HOSTILE.into();
+        p.vulnerabilities[0].kev_added = Some(HOSTILE.into());
+        p.vuln_check = Some(rmap_core::VulnCheck::NotCovered {
+            product: HOSTILE.into(),
+        });
+        let data = r.vuln_data.as_mut().unwrap();
+        data.built_at = HOSTILE.into();
+        data.source = HOSTILE.into();
         r
+    }
+
+    #[test]
+    fn unchecked_ports_are_counted_and_never_read_as_clean() {
+        let mut r = sample();
+        assert_eq!(unchecked_counts(&r), (0, 0));
+        assert_eq!(vuln_data_line(&r), None, "matching never ran");
+        r.hosts[0].ports[0].vuln_check = Some(rmap_core::VulnCheck::NoDatabase);
+        assert_eq!(unchecked_counts(&r), (1, 1));
+        assert_eq!(vuln_data_line(&r).as_deref(), Some("none available"));
+        assert!(no_findings_text(&r).contains("1 of 1 ports could not be checked"));
+        let r = fixture();
+        assert_eq!(unchecked_counts(&r), (0, 1));
+        assert_eq!(
+            vuln_data_line(&r).as_deref(),
+            Some("built 2025-11-01, 245000 CVEs (NVD + CISA KEV)")
+        );
+        let kev = kev_note(&r.hosts[0].ports[0].vulnerabilities[1]);
+        assert_eq!(
+            kev.as_deref(),
+            Some("actively exploited (CISA KEV, added 2024-07-15)")
+        );
     }
 
     /// Compare `actual` with `tests/fixtures/<name>`. After an intended

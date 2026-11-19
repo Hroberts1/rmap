@@ -36,6 +36,7 @@ fn config(targets: &str, ports: &str, timing: Timing, discovery: bool) -> ScanCo
         max_rate: None,
         resolve_names: false,
         dns_server: None,
+        vuln_db: None,
     }
 }
 
@@ -820,13 +821,103 @@ async fn service_detection_reports_after_the_port() {
 
 // ------------------------------------------------- vulnerability matching ---
 
-#[tokio::test(flavor = "multi_thread")]
-async fn vuln_matching_reports_a_real_cve_for_a_real_detected_service() {
-    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+/// A unique temp path for a CVE database, deleted when dropped.
+struct VulnDb(std::path::PathBuf);
+
+impl VulnDb {
+    fn missing(tag: &str) -> VulnDb {
+        VulnDb(std::env::temp_dir().join(format!("rmap-engine-{tag}-{}.db", std::process::id())))
+    }
+
+    /// A database holding regreSSHion (CVE-2024-6387) and two Dropbear
+    /// CVEs: one "before 2022.83", one for any version.
+    fn regresshion(tag: &str) -> VulnDb {
+        use rmap_vuln::{Bound, CpeMatch, Entry, Writer};
+        let db = VulnDb::missing(tag);
+        let mut w = Writer::create(&db.0).unwrap();
+        w.add(&Entry {
+            finding: rmap_core::Vulnerability {
+                id: "CVE-2024-6387".into(),
+                summary: "regreSSHion".into(),
+                severity: rmap_core::VulnSeverity::High,
+                score: Some(8.1),
+                published: Some("2024-07-01".into()),
+                kev_added: None,
+            },
+            matches: vec![CpeMatch {
+                vendor: "openbsd".into(),
+                product: "openssh".into(),
+                min: Some(Bound::Including("8.5p1".into())),
+                max: Some(Bound::Including("9.7p1".into())),
+            }],
+        })
+        .unwrap();
+        // "Every version before 2022.83": a hidden version must not match it.
+        w.add(&Entry {
+            finding: rmap_core::Vulnerability {
+                id: "CVE-2021-36369".into(),
+                summary: "Dropbear auth bypass".into(),
+                severity: rmap_core::VulnSeverity::Medium,
+                score: Some(5.0),
+                published: Some("2022-10-12".into()),
+                kev_added: None,
+            },
+            matches: vec![CpeMatch {
+                vendor: "dropbear_ssh_project".into(),
+                product: "dropbear_ssh".into(),
+                min: None,
+                max: Some(Bound::Excluding("2022.83".into())),
+            }],
+        })
+        .unwrap();
+        // An any-version row: a hidden version must not match it either.
+        w.add(&Entry {
+            finding: rmap_core::Vulnerability {
+                id: "CVE-2000-0001".into(),
+                summary: "every Dropbear version".into(),
+                severity: rmap_core::VulnSeverity::Low,
+                score: None,
+                published: None,
+                kev_added: None,
+            },
+            matches: vec![CpeMatch {
+                vendor: "dropbear_ssh_project".into(),
+                product: "dropbear_ssh".into(),
+                min: None,
+                max: None,
+            }],
+        })
+        .unwrap();
+        w.finish().unwrap();
+        db
+    }
+}
+
+impl Drop for VulnDb {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn vuln_config(port: u16, db: &VulnDb) -> ScanConfig {
     let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
     cfg.service_detection = true;
     cfg.vuln_matching = true;
-    let out = run_scan(cfg).await;
+    cfg.vuln_db = Some(db.0.clone());
+    cfg
+}
+
+fn any_vulns(out: &Outcome) -> bool {
+    out.events
+        .iter()
+        .any(|e| matches!(e, ScanEvent::Vulnerabilities { .. }))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_matching_reports_a_real_cve_for_a_real_detected_service() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+    let db = VulnDb::regresshion("vuln-match");
+    let out = run_scan(vuln_config(port, &db)).await;
     assert!(out.finished());
     assert!(out.warnings().is_empty(), "{:?}", out.warnings());
     let service_at = out
@@ -856,31 +947,195 @@ async fn vuln_matching_reports_a_real_cve_for_a_real_detected_service() {
 #[tokio::test(flavor = "multi_thread")]
 async fn vuln_matching_sends_nothing_for_a_clean_version() {
     let port = banner_server(b"SSH-2.0-OpenSSH_9.9\r\n").await;
-    let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
-    cfg.service_detection = true;
-    cfg.vuln_matching = true;
-    let out = run_scan(cfg).await;
+    let db = VulnDb::regresshion("vuln-clean");
+    let out = run_scan(vuln_config(port, &db)).await;
     assert!(out.finished());
-    assert!(
-        !out.events
-            .iter()
-            .any(|e| matches!(e, ScanEvent::Vulnerabilities { .. })),
-        "{:?}",
-        out.events
-    );
+    assert!(!any_vulns(&out), "{:?}", out.events);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn vuln_matching_without_service_detection_sends_nothing() {
     let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
-    let mut cfg = config("127.0.0.1", &port.to_string(), patient(), false);
-    cfg.vuln_matching = true; // no service_detection: nothing to look up
+    let db = VulnDb::missing("vuln-no-detect");
+    let mut cfg = vuln_config(port, &db);
+    cfg.service_detection = false; // nothing to look up, so no DB is opened
     let out = run_scan(cfg).await;
     assert!(out.finished());
+    assert!(!any_vulns(&out));
+    assert!(out.warnings().is_empty(), "{:?}", out.warnings());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_missing_vuln_database_warns_once_and_the_scan_still_completes() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+    let db = VulnDb::missing("vuln-missing");
+    let out = run_scan(vuln_config(port, &db)).await;
+    assert!(out.finished());
+    assert!(!any_vulns(&out));
+    assert!(
+        out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Service { .. }))
+    );
+    let warnings = out.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with("no vulnerability data at ")
+            && warnings[0].ends_with("; CVE matching skipped"),
+        "{warnings:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_vuln_database_warns_and_the_scan_still_completes() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+    let db = VulnDb::missing("vuln-corrupt");
+    std::fs::write(&db.0, b"not a database").unwrap();
+    let out = run_scan(vuln_config(port, &db)).await;
+    assert!(out.finished());
+    assert!(!any_vulns(&out));
+    let warnings = out.warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].ends_with("; CVE matching skipped"),
+        "{warnings:?}"
+    );
+}
+
+/// Every `VulnCheck` status in the scan, with its event index.
+fn vuln_checks(out: &Outcome) -> Vec<(usize, rmap_core::VulnCheck)> {
+    out.events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            ScanEvent::VulnCheck { status, .. } => Some((i, status.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The one status a single-port scan of `banner` gets against `db`.
+async fn status_for(banner: &'static [u8], db: &VulnDb) -> rmap_core::VulnCheck {
+    let port = banner_server(banner).await;
+    let out = run_scan(vuln_config(port, db)).await;
+    assert!(out.finished());
+    let checks = vuln_checks(&out);
+    assert_eq!(checks.len(), 1, "{:?}", out.events);
+    checks[0].1.clone()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_check_follows_port_service_and_vulnerabilities() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").await;
+    let db = VulnDb::regresshion("check-order");
+    let out = run_scan(vuln_config(port, &db)).await;
+    let at = |want: fn(&ScanEvent) -> bool| out.events.iter().position(want).unwrap();
+    let port_at = at(|e| matches!(e, ScanEvent::Port { .. }));
+    let service_at = at(|e| matches!(e, ScanEvent::Service { .. }));
+    let vulns_at = at(|e| matches!(e, ScanEvent::Vulnerabilities { .. }));
+    let checks = vuln_checks(&out);
+    assert_eq!(checks.len(), 1);
+    assert!(port_at < service_at && service_at < vulns_at && vulns_at < checks[0].0);
+    assert_eq!(
+        checks[0].1,
+        rmap_core::VulnCheck::Checked {
+            product: "OpenSSH".into(),
+            version: "9.6p1".into(),
+            matches: 1
+        }
+    );
+    // VulnData comes once, before any port.
+    let data: Vec<_> = out
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            ScanEvent::VulnData(d) => Some((i, d)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(data.len(), 1, "{:?}", out.events);
+    assert!(data[0].0 < port_at);
+    assert_eq!(data[0].1.cve_count, 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_check_says_checked_and_clean() {
+    let db = VulnDb::regresshion("check-clean");
+    assert_eq!(
+        status_for(b"SSH-2.0-OpenSSH_9.9\r\n", &db).await,
+        rmap_core::VulnCheck::Checked {
+            product: "OpenSSH".into(),
+            version: "9.9".into(),
+            matches: 0
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_check_says_version_hidden_and_matches_nothing() {
+    let db = VulnDb::regresshion("check-hidden");
+    let port = banner_server(b"SSH-2.0-dropbear\r\n").await;
+    let out = run_scan(vuln_config(port, &db)).await;
+    assert!(!any_vulns(&out), "{:?}", out.events);
+    assert_eq!(
+        vuln_checks(&out)[0].1,
+        rmap_core::VulnCheck::VersionHidden {
+            product: "Dropbear sshd".into()
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_check_says_not_covered() {
+    let db = VulnDb::regresshion("check-uncovered");
+    assert_eq!(
+        status_for(b"220 (vsFTPd 3.0.5)\r\n", &db).await,
+        rmap_core::VulnCheck::NotCovered {
+            product: "vsftpd".into()
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_check_says_no_product() {
+    let db = VulnDb::regresshion("check-noproduct");
+    assert_eq!(
+        status_for(b"SSH-2.0-SomeEmbeddedSsh\r\n", &db).await,
+        rmap_core::VulnCheck::NoProduct
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vuln_check_says_no_database() {
+    let db = VulnDb::missing("check-nodb");
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1\r\n").await;
+    let out = run_scan(vuln_config(port, &db)).await;
+    assert_eq!(vuln_checks(&out)[0].1, rmap_core::VulnCheck::NoDatabase);
     assert!(
         !out.events
             .iter()
-            .any(|e| matches!(e, ScanEvent::Vulnerabilities { .. }))
+            .any(|e| matches!(e, ScanEvent::VulnData(_)))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn no_vuln_check_when_matching_is_off() {
+    let port = banner_server(b"SSH-2.0-OpenSSH_9.6p1\r\n").await;
+    let db = VulnDb::regresshion("check-off");
+    let mut cfg = vuln_config(port, &db);
+    cfg.vuln_matching = false;
+    let out = run_scan(cfg).await;
+    assert!(
+        out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::Service { .. }))
+    );
+    assert!(vuln_checks(&out).is_empty());
+    assert!(
+        !out.events
+            .iter()
+            .any(|e| matches!(e, ScanEvent::VulnData(_)))
     );
 }
 
