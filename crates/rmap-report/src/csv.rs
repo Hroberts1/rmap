@@ -3,7 +3,7 @@
 use crate::model::ScanReport;
 use crate::summary::{kev_note, neutralise, worst};
 
-const HEADER: [&str; 12] = [
+const HEADER: [&str; 13] = [
     "ip",
     "hostname",
     "port",
@@ -12,6 +12,7 @@ const HEADER: [&str; 12] = [
     "service",
     "product",
     "version",
+    "info",
     "cves",
     "worst_severity",
     "cve_check",
@@ -61,6 +62,7 @@ pub fn to_string(r: &ScanReport) -> String {
                     s.map_or("", |s| &s.name),
                     s.and_then(|s| s.product.as_deref()).unwrap_or(""),
                     s.and_then(|s| s.version.as_deref()).unwrap_or(""),
+                    s.and_then(|s| s.info.as_deref()).unwrap_or(""),
                     &cves.join(" "),
                     worst(p).map_or("", |w| w.as_str()),
                     &p.vuln_check
