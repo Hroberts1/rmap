@@ -359,6 +359,39 @@ How matching works (`crates/rmap-vuln`):
 2. Each row's range is checked in Rust, comparing versions the way dpkg/rpm do: split into alternating digit and text runs, compare each run in order, and treat a side that runs out of runs first as smaller - so `9.7` sorts before `9.7p1`, and that before `9.7p2`. Versions are stored in that same combined form.
 3. Matches are deduplicated by CVE id and reported newest first.
 
+### Vulnerability data (maintainers)
+
+`vulns.db` is built by `tools/vulndb-build` and published by the **Vulnerability data** GitHub Action (`.github/workflows/vulndb.yml`), on the 1st of every month and on demand (Actions → Vulnerability data → Run workflow, on `main`; other branches skip the job). It:
+
+1. Downloads CISA's [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) list, then every CVE from the [NVD CVE API 2.0](https://nvd.nist.gov/developers/vulnerabilities), 2000 per page, within NVD's rate limits (one request per 6 s without an API key, one per second with one), retrying rate-limit and server errors with backoff.
+2. Keeps only CVEs that affect a product rmap can detect (the vendor/product pairs in `crates/rmap-detect/src/cpe.rs`, via `rmap_detect::cpe::nvd_products`), which keeps the file to a few MB. Rejected CVEs are dropped.
+3. Writes `vulns.db` and `vulns.meta.json`, and refuses to finish if fewer than 500 CVEs (or 500 KEV entries) came back, so a broken response is never published.
+4. Uploads `vulns.db`, then the manifest `vulns.json` (`schema_version`, `built_at`, `cve_count`, `source`, `size`, `sha256`, `db`), to the release tagged `vulndb`, replacing the previous month's files.
+
+How NVD data is converted:
+
+- Each vulnerable `cpeMatch` becomes a `cpe_match` row: `versionStart*`/`versionEnd*` become range bounds; a CPE with a concrete version and no range becomes an exact version, with `update` appended the way rmap-detect splits it (`9.7` + `p1` → `9.7p1`). Versions keep CPE 2.3 escaping exactly as rmap-detect writes them, so they compare equal.
+- A CPE with version `*` and no range means NVD lists every version as affected, and is stored as a row with no bounds, which matches any version. Version `-` (not applicable) is skipped.
+- Severity and score come from CVSS v3.1, else v3.0, else v4.0, else v2 (NVD's primary metric first; v2's low/medium/high kept as NVD rated them). A CVE with no CVSS data yet is kept with no score and severity `medium`, or `high` if it is on the KEV list.
+- Summary: the English description, whitespace collapsed, at most 1000 characters. `published` is the date part of NVD's timestamp; `kev_added` is the KEV `dateAdded`.
+
+Limitations:
+
+- **AND configurations.** NVD often says "product X is vulnerable when running on platform Y". rmap keeps X's match and ignores Y, since a scan can't verify the platform, so such CVEs can be over-reported.
+- **NVD's backlog.** Many recent CVEs have no CPE data yet (NVD enrichment lags publication), so they can't be matched to a product and aren't in the file until NVD analyses them; the next monthly build picks them up.
+
+Run the builder locally (it writes into `OUT_DIR`, which must not already contain `vulns.db` or `vulns.meta.json`):
+
+```sh
+OUT_DIR=/tmp/vulndb cargo run --release -p vulndb-build
+# A quick trial with one NVD page, which skips the minimum-size check:
+NVD_MAX_PAGES=1 OUT_DIR=/tmp/vulndb-trial cargo run -p vulndb-build
+```
+
+A full keyless run takes about 25 minutes. An NVD API key ([request one free](https://nvd.nist.gov/developers/request-an-api-key)) makes it faster: set `NVD_API_KEY` locally, or add it as the repository secret `NVD_API_KEY` for the Action. Without the secret the Action still works, just slower.
+
+Data sources and terms: NVD data is a work of the US government and in the public domain; CISA's KEV catalog is public. *This product uses the NVD API but is not endorsed or certified by the NVD.*
+
 ## Logs and crash reports
 
 rmap keeps local diagnostic logs so bugs can be reproduced. **Nothing is sent anywhere**: there is no network telemetry.

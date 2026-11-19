@@ -1,0 +1,77 @@
+# Rebuilds rmap's vulnerability database from NVD + CISA KEV once a month
+# and publishes it as assets of the fixed `vulndb` release, where rmap's
+# downloader fetches it. See "Vulnerability data" in README.md.
+# Third-party actions are pinned to full commit SHAs (version in the comment).
+name: Vulnerability data
+
+on:
+  schedule:
+    - cron: '17 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vulndb
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build and publish vulns.db
+    # Only main's code publishes, even when run by hand on another branch.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # A sync without an API key takes ~25 minutes (~215 pages, 6 s apart) plus the build.
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      # No cargo cache: this job can write releases, so it builds from scratch.
+      # Compiled in its own step so dependency build scripts never see the key.
+      - run: cargo build --release --locked -p vulndb-build
+      - name: Build the database
+        env:
+          # Optional; an unset secret is an empty string and the tool then
+          # uses NVD's slower keyless rate limit.
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          OUT_DIR: dist
+        run: |
+          mkdir dist
+          target/release/vulndb-build
+      - name: Write the manifest
+        working-directory: dist
+        run: |
+          size=$(stat -c%s vulns.db)
+          sha256=$(sha256sum vulns.db | cut -d' ' -f1)
+          jq --argjson size "$size" --arg sha256 "$sha256" \
+            '{schema_version, built_at, cve_count, source, size: $size, sha256: $sha256, db: "vulns.db"}' \
+            vulns.meta.json > vulns.json
+          jq -e '.schema_version == 1 and .cve_count >= 500 and .size > 0
+                 and (.sha256 | test("^[0-9a-f]{64}$"))' vulns.json
+          cat vulns.json
+      - name: Publish to the vulndb release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view vulndb > /dev/null 2>&1; then
+            gh release create vulndb --title "Vulnerability data" --latest=false \
+              --notes "rmap's CVE database, rebuilt monthly by .github/workflows/vulndb.yml from the NVD API 2.0 and CISA KEV. This product uses the NVD API but is not endorsed or certified by the NVD."
+          fi
+          # The database first, so a manifest never describes a missing file.
+          gh release upload vulndb vulns.db --clobber
+          gh release upload vulndb vulns.json --clobber
