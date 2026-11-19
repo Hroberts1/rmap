@@ -168,6 +168,32 @@ fn resolv_conf() {
 }
 
 #[test]
+fn windows_dns_entries() {
+    let pad = |s: &str| {
+        let mut b = [0u8; 16];
+        b[..s.len()].copy_from_slice(s.as_bytes());
+        b
+    };
+    let (zero, junk, good) = (pad("0.0.0.0"), pad("not an ip"), pad("10.0.0.10"));
+    assert_eq!(
+        first_dns_entry([&zero[..], &junk[..], &good[..]]),
+        Some("10.0.0.10:53".parse().unwrap())
+    );
+    // No NUL at all, a bad UTF-8 byte, an empty list.
+    assert_eq!(first_dns_entry([&b"192.168.100.200x"[..]]), None);
+    assert_eq!(first_dns_entry([&[0xffu8, 0][..]]), None);
+    assert_eq!(first_dns_entry(std::iter::empty()), None);
+}
+
+// Needs a configured IPv4 DNS server; a bare CI runner may have none.
+#[cfg(windows)]
+#[test]
+#[ignore]
+fn windows_system_dns_found() {
+    assert!(system_dns_server().is_some());
+}
+
+#[test]
 fn rank_orders_and_dedupes() {
     let n = |s, src| HostName::new(s, src).unwrap();
     let ranked = rank(vec![
