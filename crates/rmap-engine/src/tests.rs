@@ -245,6 +245,22 @@ async fn discovery_finds_loopback_up() {
     );
 }
 
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_finds_icmp_only_host_up() {
+    // Windows takes ~2s to refuse on loopback, beyond this 1s ping window, so
+    // closed discovery ports don't answer in time; the ICMP echo does. Ports
+    // something listens on (often 445/3389) still win the race.
+    let timing = Timing {
+        connect_timeout: Duration::from_millis(300),
+        retries: 0,
+        ..Timing::template(4)
+    };
+    let port = closed_port().await;
+    let out = run_scan(config("127.0.0.1", &port.to_string(), timing, true)).await;
+    assert_eq!(out.hosts()[0].2, HostState::Up);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn resolves_hostnames() {
     let port = listener().await;
