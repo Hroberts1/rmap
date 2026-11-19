@@ -42,6 +42,9 @@ pub struct Page {
     /// CVEs on the page, before filtering (to advance `startIndex`).
     pub returned: usize,
     pub entries: Vec<Entry>,
+    /// Every well-formed CVE id on the page, kept or not (a refresh
+    /// deletes these before re-adding the kept ones).
+    pub ids: Vec<String>,
     /// Newest `lastModified` on the page.
     pub last_modified: Option<String>,
 }
@@ -64,9 +67,19 @@ pub fn convert_page(
     Some(Page {
         total_results,
         returned: list.len(),
-        entries: cves.filter_map(|c| convert_cve(c, products, kev)).collect(),
+        entries: cves
+            .clone()
+            .filter_map(|c| convert_cve(c, products, kev))
+            .collect(),
+        ids: cves.filter_map(cve_id).map(str::to_string).collect(),
         last_modified,
     })
+}
+
+/// A CVE's id, if it looks like one.
+fn cve_id(cve: &Value) -> Option<&str> {
+    let id = cve.get("id")?.as_str()?.trim();
+    (id.starts_with("CVE-") && id.len() <= MAX_ID).then_some(id)
 }
 
 /// A CVE as an `Entry`, or `None` when it is rejected, malformed, or
@@ -76,10 +89,7 @@ pub fn convert_cve(
     products: &Products,
     kev: &HashMap<String, String>,
 ) -> Option<Entry> {
-    let id = cve.get("id")?.as_str()?.trim();
-    if !id.starts_with("CVE-") || id.len() > MAX_ID {
-        return None;
-    }
+    let id = cve_id(cve)?;
     if cve.get("vulnStatus").and_then(Value::as_str) == Some("Rejected") {
         return None;
     }

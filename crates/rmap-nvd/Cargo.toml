@@ -1,0 +1,18 @@
+[package]
+name = "rmap-nvd"
+description = "Builds rmap's vulnerability database from the NVD API 2.0 and CISA KEV"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rmap-core = { workspace = true }
+rmap-detect = { workspace = true }
+rmap-log = { workspace = true }
+rmap-vuln = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }

@@ -1290,6 +1290,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmap-nvd"
+version = "0.1.0"
+dependencies = [
+ "rmap-core",
+ "rmap-detect",
+ "rmap-log",
+ "rmap-vuln",
+ "rusqlite",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "rmap-oui"
 version = "0.1.0"
 dependencies = [
@@ -1319,6 +1332,7 @@ dependencies = [
  "rmap-core",
  "rmap-engine",
  "rmap-log",
+ "rmap-nvd",
  "rmap-oui",
  "rmap-report",
  "rmap-vuln",
@@ -1948,11 +1962,9 @@ dependencies = [
 name = "vulndb-build"
 version = "0.1.0"
 dependencies = [
- "rmap-core",
- "rmap-detect",
+ "rmap-nvd",
  "rmap-vuln",
  "serde_json",
- "ureq",
 ]
 
 [[package]]
