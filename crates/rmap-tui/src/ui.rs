@@ -283,11 +283,7 @@ fn draw_setup(frame: &mut Frame, app: &App, hits: &mut HitMap) {
         Field::DnsServer,
         "DNS server",
         &form.dns_server,
-        if cfg!(unix) {
-            "system resolver (or e.g. the client's DC: 10.0.0.10)"
-        } else {
-            "e.g. the client's DC, 10.0.0.10 (needed for DNS names)"
-        },
+        "system resolver (or e.g. the client's DC: 10.0.0.10)",
     );
 
     let services_check = if form.service_detection {
