@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 
 use crate::model::{HostReport, ScanReport};
 use crate::summary::{
-    FINDINGS_NOTE, SEVERITIES, duration, findings, one_line, service_name, severity_counts, utc,
-    version_text, worst,
+    FINDINGS_NOTE, SEVERITIES, duration, findings, kev_note, no_findings_text, one_line,
+    service_name, severity_counts, unchecked_counts, utc, version_text, vuln_data_line, worst,
 };
 
 const STYLE: &str = r#"
@@ -39,6 +39,7 @@ th { font-size: 13px; color: var(--muted); font-weight: 600; }
 .sev { font-weight: 700; text-transform: uppercase; font-size: 12px; letter-spacing: .03em; }
 .critical { color: var(--critical); } .high { color: var(--high); }
 .medium { color: var(--medium); } .low { color: var(--low); }
+.kev { font-weight: 700; color: var(--critical); } .unchecked { color: var(--medium); }
 footer { margin-top: 40px; font-size: 13px; color: var(--muted); }
 @media print { main { max-width: none; padding: 0; } h2 { break-after: avoid; } tr { break-inside: avoid; } }
 "#;
@@ -78,16 +79,27 @@ fn write_host(o: &mut String, h: &HostReport) {
     }
     let _ = writeln!(
         o,
-        "<table>\n<thead><tr><th>Port</th><th>State</th><th>Service</th><th>Version</th><th>Potential CVEs</th></tr></thead>\n<tbody>"
+        "<table>\n<thead><tr><th>Port</th><th>State</th><th>Service</th><th>Version</th><th>CVE check</th></tr></thead>\n<tbody>"
     );
     for p in &h.ports {
+        // The check status, else the bare count (older reports).
+        let lead = match &p.vuln_check {
+            Some(c) if c.is_unchecked() => {
+                format!(
+                    "<span class=\"unchecked\">{}</span>",
+                    escape(&c.to_string())
+                )
+            }
+            Some(c) => escape(&c.to_string()),
+            None if p.vulnerabilities.is_empty() => String::new(),
+            None => p.vulnerabilities.len().to_string(),
+        };
         let cves = match worst(p) {
             Some(s) => format!(
-                "{} <span class=\"sev {s}\">worst {s}</span>",
-                p.vulnerabilities.len(),
+                "{lead} <span class=\"sev {s}\">worst {s}</span>",
                 s = s.as_str()
             ),
-            None => String::new(),
+            None => lead,
         };
         let _ = writeln!(
             o,
@@ -150,7 +162,7 @@ pub fn to_string(r: &ScanReport) -> String {
     } else {
         format!("{} (partial results)", r.status.as_str())
     };
-    let rows = [
+    let mut rows = vec![
         ("Targets", escape(&c.targets)),
         (
             "Ports",
@@ -173,6 +185,12 @@ pub fn to_string(r: &ScanReport) -> String {
         ("Status", status),
         ("rmap version", escape(&r.rmap_version)),
     ];
+    if let Some(line) = vuln_data_line(r) {
+        rows.push(("Vulnerability data", escape(&line)));
+    }
+    if let (n, total @ 1..) = unchecked_counts(r) {
+        rows.push(("Not checked for CVEs", format!("{n} of {total} ports")));
+    }
     let _ = writeln!(o, "<table class=\"kv\">\n<tbody>");
     for (k, v) in rows {
         let _ = writeln!(o, "<tr><th>{k}</th><td>{v}</td></tr>");
@@ -191,12 +209,7 @@ pub fn to_string(r: &ScanReport) -> String {
     let _ = writeln!(o, "<h2>Potential findings</h2>");
     let all = findings(r);
     if all.is_empty() {
-        let why = if c.service_detection {
-            "No potential CVEs matched the detected services."
-        } else {
-            "Service detection was off, so no CVE matching was done."
-        };
-        let _ = writeln!(o, "<p class=\"muted\">{why}</p>");
+        let _ = writeln!(o, "<p class=\"muted\">{}</p>", escape(&no_findings_text(r)));
     } else {
         let _ = writeln!(
             o,
@@ -205,9 +218,12 @@ pub fn to_string(r: &ScanReport) -> String {
         for f in all {
             let sev = f.vuln.severity.as_str();
             let score = f.vuln.score.map_or(String::new(), |s| format!("{s:.1}"));
+            let kev = kev_note(f.vuln).map_or(String::new(), |n| {
+                format!(" <span class=\"kev\">{}</span>", escape(&n))
+            });
             let _ = writeln!(
                 o,
-                "<tr><td><span class=\"sev {sev}\">{sev}</span></td><td>{}</td><td>{score}</td><td>{}</td><td>{}/{}</td><td>{}</td></tr>",
+                "<tr><td><span class=\"sev {sev}\">{sev}</span></td><td>{}</td><td>{score}</td><td>{}</td><td>{}/{}</td><td>{}{kev}</td></tr>",
                 escape(&f.vuln.id),
                 f.ip,
                 f.port,

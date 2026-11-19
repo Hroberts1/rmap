@@ -84,6 +84,13 @@ pub struct PortResult {
     /// reported. Empty, not missing, when detection ran and found nothing.
     #[cfg_attr(feature = "serde", serde(default))]
     pub vulnerabilities: Vec<crate::Vulnerability>,
+    /// Whether vulnerability matching could check this port; `None` when
+    /// matching was off or detection found no service.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub vuln_check: Option<crate::VulnCheck>,
 }
 
 impl PortResult {
@@ -95,6 +102,7 @@ impl PortResult {
             rtt,
             service: None,
             vulnerabilities: Vec::new(),
+            vuln_check: None,
         }
     }
 }
@@ -141,6 +149,18 @@ pub enum ScanEvent {
         port: u16,
         findings: Vec<crate::Vulnerability>,
     },
+    /// Whether matching could check a port already reported with
+    /// `Service`. Sent after that port's `Vulnerabilities` (if any) for
+    /// every such port while matching is on; never when it is off.
+    VulnCheck {
+        ip: IpAddr,
+        protocol: Protocol,
+        port: u16,
+        status: crate::VulnCheck,
+    },
+    /// The CVE database this scan matches against. Sent once near the
+    /// start, only when matching is on and the database opened.
+    VulnData(crate::VulnData),
     /// Every port on this host has been probed.
     HostDone {
         ip: IpAddr,

@@ -1,9 +1,9 @@
 //! CSV export: one row per open (or open|filtered) port, for spreadsheets.
 
 use crate::model::ScanReport;
-use crate::summary::{neutralise, worst};
+use crate::summary::{kev_note, neutralise, worst};
 
-const HEADER: [&str; 10] = [
+const HEADER: [&str; 12] = [
     "ip",
     "hostname",
     "port",
@@ -14,6 +14,8 @@ const HEADER: [&str; 10] = [
     "version",
     "cves",
     "worst_severity",
+    "cve_check",
+    "exploited",
 ];
 
 /// One RFC 4180 field. Every field is quoted, and one that a spreadsheet
@@ -42,6 +44,12 @@ pub fn to_string(r: &ScanReport) -> String {
         for p in &h.ports {
             let s = p.service.as_ref();
             let cves: Vec<&str> = p.vulnerabilities.iter().map(|v| v.id.as_str()).collect();
+            // `CVE-2024-6387 actively exploited (CISA KEV, added 2024-07-01); ...`
+            let exploited: Vec<String> = p
+                .vulnerabilities
+                .iter()
+                .filter_map(|v| kev_note(v).map(|n| format!("{} {n}", v.id)))
+                .collect();
             row(
                 &mut out,
                 &[
@@ -55,6 +63,10 @@ pub fn to_string(r: &ScanReport) -> String {
                     s.and_then(|s| s.version.as_deref()).unwrap_or(""),
                     &cves.join(" "),
                     worst(p).map_or("", |w| w.as_str()),
+                    &p.vuln_check
+                        .as_ref()
+                        .map_or(String::new(), |c| c.to_string()),
+                    &exploited.join("; "),
                 ],
             );
         }

@@ -416,12 +416,16 @@ pub(crate) fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
     } else {
         ("scanning", ACCENT)
     };
-    let block = Block::bordered()
+    let mut block = Block::bordered()
         .title(Line::from(vec![
             " rmap ".bold().fg(ACCENT),
             Span::raw(format!("· {} ", view.summary)),
         ]))
         .title(Line::from(format!(" {status} ").bold().fg(color)).right_aligned());
+    // CVE coverage and data age ride on the bottom border, clear of the stats.
+    if let Some(line) = crate::vuln_status::header_line(view) {
+        block = block.title_bottom(line.right_aligned());
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -753,7 +757,18 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
             heights.push(lines.len());
             rows.push(spanning_row(Text::from(lines), ncols).dim());
         }
-        for v in &p.vulnerabilities {
+        if let Some((label, style)) = p.vuln_check.as_ref().and_then(crate::vuln_status::detail) {
+            let lines: Vec<Line> = wrap(&label, span_w, 2)
+                .into_iter()
+                .map(|l| Line::styled(l, style))
+                .collect();
+            heights.push(lines.len());
+            rows.push(spanning_row(Text::from(lines), ncols));
+        }
+        // Actively exploited first; the sort is stable, so newest next.
+        let mut vulns: Vec<&Vulnerability> = p.vulnerabilities.iter().collect();
+        vulns.sort_by_key(|v| v.kev_added.is_none());
+        for v in vulns {
             let text = vuln_text(v, span_w);
             heights.push(text.lines.len());
             rows.push(spanning_row(text, ncols));
@@ -864,7 +879,7 @@ pub(crate) fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
     let head = format!("{label:<4} {score:>4}  ");
     let indent = head.chars().count();
     let body = format!("{}  {}", v.id, v.summary);
-    let lines = wrap(&body, width.saturating_sub(indent), 0)
+    let mut lines = wrap(&body, width.saturating_sub(indent), 0)
         .into_iter()
         .enumerate()
         .map(|(i, line)| {
@@ -876,6 +891,15 @@ pub(crate) fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
             Line::from(vec![lead, Span::raw(line).fg(color)])
         })
         .collect::<Vec<_>>();
+    if let Some(date) = &v.kev_added {
+        let note = format!("actively exploited (CISA KEV, added {date})");
+        for line in wrap(&note, width.saturating_sub(indent), 0) {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::raw(line).fg(Color::Red).bold(),
+            ]));
+        }
+    }
     Text::from(lines)
 }
 

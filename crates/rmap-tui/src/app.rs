@@ -373,6 +373,27 @@ impl ScanView {
                     ),
                 }
             }
+            ScanEvent::VulnCheck {
+                ip,
+                protocol,
+                port,
+                status,
+            } => {
+                let found = self.hosts.get_mut(&ip).and_then(|h| {
+                    h.open
+                        .iter_mut()
+                        .find(|p| p.port == port && p.protocol == protocol)
+                });
+                match found {
+                    Some(p) => p.vuln_check = Some(status),
+                    None => rmap_log::warn!(
+                        "CVE check status for {ip} {port}/{} arrived before its port",
+                        protocol.as_str()
+                    ),
+                }
+            }
+            // The report builder keeps it; the header reads it from there.
+            ScanEvent::VulnData(_) => {}
             ScanEvent::HostDone {
                 ip,
                 closed,
