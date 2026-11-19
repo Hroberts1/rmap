@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Cell, Clear, LineGauge, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
-use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, Vulnerability, service_name};
+use rmap_core::{HostState, PortResult, PortState, Service, Timing, VulnSeverity, Vulnerability};
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
 use crate::input::TextInput;
@@ -729,6 +729,7 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
     let mut info_lines = vec![host_info(host)];
     info_lines.extend(crate::names::detail_line(host));
     info_lines.extend(crate::mac::detail_line(host));
+    info_lines.extend(silent_hint(host));
     let [info, ports, footer] = Layout::vertical([
         Constraint::Length(info_lines.len() as u16),
         Constraint::Min(1),
@@ -759,13 +760,12 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
             PortState::Open => Color::Green,
             _ => Color::Yellow,
         };
-        let (name, version) = match &p.service {
-            Some(s) => (s.name.clone(), s.version_label().unwrap_or_default()),
-            None => (
-                service_name(p.port).unwrap_or("unknown").to_string(),
-                String::new(),
-            ),
-        };
+        let name = crate::tabs::service_label(p);
+        let version = p
+            .service
+            .as_ref()
+            .and_then(Service::version_label)
+            .unwrap_or_default();
         let mut cells = vec![
             Cell::from(format!("{}/{}", p.port, p.protocol.as_str())),
             Cell::from(state_label(p.state)).fg(state_color),
@@ -997,6 +997,18 @@ fn service_detail(s: &Service) -> Option<String> {
         parts.push(cpe.trim_end_matches(":*").to_string());
     }
     (!parts.is_empty()).then(|| format!("└ {}", parts.join(" · ")))
+}
+
+/// Many open ports that all accept and say nothing: something in the path
+/// (firewall, IPS) is likely completing the handshake for the real host.
+fn silent_hint(h: &HostRow) -> Option<Line<'static>> {
+    let silent = |p: &PortResult| p.service.as_ref().is_some_and(Service::is_silent);
+    (h.open.len() >= 5 && h.open.iter().all(silent)).then(|| {
+        Line::from(
+            "all ports accept but stay silent: likely a firewall or IPS intercepting connections",
+        )
+        .fg(Color::Yellow)
+    })
 }
 
 fn host_info(h: &HostRow) -> Line<'static> {

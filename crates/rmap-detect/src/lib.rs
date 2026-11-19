@@ -37,7 +37,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use rmap_core::{DetectMethod, Protocol, Service, Timing, service_name};
+use rmap_core::{DetectMethod, Protocol, SILENT_INFO, Service, Timing, service_name};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
@@ -217,6 +217,8 @@ impl Detector {
         let mut unmatched: Option<Vec<u8>> = None;
         let mut failures = 0;
         let mut answered = false;
+        // Some probe connected; with nothing answered, the port is silent.
+        let mut connected = false;
         for index in self.plan(port, protocol) {
             let remaining = budget.saturating_sub(started.elapsed());
             if remaining.is_zero() {
@@ -237,6 +239,7 @@ impl Detector {
             };
             match reply {
                 Ok(response) => {
+                    connected = true;
                     rmap_log::trace!(
                         "service {addr}: probe {} got {} bytes: {}",
                         probe.name,
@@ -281,8 +284,10 @@ impl Detector {
             }
         }
         rmap_log::debug!("service {addr}: no rule matched; using the port table");
+        // UDP silence is normal (open|filtered), so only TCP is marked.
+        let silent = protocol == Protocol::Tcp && connected && !answered;
         Detected {
-            service: port_table(port, unmatched.as_deref()),
+            service: port_table(port, unmatched.as_deref(), silent),
             answered,
         }
     }
@@ -403,17 +408,26 @@ fn tls_service(info: &tls::TlsInfo, port: u16) -> Service {
     }
 }
 
-/// The guess from the port number, noting any reply nothing recognised.
-fn port_table(port: u16, unmatched: Option<&[u8]>) -> Option<Service> {
+/// The guess from the port number, noting any reply nothing recognised,
+/// or that the port accepted connections but stayed `silent`.
+fn port_table(port: u16, unmatched: Option<&[u8]>, silent: bool) -> Option<Service> {
     let name = service_name(port);
-    if name.is_none() && unmatched.is_none() {
+    if name.is_none() && unmatched.is_none() && !silent {
         return None;
     }
+    let info = match unmatched {
+        Some(r) => Some(format!("unrecognised reply: {}", escape(r, 48))),
+        None => silent.then(|| SILENT_INFO.to_string()),
+    };
     Some(Service {
         name: name.unwrap_or("unknown").to_string(),
-        info: unmatched.map(|r| format!("unrecognised reply: {}", escape(r, 48))),
+        info,
         method: DetectMethod::PortTable,
-        confidence: if name.is_some() { 3 } else { 0 },
+        confidence: match (name, silent) {
+            (None, _) => 0,
+            (Some(_), true) => 1,
+            (Some(_), false) => 3,
+        },
         ..Default::default()
     })
 }
@@ -476,13 +490,13 @@ mod tests {
 
     #[test]
     fn port_table_fallback() {
-        let s = port_table(22, None).unwrap();
+        let s = port_table(22, None, false).unwrap();
         assert_eq!(
             (s.name.as_str(), s.method, s.confidence),
             ("ssh", DetectMethod::PortTable, 3)
         );
-        assert!(port_table(40000, None).is_none());
-        let s = port_table(40000, Some(b"\x00hi\r\n")).unwrap();
+        assert!(port_table(40000, None, false).is_none());
+        let s = port_table(40000, Some(b"\x00hi\r\n"), false).unwrap();
         assert_eq!(s.name, "unknown");
         assert_eq!(s.info.as_deref(), Some("unrecognised reply: \\x00hi\\r\\n"));
     }

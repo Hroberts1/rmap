@@ -128,11 +128,11 @@ pub fn findings(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<Finding<'_>> {
     all
 }
 
-/// Detected service name, else the well-known name for the port.
-fn service_label(p: &PortResult) -> String {
+/// Service name for display; guesses from the port number end in `?`.
+pub(crate) fn service_label(p: &PortResult) -> String {
     match &p.service {
-        Some(s) => s.name.clone(),
-        None => service_name(p.port).unwrap_or("unknown").to_string(),
+        Some(s) => s.display_name(),
+        None => service_name(p.port).map_or_else(|| "unknown".into(), |n| format!("{n}?")),
     }
 }
 
@@ -435,7 +435,7 @@ fn draw_vulns(frame: &mut Frame, area: Rect, view: &mut ScanView) {
     let text_w = inner.saturating_sub(place_w + 1);
     let rows = all.iter().zip(&places).map(|(f, place)| {
         let product = match &f.port.service {
-            Some(s) => s.version_label().unwrap_or_else(|| s.name.clone()),
+            Some(s) => s.version_label().unwrap_or_else(|| s.display_name()),
             None => service_label(f.port),
         };
         let left = Text::from(vec![
@@ -518,6 +518,7 @@ mod tests {
                     name: name.into(),
                     product: Some("Samba".into()),
                     version: Some("4.15".into()),
+                    method: rmap_core::DetectMethod::Probe,
                     ..Default::default()
                 },
             });
@@ -595,12 +596,12 @@ mod tests {
         assert_eq!(
             summary,
             [
-                (22, "ssh", ips(&["10.0.0.2"])),
+                (22, "ssh?", ips(&["10.0.0.2"])),
                 (445, "microsoft-ds", ips(&["10.0.0.2", "10.0.0.5"])),
                 // Same port without detection: its well-known name, so a
                 // separate group.
-                (445, "smb", ips(&["10.0.0.9"])),
-                (3389, "rdp", ips(&["10.0.0.9"])),
+                (445, "smb?", ips(&["10.0.0.9"])),
+                (3389, "rdp?", ips(&["10.0.0.9"])),
             ]
         );
     }
@@ -689,7 +690,7 @@ mod tests {
         // A new lower port shifts every row down by one.
         open(view(&mut app), "10.0.0.7", 21, None);
         let screen = render(&mut app, 80, 24);
-        assert!(screen.contains("3389/tcp · rdp · 1 host"), "{screen}");
+        assert!(screen.contains("3389/tcp · rdp? · 1 host"), "{screen}");
 
         // Tab moves into the group's hosts; ↑↓ then move there.
         press(&mut app, KeyCode::Home); // 21 ftp

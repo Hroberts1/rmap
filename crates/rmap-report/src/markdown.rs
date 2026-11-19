@@ -113,7 +113,7 @@ pub fn to_string(r: &ScanReport) -> String {
                 p.port,
                 p.protocol.as_str(),
                 escape(p.state.as_str()),
-                escape(service_name(p)),
+                escape(&service_name(p)),
                 escape(&version_text(p)),
             );
         }

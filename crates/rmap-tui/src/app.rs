@@ -1299,6 +1299,71 @@ mod tests {
         assert_eq!(ports, [22, 80, 443, 8080]);
     }
 
+    /// Open `ports` on `ip` and attach `service(port)` to each.
+    fn open_with(
+        app: &mut App,
+        ip: IpAddr,
+        ports: &[u16],
+        service: impl Fn(u16) -> rmap_core::Service,
+    ) {
+        let view = app.scan.as_mut().unwrap();
+        for &port in ports {
+            let open = rmap_core::PortState::Open;
+            view.apply(ScanEvent::Port {
+                ip,
+                result: PortResult::new(port, Protocol::Tcp, open, None),
+            });
+            view.apply(ScanEvent::Service {
+                ip,
+                protocol: Protocol::Tcp,
+                port,
+                service: service(port),
+            });
+        }
+        view.selected = Some(ip);
+    }
+
+    #[test]
+    fn port_table_guesses_render_with_a_question_mark() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        open_with(&mut app, ip, &[22, 7001], |port| rmap_core::Service {
+            name: if port == 22 { "ssh" } else { "weblogic" }.into(),
+            method: if port == 22 {
+                rmap_core::DetectMethod::Probe
+            } else {
+                rmap_core::DetectMethod::PortTable
+            },
+            ..Default::default()
+        });
+        let screen = render(&mut app, 110, 30);
+        assert!(screen.contains("weblogic?"), "{screen}");
+        assert!(
+            screen.contains("ssh ") && !screen.contains("ssh?"),
+            "{screen}"
+        );
+        assert!(!screen.contains("silent"), "{screen}");
+    }
+
+    #[test]
+    fn all_silent_ports_get_a_host_hint() {
+        let (_rt, mut app) = app();
+        fake_results(&mut app);
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        open_with(&mut app, ip, &[21, 22, 25, 80, 445], |port| {
+            rmap_core::Service {
+                name: rmap_core::service_name(port).unwrap().into(),
+                info: Some(rmap_core::SILENT_INFO.into()),
+                confidence: 1,
+                ..Default::default()
+            }
+        });
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("likely a firewall or IPS"), "{screen}");
+        assert!(screen.contains("smb?"), "{screen}");
+    }
+
     #[test]
     fn service_events_attach_to_their_port() {
         let (_rt, mut app) = app();

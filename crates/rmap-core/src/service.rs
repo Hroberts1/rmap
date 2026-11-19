@@ -19,6 +19,10 @@ pub enum DetectMethod {
     Probe,
 }
 
+/// `info` of a TCP port that accepted connections but never sent a byte to
+/// any probe (timed out, or closed at once). Its name is the port-table guess.
+pub const SILENT_INFO: &str = "connection accepted, no response";
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Service {
@@ -49,6 +53,21 @@ impl Service {
             (None, None) => None,
         }
     }
+
+    /// The name for people to read: a port-number guess ends in `?`
+    /// (`weblogic?`), so it doesn't look like an identification.
+    pub fn display_name(&self) -> String {
+        if self.method == DetectMethod::PortTable && self.name != "unknown" {
+            format!("{}?", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+
+    /// Accepted the connection but answered no probe; see [`SILENT_INFO`].
+    pub fn is_silent(&self) -> bool {
+        self.info.as_deref() == Some(SILENT_INFO)
+    }
 }
 
 #[cfg(test)]
@@ -66,5 +85,19 @@ mod tests {
         assert_eq!(s.version_label().as_deref(), Some("OpenSSH"));
         s.version = Some("9.6p1".into());
         assert_eq!(s.version_label().as_deref(), Some("OpenSSH 9.6p1"));
+    }
+
+    #[test]
+    fn display_name_marks_guesses() {
+        let mut s = Service {
+            name: "weblogic".into(),
+            ..Default::default()
+        };
+        assert_eq!(s.display_name(), "weblogic?");
+        s.method = DetectMethod::Probe;
+        assert_eq!(s.display_name(), "weblogic");
+        s.method = DetectMethod::PortTable;
+        s.name = "unknown".into();
+        assert_eq!(s.display_name(), "unknown");
     }
 }
