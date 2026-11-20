@@ -205,6 +205,13 @@ fn every_rule_matches_its_banner() {
     );
     r.check(
         "banner",
+        b"220 ZBR-48213 Version V84.20.10Z ready.\r\n",
+        "ftp",
+        Some("Zebra print server"),
+        Some("V84.20.10Z"),
+    );
+    r.check(
+        "banner",
         b"220 Microsoft FTP Service\r\n",
         "ftp",
         Some("Microsoft ftpd"),
@@ -929,10 +936,11 @@ fn detected_products_have_cpes() {
     let without_cpe = [
         "Apache Tomcat Coyote",
         "Microsoft HTTPAPI httpd",
-        "Microsoft DNS", // reports the Windows build
-        "Cisco IOS",     // an OS, and the table makes application CPEs
-        "Knot DNS",      // NVD naming not confirmed yet
-        "$1",            // products taken from the response itself
+        "Microsoft DNS",      // reports the Windows build
+        "Cisco IOS",          // an OS, and the table makes application CPEs
+        "Knot DNS",           // NVD naming not confirmed yet
+        "Zebra print server", // NVD only has per-model printer firmware CPEs
+        "$1",                 // products taken from the response itself
     ];
     let known: BTreeSet<&str> = crate::cpe::known_products().collect();
     let db = Database::parse(crate::db::BUILTIN).unwrap();

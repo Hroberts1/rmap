@@ -9,9 +9,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Cell, Clear, LineGauge, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
-use rmap_core::{
-    HostState, PortResult, PortState, Service, Timing, VulnSeverity, VulnTier, Vulnerability,
-};
+use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, VulnTier, Vulnerability};
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
 use crate::input::TextInput;
@@ -405,7 +403,7 @@ fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
     let mut wanted = vec![
         ("Tab", "pane"),
         ("↑↓", "select"),
-        ("1-3", "tabs"),
+        ("1-4", "tabs"),
         ("/", "filter"),
     ];
     if view.is_running() || view.rescan.is_some() {
@@ -556,6 +554,11 @@ pub(crate) fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Bloc
 
 fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut HitMap) {
     let visible = view.visible();
+    let groups = view.report.device_groups();
+    // A device's other addresses, shown under its first one as `↳ addr`.
+    let tucked = |ip: &std::net::IpAddr| {
+        crate::devices::primary_of(*ip, &groups).is_some_and(|p| visible.contains(&p))
+    };
     let focused = view.focus == Pane::Hosts;
 
     // Fixed widths for address and open count; the name gets what's left,
@@ -564,7 +567,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut Hi
     let inner = area.width.saturating_sub(3) as usize;
     let addr_w = visible
         .iter()
-        .map(|ip| ip.to_string().len())
+        .map(|ip| ip.to_string().len() + if tucked(ip) { 2 } else { 0 })
         .max()
         .unwrap_or(0)
         .max("ADDRESS".len());
@@ -608,7 +611,11 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut Hi
         let name = crate::mac::host_name(h).unwrap_or_default();
         let mut cells = vec![
             Cell::from(mark).style(style),
-            Cell::from(ip.to_string()),
+            Cell::from(if tucked(ip) {
+                format!("↳ {ip}")
+            } else {
+                ip.to_string()
+            }),
             Cell::from(ellipsize(name, name_w)).dim(),
             Cell::from(Line::from(open)),
         ];
@@ -731,7 +738,20 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
     let mut info_lines = vec![host_info(host)];
     info_lines.extend(crate::names::detail_line(host));
     info_lines.extend(crate::mac::detail_line(host));
-    info_lines.extend(silent_hint(host));
+    let decoy = rmap_report::tags::honeypot_reasons(
+        ip,
+        &host.open,
+        host.mac,
+        view.hosts
+            .iter()
+            .filter(|(_, h)| h.state != HostState::Down)
+            .map(|(ip, h)| (*ip, h.mac)),
+    );
+    info_lines.extend(decoy_hint(&decoy));
+    info_lines.extend(crate::devices::detail_lines(
+        ip,
+        &view.report.device_groups(),
+    ));
     let [info, ports, footer] = Layout::vertical([
         Constraint::Length(info_lines.len() as u16),
         Constraint::Min(1),
@@ -777,7 +797,12 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
         if show_rtt {
             cells.push(Cell::from(p.rtt.map(fmt_rtt).unwrap_or_default()).dim());
         }
-        rows.push(Row::new(cells));
+        // A likely decoy's ports are dimmed: they aren't real services.
+        rows.push(if decoy.is_empty() {
+            Row::new(cells)
+        } else {
+            Row::new(cells).dim()
+        });
         heights.push(1);
 
         if let Some(d) = p.service.as_ref().and_then(service_detail) {
@@ -1039,16 +1064,16 @@ fn service_detail(s: &Service) -> Option<String> {
     (!parts.is_empty()).then(|| format!("└ {}", parts.join(" · ")))
 }
 
-/// Many open ports that all accept and say nothing: something in the path
-/// (firewall, IPS) is likely completing the handshake for the real host.
-fn silent_hint(h: &HostRow) -> Option<Line<'static>> {
-    let silent = |p: &PortResult| p.service.as_ref().is_some_and(Service::is_silent);
-    (h.open.len() >= 5 && h.open.iter().all(silent)).then(|| {
-        Line::from(
-            "all ports accept but stay silent: likely a firewall or IPS intercepting connections",
-        )
-        .fg(Color::Yellow)
-    })
+/// Many open ports that all accept and say nothing: a decoy, a tarpit, or
+/// a firewall completing the handshake for the real host.
+fn decoy_hint(reasons: &[String]) -> Vec<Line<'static>> {
+    if reasons.is_empty() {
+        return Vec::new();
+    }
+    let head = "likely honeypot or tarpit (or a firewall answering for the host)";
+    std::iter::once(Line::from(head).fg(Color::Yellow))
+        .chain(reasons.iter().map(|r| Line::from(format!("· {r}")).dim()))
+        .collect()
 }
 
 fn host_info(h: &HostRow) -> Line<'static> {
@@ -1089,7 +1114,7 @@ fn draw_help(frame: &mut Frame) {
         ("PgUp PgDn", "move by 10"),
         ("Home End g G", "first / last"),
         ("Tab ← → h l", "switch between hosts and ports"),
-        ("1 2 3", "hosts / services / vulns tab"),
+        ("1 2 3 4", "hosts / services / vulns / findings tab"),
         ("d", "show or hide down hosts"),
         ("/", "filter by ip, name, port, service"),
         ("o", "sort: ip, open ports, worst CVE"),

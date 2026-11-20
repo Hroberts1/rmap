@@ -54,6 +54,7 @@ pub type Decoder = fn(&[u8]) -> Option<Decoded>;
 pub fn decoder(b: Builtin) -> Option<Decoder> {
     Some(match b {
         Builtin::DnsVersionBind => dns_version_reply,
+        Builtin::DnsVersionBindTcp => dns_tcp_version_reply,
         Builtin::MdnsServices => mdns_reply,
         Builtin::NtpClient => ntp_client_reply,
         Builtin::NtpReadvar => ntp_readvar_reply,
@@ -228,6 +229,20 @@ fn dns_version_reply(msg: &[u8]) -> Option<Decoded> {
         service: service("dns", info),
         text: txt.map(<[u8]>::to_vec),
     })
+}
+
+/// A DNS message framed for TCP: two-byte big-endian length, then the message.
+pub fn dns_over_tcp(msg: &[u8]) -> Vec<u8> {
+    let mut out = (msg.len() as u16).to_be_bytes().to_vec();
+    out.extend_from_slice(msg);
+    out
+}
+
+/// The TCP answer to `version.bind`: unframe it, then read it like UDP's.
+/// A reply cut short is rejected, since its records can't be trusted.
+fn dns_tcp_version_reply(reply: &[u8]) -> Option<Decoded> {
+    let len = usize::from(u16_at(reply, 0)?);
+    dns_version_reply(reply.get(2..2 + len)?)
 }
 
 fn mdns_reply(msg: &[u8]) -> Option<Decoded> {
@@ -759,6 +774,48 @@ pub(crate) mod tests {
         );
         let d = netbios_reply(&netbios_response(&[("SAMBA", 0, false)], [0; 6])).unwrap();
         assert_eq!(d.service.info.as_deref(), Some("name SAMBA"));
+    }
+
+    #[test]
+    fn decodes_version_bind_over_tcp() {
+        let r = dns_answer(&dns_version_bind(), 0, &[(16, txt("unbound 1.19.0"))]);
+        let framed = dns_over_tcp(&r);
+        let d = dns_tcp_version_reply(&framed).unwrap();
+        assert_eq!(d.text.as_deref(), Some(&b"unbound 1.19.0"[..]));
+        // Cut short, or framed with the wrong length: not an answer.
+        assert!(dns_tcp_version_reply(&framed[..framed.len() - 1]).is_none());
+        assert!(dns_tcp_version_reply(&r).is_none());
+        for n in 0..framed.len() {
+            let _ = dns_tcp_version_reply(&framed[..n]);
+        }
+    }
+
+    #[test]
+    fn random_replies_never_panic_any_decoder() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let decoders = [
+            Builtin::DnsVersionBind,
+            Builtin::DnsVersionBindTcp,
+            Builtin::MdnsServices,
+            Builtin::NtpClient,
+            Builtin::NtpReadvar,
+            Builtin::SnmpV1,
+            Builtin::NetbiosStatus,
+        ]
+        .map(|b| decoder(b).unwrap());
+        for len in 0..600 {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            for d in &decoders {
+                let _ = d(&bytes);
+            }
+        }
     }
 
     #[test]

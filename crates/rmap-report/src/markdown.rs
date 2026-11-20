@@ -6,9 +6,9 @@ use rmap_core::{VulnTier, Vulnerability};
 
 use crate::model::ScanReport;
 use crate::summary::{
-    FINDINGS_NOTE, Group, coverage_line, findings, groups, host_label, kev_note, no_findings_text,
-    not_counted_line, one_line, service_name, severity_line, utc, version_text, vuln_data_line,
-    worst,
+    FINDINGS_NOTE, Group, coverage_line, findings, groups, host_label, ip_list, kev_note,
+    no_findings_text, not_counted_line, one_line, service_name, severity_line, utc, version_text,
+    vuln_data_line, worst,
 };
 
 /// Scanned text made safe for a Markdown table cell or list item: one
@@ -134,7 +134,27 @@ pub fn to_string(r: &ScanReport) -> String {
     if let Some(line) = vuln_data_line(r) {
         let _ = writeln!(o, "- **Vulnerability data:** {}", escape(&line));
     }
+    let exposures = crate::exposure::findings(r);
+    if !exposures.is_empty() {
+        let line = crate::exposure::severity_line(&exposures);
+        let _ = writeln!(o, "- **Exposure findings:** {line}");
+    }
     let _ = writeln!(o, "- **rmap version:** {}\n", escape(&r.rmap_version));
+
+    if !exposures.is_empty() {
+        let _ = writeln!(o, "## Exposure findings\n");
+        for f in &exposures {
+            let _ = writeln!(
+                o,
+                "- **{}** {}: {}. {}",
+                f.severity.as_str(),
+                escape(&f.place()),
+                escape(&f.title),
+                escape(&f.detail)
+            );
+        }
+        let _ = writeln!(o);
+    }
 
     let all = findings(r);
     let _ = writeln!(o, "## Hosts\n");
@@ -201,14 +221,18 @@ pub fn to_string(r: &ScanReport) -> String {
     }
     for g in &groups {
         let _ = writeln!(o, "### {}\n", escape(&g.line()));
-        for f in g.findings.iter().filter(|f| f.tier == VulnTier::Potential) {
+        for (f, ips) in g
+            .findings
+            .iter()
+            .filter(|(f, _)| f.tier == VulnTier::Potential)
+        {
             let score = f.vuln.score.map_or(String::new(), |s| format!(", {s:.1}"));
             let _ = writeln!(
                 o,
                 "- **{}** ({}{score}) on {} {}/{}: {}{}",
                 escape(&f.vuln.id),
                 f.vuln.severity.as_str(),
-                f.ip,
+                ip_list(ips),
                 f.port,
                 f.protocol.as_str(),
                 escape(&f.vuln.summary),
@@ -273,6 +297,26 @@ mod tests {
         assert!(md.contains("- **Potential CVEs:** none"));
         assert!(md.contains("No potential CVEs matched"));
         assert!(md.contains("not finished"));
+    }
+
+    #[test]
+    fn exposure_findings_section_is_escaped() {
+        let mut r = fixture();
+        assert!(
+            !to_string(&r).contains("Exposure findings"),
+            "none: no section"
+        );
+        let mut printer = crate::exposure::tests::printer();
+        printer.ports[1].service.as_mut().unwrap().product = Some("<b>|x".into());
+        r.hosts.push(printer);
+        let md = to_string(&r);
+        assert!(
+            md.contains("- **Exposure findings:** 2 (high 1, medium 1)"),
+            "{md}"
+        );
+        assert!(md.contains("## Exposure findings"));
+        assert!(md.contains("- **high** 10.9.0.26:23/tcp: Telnet (plaintext remote login)."));
+        assert!(md.contains("telnet \\<b\\>\\|x"), "{md}");
     }
 
     #[test]

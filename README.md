@@ -40,6 +40,7 @@
   - [Adaptive timeouts](#adaptive-timeouts)
   - [MAC vendor lookup](#mac-vendor-lookup)
   - [Host names](#host-names)
+  - [Device grouping](#device-grouping)
 - [Service detection](#service-detection)
   - [UDP detection](#udp-detection)
   - [Adding a probe or match rule](#adding-a-probe-or-match-rule)
@@ -49,6 +50,8 @@
   - [Updating vulnerability data](#updating-vulnerability-data)
   - [Building from NVD](#building-from-nvd)
   - [Vulnerability data (maintainers)](#vulnerability-data-maintainers)
+- [Exposure findings](#exposure-findings)
+  - [JSON summary](#json-summary)
 - [Logs and crash reports](#logs-and-crash-reports)
 - [Testing](#testing)
 - [Roadmap](#roadmap)
@@ -215,7 +218,7 @@ sudo setcap cap_net_raw+ep target/release/rmap
 | `PgUp` `PgDn` | Move by 10 |
 | `Home` `End` `g` `G` | First / last |
 | `Tab` `←` `→` `h` `l` | Switch between the hosts pane and the ports pane |
-| `1` `2` `3` | Hosts / Services / Vulns tab (below) |
+| `1` `2` `3` `4` | Hosts / Services / Vulns / Findings tab (below) |
 | `d` | Show or hide down hosts |
 | `/` | Filter the host list (below) |
 | `o` | Cycle sort order (below) |
@@ -235,7 +238,7 @@ sudo setcap cap_net_raw+ep target/release/rmap
 
 ### Tabs: Hosts, Services, Vulns
 
-`1` (Hosts, the default) shows one host at a time with its ports, as described above. `2` (Services) groups every open port across the whole scan by port and protocol - "which hosts have 445 open?" - with the service name and a count. `3` (Vulns) starts with a coverage line (`CVE coverage: 4 of 65 open ports checked`), then lists every match grouped by product and version (`OpenSSH 10.2p1: 29 potential (upstream match; Ubuntu build) · 3 conditional (platform not verified) · 8 client-only, not counted · 2 ports`), worst group first, host and port alongside each finding. `Enter` or `Space` opens or closes the selected group; groups with plain potential findings start open, groups holding only distro-build, conditional or client-only matches start closed (see [Match tiers](#match-tiers)). Both rebuild from the live results every frame, so they fill in as the scan runs, and arrow keys move through whichever group or finding is selected.
+`1` (Hosts, the default) shows one host at a time with its ports, as described above. `2` (Services) groups every open port across the whole scan by port and protocol - "which hosts have 445 open?" - with the service name and a count. `3` (Vulns) starts with a coverage line (`CVE coverage: 4 of 65 open ports checked`), then lists every match grouped by product and version (`OpenSSH 10.2p1: 29 potential (upstream match; Ubuntu build) · 3 conditional (platform not verified) · 8 client-only, not counted · 2 ports`), worst group first, host and port alongside each finding. `Enter` or `Space` opens or closes the selected group; groups with plain potential findings start open, groups holding only distro-build, conditional or client-only matches start closed (see [Match tiers](#match-tiers)). Both rebuild from the live results every frame, so they fill in as the scan runs, and arrow keys move through whichever group or finding is selected. `4` (Findings) lists [exposure findings](#exposure-findings) such as Telnet on a printer or an expired certificate, worst first.
 
 ### Filtering and sorting the host list
 
@@ -297,10 +300,10 @@ Set `RMAP_SCAN_DIR` to keep scans somewhere else; exports then default to `$RMAP
 
 **Export (`e`).** Pick a format with `Tab`, edit the path if you like (`Ctrl-U` clears it), and press `Enter`:
 
-- **JSON:** rmap's own report format, the same one used for saved scans. It carries a `format_version` so later versions of rmap can keep reading old files. It records the rmap version, start and end times, how the scan ended (`completed`, `stopped`, `failed`), the configuration, and every host with its open and open|filtered ports, detected services and CPEs, and closed/filtered counts.
+- **JSON:** rmap's own report format, the same one used for saved scans. It carries a `format_version` so later versions of rmap can keep reading old files. It records the rmap version, start and end times, how the scan ended (`completed`, `stopped`, `failed`), the configuration, and every host with its open and open|filtered ports, detected services and CPEs, and closed/filtered counts. It also carries a [`summary` block and `findings`](#json-summary) for other tools to ingest.
 - **Nmap XML:** the commonly used subset of Nmap's documented XML output (`nmaprun`, `scaninfo`, `host`, `status`, `address`, `hostnames`, `ports`, `extraports`, `port`, `state`, `service` with product/version/extrainfo/CPE, `times`, `runstats`), so tools that import Nmap results can read rmap scans. It's written by rmap's own small XML writer; times are in UTC, and CPEs are converted to the `cpe:/` form Nmap uses.
 - **Markdown:** a readable summary for pasting into a ticket: scope, times, hosts up, open ports and potential CVE counts by severity, then a ports table and findings per host, then all matches grouped by product and version (distro-build, conditional and client-only matches as one collapsed line each).
-- **CSV:** one row per open or open|filtered port (`ip, hostname, port, protocol, state, service, product, version, info, cves, worst_severity, cve_check, exploited`). Every field is quoted per RFC 4180, and fields a spreadsheet would treat as a formula (starting with `=`, `+`, `-`, `@`, tab or CR) get a leading `'`, since banners and hostnames come from the scanned devices.
+- **CSV:** one row per open or open|filtered port (`ip, hostname, port, protocol, state, service, product, version, info, cves, worst_severity, cve_check, exploited, exposure_findings`). Every field is quoted per RFC 4180, and fields a spreadsheet would treat as a formula (starting with `=`, `+`, `-`, `@`, tab or CR) get a leading `'`, since banners and hostnames come from the scanned devices.
 - **HTML:** one self-contained, printable page for handing to a client: inline CSS only, no JavaScript or external requests (a Content-Security-Policy blocks them), light and dark friendly.
 
 Every scanned string is escaped for its format, and control characters (terminal escape sequences) and bidirectional overrides are replaced with `�`. CVE matches are version-based, so the Markdown and HTML reports call them *potential* findings to verify before acting.
@@ -381,6 +384,16 @@ When ARP discovers a host's hardware address, the host detail pane shows it with
 With **Names** ticked on the setup form (the default), rmap looks up every live host's names while its ports are scanned, from three sources at once: reverse DNS (a PTR query), the host's NetBIOS name table (UDP 137) and its own mDNS responder (UDP 5353). No single one names everything: DNS covers domain-joined and DHCP-registered machines, NetBIOS covers Windows PCs, Samba, NAS boxes and many printers, and mDNS covers Macs, phones, Linux, printers and IoT. The best name fills the host list (DNS first, then NetBIOS, then mDNS); the detail pane lists all of them with their source, e.g. `names frontdesk.corp.lan (DNS) · FRONTDESK (NetBIOS)`, which makes a stale DNS record easy to spot. A name typed as the target is kept.
 
 Reverse DNS uses the **DNS server** field if set, otherwise the system resolver (`/etc/resolv.conf` on Linux, the first IPv4 DNS server Windows reports on Windows). Set the field to override it, for example to the client's domain controller when your machine isn't using it; NetBIOS and mDNS work either way. Each lookup is one small UDP packet that waits its turn under the rate cap, loopback targets skip reverse DNS, and names from the network are cleaned of control characters before they're shown or saved. Names go into every export, and the scan diff reports a host whose name changed.
+
+### Device grouping
+
+One device often answers at several addresses: a server wired and on Wi-Fi, a NAS with two NICs, a gateway's decoy address. rmap links them so they aren't counted, or their CVEs listed, twice. Two up hosts are one device when they have:
+
+- **the same MAC address** (strongest; this also links a decoy or proxy-ARP address to the device behind it, which is worth seeing), or
+- **the same SSH host key or TLS certificate** - unless more than 4 hosts share it, which means a vendor default or a cloned image, not one device (logged and ignored), or
+- **neighbouring burned-in MACs** (same vendor prefix, 1-2 apart, like a multi-port NIC) **and** the same short hostname or the same vendor. Neighbouring MACs alone aren't enough: machines from one batch can have them too.
+
+Links are transitive. The Hosts tab shows a device's other addresses right under its first one, marked `↳`, and the detail pane says `same device as …` with the reason for each link. The Vulns tab and the Markdown and HTML reports list a CVE found on the same product version at several addresses of one device once, with every address, and count it once. The scan diff doesn't call a device's new address a new host when the device was already up. JSON reports carry each grouped host's `device_group` (`id`, `members`, `reasons`) and a top-level `devices` count; both are recomputed whenever a report is loaded, so older saved scans gain them too. CSV and XML stay one row per address.
 
 ## Service detection
 
@@ -580,6 +593,49 @@ NVD_MAX_PAGES=1 OUT_DIR=/tmp/vulndb-trial cargo run -p vulndb-build
 A full keyless run takes about 25 minutes. An NVD API key ([request one free](https://nvd.nist.gov/developers/request-an-api-key)) makes it faster: set `NVD_API_KEY` locally, or add it as the repository secret `NVD_API_KEY` for the Action. Without the secret the Action still works, just slower.
 
 Data sources and terms: NVD data is a work of the US government and in the public domain; CISA's KEV catalog is public. *This product uses the NVD API but is not endorsed or certified by the NVD.*
+
+## Exposure findings
+
+CVEs aren't the only thing worth fixing. After a scan, rmap also checks the results against a small set of exposure rules: services that are risky just by being reachable, certificates that have expired, and hosts that expose more than their peers. Rules only read the finished results (no extra traffic), and certificate dates are judged against the scan's start time, so a saved scan reads the same next year. Findings show in the `4` Findings tab, in the Markdown, HTML and CSV exports, and in the JSON `findings` array.
+
+| Rule id | Severity | Flags |
+|---|---|---|
+| `telnet` | high | Telnet (23, or detected anywhere) |
+| `ftp` | medium | FTP (21) |
+| `pop3`, `imap` | low | POP3 (110) and IMAP (143) without TLS |
+| `snmp-v1-v2c` | medium | SNMP v1/v2c answering a community string (detection must have seen the reply) |
+| `rdp`, `vnc` | medium | Remote Desktop (3389), VNC (5900-5903) |
+| `winrm-http` | low | WinRM over HTTP (5985) |
+| `mssql`, `mysql`, `postgresql` | medium | SQL Server (1433), MySQL (3306), PostgreSQL (5432) |
+| `redis`, `mongodb`, `memcached`, `elasticsearch` | high | Redis (6379), MongoDB (27017), Memcached (11211), Elasticsearch (9200): no authentication by default |
+| `cert-expired` | medium, low if self-signed | A TLS certificate whose `not_after` is before the scan date |
+| `cert-expiring` | low, info if self-signed | A certificate expiring within 30 days of the scan |
+| `cert-self-signed` | info | A self-signed certificate that isn't expired or expiring |
+| `peer-outlier` | medium if SMB/RPC/remote admin, else low | A host with open ports most of its peers don't have |
+
+A port matches when detection identified the service by name, or, when detection couldn't tell, by its usual port number. Ports that accepted a connection but answered nothing (tarpits, honeypots) don't count, and a database port-number guess on a printer is ignored (Zebra printers use 9200 for their own web services).
+
+**Peer outliers.** Hosts are peers when their first hostname label starts the same up to the first digit (`OFFICE-PC014` and `office-pc022.corp.lan` are both `office-pc`). A host is flagged for each open port that fewer than half the group has and at least 3 peers don't, so the one workstation with 135/139/445 open stands out while two odd machines never flag each other. Only hosts whose scan completed count, and the finding names the peer group it was compared with.
+
+### JSON summary
+
+Every JSON export and saved scan has a top-level `summary` block for feeding into other tools. It is recomputed whenever the file is written and ignored when rmap reads one, as is `findings`, so files from older versions load unchanged. Fields are only ever added, never renamed.
+
+| Field | Meaning |
+|---|---|
+| `hosts_scanned` | Addresses in the scan |
+| `hosts_up` | Hosts up, or assumed up when discovery was off |
+| `open_ports` | Ports in state `open` (not `open\|filtered`) |
+| `open_ports_by_protocol.tcp`, `.udp` | The same, by protocol |
+| `cve_check.checked`, `.checked_upstream_only`, `.version_hidden`, `.no_product`, `.not_covered`, `.no_database` | Ports per CVE check status (see [Was the port actually checked?](#was-the-port-actually-checked)) |
+| `cve_check.not_run` | Open ports matching never looked at (matching off, or no service detected) |
+| `cves_by_severity.total`, `.critical`, `.high`, `.medium`, `.low` | Potential CVE matches, one per CVE per port; potential and upstream-only [tiers](#match-tiers) only |
+| `cves_by_severity.upstream_only` | Of `total`, matches on distro builds |
+| `cves_by_severity.conditional`, `.client_only` | Matches not in `total`: platform not verified, or client programs only |
+| `cves_by_severity.kev` | Counted matches on CISA's Known Exploited Vulnerabilities list |
+| `findings_by_severity.total`, `.high`, `.medium`, `.low`, `.info` | Exposure findings |
+
+Each entry in `findings` has `id` (the rule id above), `severity` (`info`, `low`, `medium` or `high`), `ip`, `port` and `protocol` (left out for host-wide findings), `title` and `detail`.
 
 ## Logs and crash reports
 

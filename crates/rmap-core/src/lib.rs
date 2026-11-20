@@ -7,13 +7,14 @@ pub mod ports;
 pub mod result;
 pub mod scan;
 pub mod service;
+pub mod sha256;
 pub mod target;
 pub mod timing;
 pub mod vuln;
 
 pub use mac::MacAddr;
 pub use names::{HostName, NameSource};
-pub use ports::{PortList, service_name};
+pub use ports::{PortList, client_speaks_first, is_print_port, service_name};
 pub use result::{HostState, PortResult, PortState, Protocol, ScanEvent};
 pub use scan::ScanType;
 pub use service::{CertInfo, DetectMethod, SILENT_INFO, Service};

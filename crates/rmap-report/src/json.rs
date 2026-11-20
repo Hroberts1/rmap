@@ -1,10 +1,170 @@
 //! JSON export and import.
 
+use rmap_core::{PortState, Protocol, VulnCheck, VulnSeverity, VulnTier};
+use serde::Serialize;
+
+use crate::exposure::{self, Finding, Severity};
 use crate::model::{FORMAT_VERSION, ScanReport};
 
-/// The report as pretty-printed JSON.
+/// What the file holds: the report, plus a `summary` and `findings`
+/// derived from it. Both are recomputed on every write and ignored on
+/// read, so they never go stale and older files load unchanged.
+#[derive(Serialize)]
+struct Document<'a> {
+    #[serde(flatten)]
+    report: &'a ScanReport,
+    summary: Summary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    findings: Vec<Finding>,
+}
+
+/// Scan-level counts for machine ingestion. Field names are a contract:
+/// add fields, don't rename them (see the README).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Summary {
+    pub hosts_scanned: usize,
+    pub hosts_up: usize,
+    /// Ports in state `open` (not `open|filtered`).
+    pub open_ports: usize,
+    pub open_ports_by_protocol: ByProtocol,
+    pub cve_check: CveCoverage,
+    pub cves_by_severity: CveCounts,
+    pub findings_by_severity: FindingCounts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ByProtocol {
+    pub tcp: usize,
+    pub udp: usize,
+}
+
+/// Ports per CVE check status; `not_run` counts open ports matching never
+/// looked at (matching off, or no service detected).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CveCoverage {
+    pub checked: usize,
+    /// Checked, but a distro build: matches are against the upstream
+    /// version and may be fixed by backports.
+    pub checked_upstream_only: usize,
+    pub version_hidden: usize,
+    pub no_product: usize,
+    pub not_covered: usize,
+    pub no_database: usize,
+    pub not_run: usize,
+}
+
+/// Potential CVE matches (one per CVE per port). `total`, the severities
+/// and `kev` count only potential and upstream-only matches; the other
+/// tiers are counted apart (see `rmap_core::VulnTier`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CveCounts {
+    pub total: usize,
+    /// Of `total`, matches on distro builds (`checked_upstream_only`).
+    pub upstream_only: usize,
+    /// Need a platform rmap can't verify; not in `total`.
+    pub conditional: usize,
+    /// Client programs only; not in `total`.
+    pub client_only: usize,
+    pub critical: usize,
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    /// Matches on CISA's Known Exploited Vulnerabilities list.
+    pub kev: usize,
+}
+
+/// Exposure findings (see [`crate::exposure`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FindingCounts {
+    pub total: usize,
+    pub high: usize,
+    pub medium: usize,
+    pub low: usize,
+    pub info: usize,
+}
+
+/// The summary block for `report`, given its exposure findings.
+pub fn summary(r: &ScanReport, findings: &[Finding]) -> Summary {
+    let open: Vec<_> = r
+        .hosts
+        .iter()
+        .flat_map(|h| &h.ports)
+        .filter(|p| p.state == PortState::Open)
+        .collect();
+    let mut cve_check = CveCoverage::default();
+    for p in r.hosts.iter().flat_map(|h| &h.ports) {
+        let n = match &p.vuln_check {
+            Some(VulnCheck::Checked { .. }) => &mut cve_check.checked,
+            Some(VulnCheck::CheckedUpstreamOnly { .. }) => &mut cve_check.checked_upstream_only,
+            Some(VulnCheck::VersionHidden { .. }) => &mut cve_check.version_hidden,
+            Some(VulnCheck::NoProduct) => &mut cve_check.no_product,
+            Some(VulnCheck::NotCovered { .. }) => &mut cve_check.not_covered,
+            Some(VulnCheck::NoDatabase) => &mut cve_check.no_database,
+            None if p.state == PortState::Open => &mut cve_check.not_run,
+            None => continue,
+        };
+        *n += 1;
+    }
+    let mut cves = CveCounts::default();
+    for (p, v) in r
+        .hosts
+        .iter()
+        .flat_map(|h| &h.ports)
+        .flat_map(|p| p.vulnerabilities.iter().map(move |v| (p, v)))
+    {
+        let tier = p.vuln_tier(v);
+        match tier {
+            VulnTier::Conditional => cves.conditional += 1,
+            VulnTier::ClientOnly => cves.client_only += 1,
+            VulnTier::UpstreamOnly => cves.upstream_only += 1,
+            VulnTier::Potential => {}
+        }
+        if !tier.shows_kev() {
+            continue;
+        }
+        cves.total += 1;
+        cves.kev += usize::from(v.kev_added.is_some());
+        *match v.severity {
+            VulnSeverity::Critical => &mut cves.critical,
+            VulnSeverity::High => &mut cves.high,
+            VulnSeverity::Medium => &mut cves.medium,
+            VulnSeverity::Low => &mut cves.low,
+        } += 1;
+    }
+    let mut by_sev = FindingCounts {
+        total: findings.len(),
+        ..Default::default()
+    };
+    for f in findings {
+        *match f.severity {
+            Severity::High => &mut by_sev.high,
+            Severity::Medium => &mut by_sev.medium,
+            Severity::Low => &mut by_sev.low,
+            Severity::Info => &mut by_sev.info,
+        } += 1;
+    }
+    Summary {
+        hosts_scanned: r.hosts.len(),
+        hosts_up: r.hosts_up(),
+        open_ports: open.len(),
+        open_ports_by_protocol: ByProtocol {
+            tcp: open.iter().filter(|p| p.protocol == Protocol::Tcp).count(),
+            udp: open.iter().filter(|p| p.protocol == Protocol::Udp).count(),
+        },
+        cve_check,
+        cves_by_severity: cves,
+        findings_by_severity: by_sev,
+    }
+}
+
+/// The report as pretty-printed JSON, with its `summary` and `findings`.
 pub fn to_string(report: &ScanReport) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(report)
+    let findings = exposure::findings(report);
+    serde_json::to_string_pretty(&Document {
+        report,
+        summary: summary(report, &findings),
+        findings,
+    })
 }
 
 /// Parse a report, rejecting files written by a newer, incompatible rmap.
@@ -24,7 +184,12 @@ pub fn from_str(text: &str) -> Result<ScanReport, String> {
         }
         Some(_) => {}
     }
-    serde_json::from_str(text).map_err(|e| format!("invalid rmap report: {e}"))
+    let mut report: ScanReport =
+        serde_json::from_str(text).map_err(|e| format!("invalid rmap report: {e}"))?;
+    // Derived data: recompute, so old files gain groups and a file's own
+    // (possibly edited) groups are never trusted.
+    crate::devices::assign(&mut report);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -117,9 +282,131 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn summary_counts_a_known_report() {
+        let mut r = crate::summary::tests::fixture();
+        r.hosts.push(crate::exposure::tests::printer());
+        let findings = exposure::findings(&r);
+        let s = summary(&r, &findings);
+        assert_eq!((s.hosts_scanned, s.hosts_up, s.open_ports), (3, 3, 5));
+        assert_eq!(s.open_ports_by_protocol, ByProtocol { tcp: 5, udp: 0 });
+        assert_eq!(
+            s.cve_check,
+            CveCoverage {
+                checked: 1,
+                not_run: 4,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            s.cves_by_severity,
+            CveCounts {
+                total: 2,
+                high: 1,
+                medium: 1,
+                kev: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            s.findings_by_severity,
+            FindingCounts {
+                total: 2,
+                high: 1,
+                medium: 1,
+                ..Default::default()
+            }
+        );
+
+        // A distro build, with the KEV CVE conditional and one client-only.
+        let p = &mut r.hosts[0].ports[0];
+        p.vuln_check = Some(VulnCheck::CheckedUpstreamOnly {
+            product: "OpenSSH".into(),
+            version: "9.6p1".into(),
+            matches: 1,
+            distro: "Ubuntu".into(),
+        });
+        p.vulnerabilities[1].condition = Some("musl-libc:musl".into());
+        let mut client = p.vulnerabilities[0].clone();
+        client.id = "CVE-2026-60002".into();
+        client.client_only = true;
+        p.vulnerabilities.push(client);
+        let s = summary(&r, &findings);
+        assert_eq!(s.cve_check.checked_upstream_only, 1);
+        assert_eq!(
+            s.cves_by_severity,
+            CveCounts {
+                total: 1,
+                upstream_only: 1,
+                conditional: 1,
+                client_only: 1,
+                medium: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn summary_and_findings_are_written_and_ignored_on_read() {
+        let mut r = sample();
+        r.hosts.push(crate::exposure::tests::printer());
+        // Device groups are derived; reading recomputes them, so do it here too.
+        crate::devices::assign(&mut r);
+        let text = to_string(&r).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["summary"]["hosts_up"], 3);
+        assert_eq!(v["summary"]["findings_by_severity"]["high"], 1);
+        assert_eq!(v["summary"]["cve_check"]["not_run"], 5, "ssh + printer");
+        assert_eq!(v["findings"][0]["id"], "telnet");
+        assert_eq!(v["findings"][0]["severity"], "high");
+        assert_eq!(v["findings"][0]["port"], 23);
+        assert_eq!(v["findings"][0]["protocol"], "tcp");
+        assert_eq!(from_str(&text).unwrap(), r);
+        // No findings: no `findings` key, but always a summary.
+        let text = to_string(&sample()).unwrap();
+        assert!(text.contains("\"summary\"") && !text.contains("\"findings\""));
+    }
+
+    #[test]
     fn empty_report_round_trips() {
-        let report = ScanReport::new(config(), 0);
+        let mut report = ScanReport::new(config(), 0);
+        crate::devices::assign(&mut report);
         assert_eq!(from_str(&to_string(&report).unwrap()).unwrap(), report);
+    }
+
+    #[test]
+    fn device_groups_round_trip_and_old_files_still_load() {
+        let mut b = ReportBuilder::new(config(), 0);
+        for a in ["10.0.0.2", "10.0.0.3"] {
+            b.apply(&ScanEvent::Host {
+                ip: ip(a),
+                hostname: None,
+                state: HostState::Up,
+                rtt: None,
+            });
+            b.apply(&ScanEvent::Mac {
+                ip: ip(a),
+                mac: "00:11:32:aa:bb:cc".parse().unwrap(),
+            });
+        }
+        let report = b.report();
+        assert_eq!(report.devices, Some(1));
+        let g = report.hosts[1].device_group.as_ref().unwrap();
+        assert_eq!(g.members, [ip("10.0.0.2"), ip("10.0.0.3")]);
+        let text = to_string(&report).unwrap();
+        assert!(text.contains("\"device_group\": {"), "{text}");
+        assert!(text.contains("same MAC"), "{text}");
+        assert_eq!(from_str(&text).unwrap(), report);
+
+        // Saved before grouping existed: the groups are recomputed on load.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v.as_object_mut().unwrap().remove("devices");
+        for h in v["hosts"].as_array_mut().unwrap() {
+            h.as_object_mut().unwrap().remove("device_group");
+        }
+        assert_eq!(from_str(&v.to_string()).unwrap(), report);
+        // A file's own groups aren't trusted, even malformed ones.
+        v["hosts"][0]["device_group"] = serde_json::json!({"id": 9, "members": [], "reasons": []});
+        assert_eq!(from_str(&v.to_string()).unwrap(), report);
     }
 
     #[test]

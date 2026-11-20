@@ -557,6 +557,7 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
     let closed = Arc::new(AtomicU32::new(0));
     let filtered = Arc::new(AtomicU32::new(0));
     let mut probes = JoinSet::new();
+    let mut services = Vec::new();
     for &port in &shared.ports {
         // Wait for a free probe slot before spawning, so memory stays flat
         // no matter how many ports are queued.
@@ -607,11 +608,12 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                             None
                         }
                     };
-                    if let Some(service) = service
+                    if let Some(service) = &service
                         && let Some(vulns) = sh.vulns.as_ref()
                     {
-                        vulns.check(ip, protocol, port, &service, &sh.tx);
+                        vulns.check(ip, protocol, port, service, &sh.tx);
                     }
+                    return service.map(|s| (port, protocol, s));
                 }
                 PortState::Closed => {
                     sh.stats.closed.fetch_add(1, Ordering::Relaxed);
@@ -622,17 +624,35 @@ async fn scan_host(ip: IpAddr, hostname: Option<String>, shared: &Arc<Shared>) {
                     filtered.fetch_add(1, Ordering::Relaxed);
                 }
             }
+            None
         });
         while let Some(r) = probes.try_join_next() {
-            if let Err(e) = r {
-                note_join_error(e, &format!("{ip}"), shared);
+            match r {
+                Ok(found) => services.extend(found),
+                Err(e) => note_join_error(e, &format!("{ip}"), shared),
             }
         }
     }
     while let Some(r) = probes.join_next().await {
-        if let Err(e) = r {
-            note_join_error(e, &format!("{ip}"), shared);
+        match r {
+            Ok(found) => services.extend(found),
+            Err(e) => note_join_error(e, &format!("{ip}"), shared),
         }
+    }
+    // Some labels need the whole host: re-report the services it changed.
+    let vendor = mac.and_then(|m| rmap_oui::lookup(m).name());
+    for i in rmap_detect::host::refine(&mut services, vendor) {
+        let (port, protocol, service) = services[i].clone();
+        rmap_log::debug!(
+            "service {ip}:{port} relabelled from host context: {}",
+            service.name
+        );
+        let _ = shared.tx.send(ScanEvent::Service {
+            ip,
+            protocol,
+            port,
+            service,
+        });
     }
 
     if let Some(task) = naming

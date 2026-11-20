@@ -1,6 +1,6 @@
 //! Just enough DER to read names out of an X.509 certificate: the subject
 //! and issuer common names, the DNS and IP subject alternative names, and
-//! the expiry date. Every read is bounds-checked; malformed input gives
+//! the validity dates. Every read is bounds-checked; malformed input gives
 //! `None` or partial results, never a panic.
 
 const SEQUENCE: u8 = 0x30;
@@ -71,18 +71,10 @@ fn expect(input: &[u8], tag: u8) -> Option<(Tlv<'_>, &[u8])> {
     (tlv.tag == tag).then_some((tlv, rest))
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CertNames {
-    pub subject_cn: Option<String>,
-    pub issuer_cn: Option<String>,
-    pub sans: Vec<String>,
-    /// `YYYY-MM-DD`.
-    pub not_after: Option<String>,
-    pub self_signed: bool,
-}
+use rmap_core::CertInfo;
 
-/// Pull names out of a DER-encoded certificate.
-pub fn certificate(der: &[u8]) -> Option<CertNames> {
+/// Pull names and dates out of a DER-encoded certificate.
+pub fn certificate(der: &[u8]) -> Option<CertInfo> {
     let (cert, _) = expect(der, SEQUENCE)?;
     let (tbs, _) = expect(cert.content, SEQUENCE)?;
     let mut rest = tbs.content;
@@ -96,11 +88,13 @@ pub fn certificate(der: &[u8]) -> Option<CertNames> {
     let (_sig_alg, rest) = expect(rest, SEQUENCE)?;
     let (issuer, rest) = expect(rest, SEQUENCE)?;
     let (validity, rest) = expect(rest, SEQUENCE)?;
-    let mut names = CertNames {
+    let mut names = CertInfo {
         issuer_cn: common_name(issuer.content),
         ..Default::default()
     };
-    names.not_after = children(validity.content).nth(1).and_then(time);
+    let mut dates = children(validity.content);
+    names.not_before = dates.next().and_then(time);
+    names.not_after = dates.next().and_then(time);
     let Some((subject, rest)) = expect(rest, SEQUENCE) else {
         return Some(names);
     };
@@ -190,8 +184,16 @@ fn time(t: Tlv<'_>) -> Option<String> {
         GENERALIZED_TIME if s.len() >= 8 => (s.get(..4)?.parse().ok()?, s.get(4..)?),
         _ => return None,
     };
-    let month: u32 = rest.get(..2)?.parse().ok()?;
-    let day: u32 = rest.get(2..4)?.parse().ok()?;
+    let digits = |r: std::ops::Range<usize>| -> Option<u32> {
+        let d = rest.get(r)?;
+        d.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| d.parse().ok())?
+    };
+    let (month, day) = (digits(0..2)?, digits(2..4)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
     Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
@@ -265,6 +267,7 @@ pub(crate) mod tests {
         assert_eq!(n.subject_cn.as_deref(), Some("www.example.test"));
         assert_eq!(n.issuer_cn.as_deref(), Some("Example CA"));
         assert_eq!(n.sans, ["www.example.test", "10.0.0.1", "::1"]);
+        assert_eq!(n.not_before.as_deref(), Some("2024-01-01"));
         assert_eq!(n.not_after.as_deref(), Some("2035-06-30"));
         assert!(!n.self_signed);
         assert!(certificate(&fake_cert("a", "a", &[])).unwrap().self_signed);

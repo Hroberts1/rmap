@@ -208,7 +208,14 @@ impl ReportBuilder {
     pub fn report(&self) -> ScanReport {
         let mut report = self.report.clone();
         report.hosts = self.hosts.values().cloned().collect();
+        crate::tags::tag_hosts(&mut report.hosts);
+        crate::devices::assign(&mut report);
         report
+    }
+
+    /// Device groups of the hosts so far; see [`crate::devices`].
+    pub fn device_groups(&self) -> BTreeMap<IpAddr, crate::devices::DeviceGroup> {
+        crate::devices::device_groups(self.hosts.values())
     }
 }
 

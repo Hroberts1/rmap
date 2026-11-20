@@ -214,7 +214,7 @@ impl ScanView {
             .map(|(ip, _)| *ip)
             .collect();
         crate::filter::sort(&mut ips, &self.hosts, self.sort);
-        ips
+        crate::devices::order(ips, &self.report.device_groups())
     }
 
     /// After the filter or sort changes: keep the selected host if it is
@@ -1360,7 +1360,8 @@ mod tests {
             }
         });
         let screen = render(&mut app, 120, 30);
-        assert!(screen.contains("likely a firewall or IPS"), "{screen}");
+        assert!(screen.contains("likely honeypot or tarpit"), "{screen}");
+        assert!(screen.contains("5 ports accept connections"), "{screen}");
         assert!(screen.contains("smb?"), "{screen}");
     }
 

@@ -1,8 +1,9 @@
 //! Results-screen tabs: `1` Hosts (the per-host view in ui.rs), `2` Services
 //! (open ports grouped across hosts: "which hosts have 445 open?") and `3`
 //! Vulns (every finding in the scan, grouped by product and version,
-//! worst first). Rows are rebuilt from
-//! `ScanView::hosts` each frame, so both tabs fill in live.
+//! worst first) and `4` Findings (exposure findings such as Telnet or an
+//! expired certificate; see `rmap_report::exposure`). Rows are rebuilt from
+//! `ScanView::hosts` (and the report) each frame, so the tabs fill in live.
 //!
 //! shortcut: rebuilding every frame is O(open ports), fine for the /24-sized
 //! scans this targets; cache the rows on event arrival if a /16 with many
@@ -19,8 +20,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use rmap_core::{PortResult, Protocol, VulnCheck, VulnTier, Vulnerability, service_name};
 
+use rmap_report::exposure::{Finding as Exposure, Severity};
+
 use crate::app::{HostRow, ScanView};
-use crate::ui::{ACCENT, STACK_BELOW, centered, ellipsize, highlight, pane_block, vuln_text};
+use crate::devices::Groups;
+use crate::ui::{ACCENT, STACK_BELOW, centered, ellipsize, highlight, pane_block, vuln_text, wrap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
@@ -28,10 +32,12 @@ pub enum Tab {
     Hosts,
     Services,
     Vulns,
+    Findings,
 }
 
 type GroupKey = (u16, Protocol, String);
 type FindingKey = (IpAddr, u16, Protocol, String);
+type ExposureKey = (IpAddr, Option<u16>, &'static str);
 
 /// A Vulns-tab row: a product group (by its key) or one finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +61,8 @@ pub struct Tabs {
     finding_offset: usize,
     /// Vulns groups the user opened or closed, against their default.
     toggled: HashSet<String>,
+    exposure: Option<ExposureKey>,
+    exposure_offset: usize,
 }
 
 /// One port/protocol and service name, with every host that has it open.
@@ -74,6 +82,8 @@ impl ServiceGroup<'_> {
 
 pub struct Finding<'a> {
     pub ip: IpAddr,
+    /// Every address of the device this finding is on, `ip` first.
+    pub ips: Vec<IpAddr>,
     pub port: &'a PortResult,
     pub vuln: &'a Vulnerability,
     pub tier: VulnTier,
@@ -118,7 +128,8 @@ pub struct VulnGroup<'a> {
     pub label: String,
     /// Set when the ports are distro builds (`CheckedUpstreamOnly`).
     pub distro: Option<&'a str>,
-    /// Counted tiers first, then worst first (see [`worse_first`]).
+    /// Counted per device; counted tiers first, then worst first (see
+    /// [`worse_first`]).
     pub findings: Vec<Finding<'a>>,
 }
 
@@ -140,7 +151,7 @@ impl VulnGroup<'_> {
         self.count(VulnTier::Potential) > 0
     }
 
-    /// See [`rmap_report::group_line`].
+    /// See [`rmap_report::group_line`]. Ports count once per device.
     pub fn summary(&self) -> String {
         let ports: HashSet<_> = self
             .findings
@@ -169,49 +180,68 @@ fn worse_first(a: &Finding, b: &Finding) -> std::cmp::Ordering {
         .then(score(b).total_cmp(&score(a)))
 }
 
-/// Every match in the scan, grouped by product and version, worst group
-/// first (by its worst finding). Ties keep address and port order.
-pub fn vuln_groups(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<VulnGroup<'_>> {
-    let mut groups: Vec<VulnGroup> = Vec::new();
-    for (ip, h) in hosts {
-        for port in h.open.iter().filter(|p| !p.vulnerabilities.is_empty()) {
-            let label = port
-                .service
-                .as_ref()
-                .and_then(|s| s.version_label())
-                .unwrap_or_else(|| service_label(port));
-            let distro = match &port.vuln_check {
-                Some(VulnCheck::CheckedUpstreamOnly { distro, .. }) => Some(distro.as_str()),
-                _ => None,
-            };
-            let i = match groups
-                .iter()
-                .position(|g| g.label == label && g.distro == distro)
-            {
-                Some(i) => i,
-                None => {
-                    groups.push(VulnGroup {
-                        label,
-                        distro,
-                        findings: Vec::new(),
-                    });
-                    groups.len() - 1
-                }
-            };
-            groups[i]
-                .findings
-                .extend(port.vulnerabilities.iter().map(|vuln| Finding {
+/// Every match in the scan, worst first (see [`worse_first`]). Ties keep
+/// address and port order. The same CVE and product version on several
+/// addresses of one device is listed once.
+pub fn findings<'a>(hosts: &'a BTreeMap<IpAddr, HostRow>, groups: &Groups) -> Vec<Finding<'a>> {
+    let mut all: Vec<Finding> = hosts
+        .iter()
+        .flat_map(|(ip, h)| {
+            h.open.iter().flat_map(move |port| {
+                port.vulnerabilities.iter().map(move |vuln| Finding {
                     ip: *ip,
+                    ips: Vec::new(),
                     port,
                     vuln,
                     tier: port.vuln_tier(vuln),
-                }));
+                })
+            })
+        })
+        .collect();
+    all.sort_by(worse_first);
+    rmap_report::dedup_per_device(all, groups, |f| {
+        let version = f.port.service.as_ref().and_then(|s| s.version_label());
+        (
+            f.ip,
+            format!("{} {}", f.vuln.id, version.unwrap_or_default()),
+        )
+    })
+    .into_iter()
+    .map(|(f, ips)| Finding { ips, ..f })
+    .collect()
+}
+
+/// [`findings`] grouped by product and version, worst group first (by its
+/// worst finding).
+pub fn vuln_groups<'a>(
+    hosts: &'a BTreeMap<IpAddr, HostRow>,
+    devices: &Groups,
+) -> Vec<VulnGroup<'a>> {
+    let mut groups: Vec<VulnGroup> = Vec::new();
+    // Already worst first, so each group's first finding is its worst.
+    for f in findings(hosts, devices) {
+        let label = f
+            .port
+            .service
+            .as_ref()
+            .and_then(|s| s.version_label())
+            .unwrap_or_else(|| service_label(f.port));
+        let distro = match &f.port.vuln_check {
+            Some(VulnCheck::CheckedUpstreamOnly { distro, .. }) => Some(distro.as_str()),
+            _ => None,
+        };
+        match groups
+            .iter_mut()
+            .find(|g| g.label == label && g.distro == distro)
+        {
+            Some(g) => g.findings.push(f),
+            None => groups.push(VulnGroup {
+                label,
+                distro,
+                findings: vec![f],
+            }),
         }
     }
-    for g in &mut groups {
-        g.findings.sort_by(worse_first);
-    }
-    groups.sort_by(|a, b| worse_first(&a.findings[0], &b.findings[0]));
     groups
 }
 
@@ -265,6 +295,7 @@ pub fn on_key(view: &mut ScanView, code: KeyCode) -> bool {
         KeyCode::Char('1') => Some(Tab::Hosts),
         KeyCode::Char('2') => Some(Tab::Services),
         KeyCode::Char('3') => Some(Tab::Vulns),
+        KeyCode::Char('4') => Some(Tab::Findings),
         _ => None,
     };
     if let Some(tab) = tab {
@@ -316,7 +347,8 @@ pub fn on_key(view: &mut ScanView, code: KeyCode) -> bool {
         // One pane: there is nothing for Tab or ←→ to switch to.
         Tab::Vulns if pane_key => true,
         Tab::Vulns => {
-            let groups = vuln_groups(&view.hosts);
+            let devices = view.report.device_groups();
+            let groups = vuln_groups(&view.hosts, &devices);
             let rows = vuln_rows(&groups, &tabs.toggled);
             if matches!(code, KeyCode::Enter | KeyCode::Char(' ')) {
                 // Open or close the selected row's group, and select it.
@@ -342,7 +374,27 @@ pub fn on_key(view: &mut ScanView, code: KeyCode) -> bool {
             tabs.finding = step(&keys, tabs.finding.as_ref(), delta);
             true
         }
+        Tab::Findings if pane_key => true,
+        Tab::Findings => {
+            let Some(delta) = nav_delta(code) else {
+                return false;
+            };
+            let keys: Vec<ExposureKey> = exposures(view).iter().map(exposure_key).collect();
+            view.tabs.exposure = step(&keys, view.tabs.exposure.as_ref(), delta);
+            true
+        }
     }
+}
+
+/// Exposure findings for the scan so far, worst first.
+// shortcut: recomputed from a report snapshot each frame, like the other
+// tabs; cache on event arrival if large scans make this slow.
+fn exposures(view: &ScanView) -> Vec<Exposure> {
+    rmap_report::exposure::findings(&view.report.report())
+}
+
+fn exposure_key(f: &Exposure) -> ExposureKey {
+    (f.ip, f.port, f.id)
 }
 
 fn nav_delta(code: KeyCode) -> Option<isize> {
@@ -387,6 +439,7 @@ pub fn draw_strip(frame: &mut Frame, area: Rect, view: &ScanView) {
         (Tab::Hosts, "1 Hosts"),
         (Tab::Services, "2 Services"),
         (Tab::Vulns, "3 Vulns"),
+        (Tab::Findings, "4 Findings"),
     ] {
         spans.push(if view.tabs.tab == tab {
             Span::raw(format!("[{label}]")).bold().fg(ACCENT)
@@ -405,8 +458,101 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &mut ScanView) -> bool {
         Tab::Hosts => return false,
         Tab::Services => draw_services(frame, area, view),
         Tab::Vulns => draw_vulns(frame, area, view),
+        Tab::Findings => draw_findings(frame, area, view),
     }
     true
+}
+
+/// Label and colour for an exposure severity, matching the CVE colours.
+fn exposure_style(s: Severity) -> (&'static str, Color) {
+    match s {
+        Severity::High => ("HIGH", Color::Red),
+        Severity::Medium => ("MED", Color::Yellow),
+        Severity::Low => ("LOW", Color::Gray),
+        Severity::Info => ("INFO", Color::DarkGray),
+    }
+}
+
+fn draw_findings(frame: &mut Frame, area: Rect, view: &mut ScanView) {
+    let all = exposures(view);
+    let running = view.is_running();
+    let tabs = &mut view.tabs;
+    if all.is_empty() {
+        frame.render_widget(pane_block(" exposure findings ", true), area);
+        empty_message(
+            frame,
+            area,
+            if running {
+                "no exposure findings yet"
+            } else {
+                "no exposure findings"
+            },
+        );
+        return;
+    }
+    let sel = resolve(all.iter().map(exposure_key), tabs.exposure.as_ref());
+    tabs.exposure = Some(exposure_key(&all[sel]));
+
+    // Inside the borders, less the highlight-symbol column.
+    let inner = area.width.saturating_sub(3) as usize;
+    let places: Vec<String> = all.iter().map(Exposure::place).collect();
+    let place_w = places
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(inner / 3)
+        .max(8);
+    let text_w = inner.saturating_sub(place_w + 1);
+    let rows = all.iter().zip(&places).map(|(f, place)| {
+        let (label, color) = exposure_style(f.severity);
+        let head = format!("{label:<4}  ");
+        let indent = " ".repeat(head.len());
+        let mut lines: Vec<Line> = wrap(&f.title, text_w.saturating_sub(head.len()), 0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let lead = if i == 0 {
+                    Span::raw(head.clone()).fg(color).bold()
+                } else {
+                    Span::raw(indent.clone())
+                };
+                Line::from(vec![lead, Span::raw(t).fg(color)])
+            })
+            .collect();
+        for t in wrap(&f.detail, text_w.saturating_sub(head.len()), 0) {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::raw(t).dim(),
+            ]));
+        }
+        let height = lines.len() as u16;
+        Row::new([
+            Cell::from(ellipsize(place, place_w)),
+            Cell::from(Text::from(lines)),
+        ])
+        .height(height)
+    });
+    let title = format!(
+        " exposure findings · {} of {} · worst first ",
+        sel + 1,
+        all.len()
+    );
+    let table = Table::new(
+        rows,
+        [Constraint::Length(place_w as u16), Constraint::Fill(1)],
+    )
+    .block(pane_block(
+        ellipsize(&title, area.width.saturating_sub(2) as usize),
+        true,
+    ))
+    .row_highlight_style(highlight(true))
+    .highlight_symbol("▌");
+    let mut state = TableState::default()
+        .with_offset(tabs.exposure_offset)
+        .with_selected(Some(sel));
+    frame.render_stateful_widget(table, area, &mut state);
+    tabs.exposure_offset = state.offset();
 }
 
 fn empty_message(frame: &mut Frame, area: Rect, msg: &str) {
@@ -539,13 +685,14 @@ fn draw_services(frame: &mut Frame, area: Rect, view: &mut ScanView) {
 
 fn draw_vulns(frame: &mut Frame, area: Rect, view: &mut ScanView) {
     let running = view.is_running();
+    let devices = view.report.device_groups();
     let [top, area] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     frame.render_widget(
         Paragraph::new(format!(" {}", crate::vuln_status::coverage(view))).dim(),
         top,
     );
     let ScanView { hosts, tabs, .. } = view;
-    let groups = vuln_groups(hosts);
+    let groups = vuln_groups(hosts, &devices);
     let all = vuln_rows(&groups, &tabs.toggled);
     if all.is_empty() {
         frame.render_widget(pane_block(" potential CVEs ", true), area);
@@ -604,12 +751,19 @@ fn draw_vulns(frame: &mut Frame, area: Rect, view: &mut ScanView) {
             Some(s) => s.version_label().unwrap_or_else(|| s.display_name()),
             None => service_label(f.port),
         };
-        let left = Text::from(vec![
+        let mut left = vec![
             Line::from(ellipsize(place, place_w)),
             Line::from(ellipsize(&product, place_w)).dim(),
-        ]);
+        ];
+        // The same device's other addresses with this finding.
+        left.extend(
+            f.ips[1..]
+                .iter()
+                .map(|ip| Line::from(ellipsize(&format!("+ {ip}"), place_w)).dim()),
+        );
         let right = vuln_text(f.vuln, text_w);
-        let height = right.lines.len().max(2) as u16;
+        let height = right.lines.len().max(left.len()) as u16;
+        let left = Text::from(left);
         Row::new([Cell::from(left), Cell::from(right)]).height(height)
     });
     let title = format!(
@@ -777,7 +931,7 @@ mod tests {
     #[test]
     fn findings_are_grouped_by_product_worst_group_first() {
         let (_rt, mut app) = audit_scan();
-        let groups = vuln_groups(&view(&mut app).hosts);
+        let groups = vuln_groups(&view(&mut app).hosts, &Groups::new());
         let got: Vec<(&str, Vec<&str>)> = groups
             .iter()
             .map(|g| {
@@ -857,7 +1011,7 @@ mod tests {
                 distro: "Ubuntu".into(),
             },
         });
-        let groups = vuln_groups(&v.hosts);
+        let groups = vuln_groups(&v.hosts, &Groups::new());
         let ssh = groups.last().unwrap();
         assert_eq!(
             ssh.summary(),
@@ -979,6 +1133,64 @@ mod tests {
         assert!(!view(&mut app).tabs.in_hosts);
     }
 
+    /// A Telnet printer and an expired certificate, fed through events so
+    /// the report the tab reads fills in as in a real scan.
+    fn exposure_scan() -> (tokio::runtime::Runtime, App) {
+        let (rt, mut app) = audit_scan();
+        let v = view(&mut app);
+        open(v, "10.0.0.30", 23, None);
+        open(v, "10.0.0.30", 9100, None);
+        open(v, "10.0.0.31", 443, None);
+        v.apply(ScanEvent::Service {
+            ip: "10.0.0.31".parse().unwrap(),
+            protocol: Protocol::Tcp,
+            port: 443,
+            service: Service {
+                name: "tls/http".into(),
+                method: rmap_core::DetectMethod::Probe,
+                cert: Some(rmap_core::CertInfo {
+                    subject_cn: Some("nas.example.test".into()),
+                    not_after: Some("2001-01-01".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        });
+        (rt, app)
+    }
+
+    #[test]
+    fn findings_tab_lists_exposures_worst_first() {
+        let (_rt, mut app) = exposure_scan();
+        press(&mut app, KeyCode::Char('4'));
+        for (w, h) in [(120, 32), (80, 24)] {
+            let screen = render(&mut app, w, h);
+            for needle in [
+                "[4 Findings]",
+                "10.0.0.30:23/tcp",
+                "Telnet (plaintext remote login)",
+                "10.0.0.31:443/tcp",
+                "Expired TLS certificate",
+                "10.0.0.9:3389/tcp",
+                "1 of 3",
+            ] {
+                assert!(screen.contains(needle), "{needle} at {w}x{h}:\n{screen}");
+            }
+            let high = screen.find("HIGH").expect("HIGH label");
+            let med = screen.find("MED").expect("MED label");
+            assert!(high < med, "worst first:\n{screen}");
+            if std::env::var_os("RMAP_SHOW_RENDER").is_some() {
+                println!("{screen}");
+            }
+        }
+        press(&mut app, KeyCode::End);
+        assert!(render(&mut app, 80, 24).contains("3 of 3"));
+        // Tiny terminals don't panic.
+        for (w, h) in [(40, 12), (20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+    }
+
     #[test]
     fn hosts_tab_keys_still_work_and_empty_tabs_do_not_panic() {
         let (_rt, mut app) = audit_scan();
@@ -988,15 +1200,22 @@ mod tests {
         assert_eq!(view(&mut app).focus, crate::app::Pane::Ports);
         assert!(render(&mut app, 80, 24).contains("[1 Hosts]"));
 
-        view(&mut app).hosts.clear();
-        for (tab, msg) in [('2', "no open ports"), ('3', "no potential CVEs")] {
+        let v = view(&mut app);
+        v.hosts.clear();
+        // The Findings tab reads the report, so empty that too.
+        v.report = rmap_report::ReportBuilder::new(v.report.report().config, 0);
+        for (tab, msg) in [
+            ('2', "no open ports"),
+            ('3', "no potential CVEs"),
+            ('4', "no exposure findings"),
+        ] {
             press(&mut app, KeyCode::Char(tab));
             press(&mut app, KeyCode::Down);
             let screen = render(&mut app, 100, 24);
             assert!(screen.contains(msg), "{screen}");
         }
         let (_rt, mut app) = audit_scan();
-        for tab in ['2', '3'] {
+        for tab in ['2', '3', '4'] {
             press(&mut app, KeyCode::Char(tab));
             for (w, h) in [(40, 12), (20, 6), (1, 1)] {
                 render(&mut app, w, h);

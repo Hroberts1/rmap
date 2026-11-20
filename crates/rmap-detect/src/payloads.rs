@@ -9,6 +9,7 @@ pub fn build(b: Builtin) -> Vec<u8> {
         Builtin::SmbNegotiate => smb_negotiate(),
         Builtin::MongoBuildInfo => mongodb_buildinfo(),
         Builtin::DnsVersionBind => udp::dns_version_bind(),
+        Builtin::DnsVersionBindTcp => udp::dns_over_tcp(&udp::dns_version_bind()),
         Builtin::MdnsServices => udp::mdns_services(),
         Builtin::NtpReadvar => udp::ntp_readvar(),
         Builtin::NtpClient => udp::ntp_client(),
@@ -55,6 +56,16 @@ fn extension(out: &mut Vec<u8>, kind: u16, body: &[u8]) {
 /// encrypts the certificate, and reading it is the point. No SNI is sent
 /// because the target is an address.
 pub fn tls_client_hello(random: &[u8; 32]) -> Vec<u8> {
+    client_hello(random, 0x03)
+}
+
+/// The same ClientHello offering TLS 1.0, for servers that refused 1.2.
+pub fn tls10_client_hello() -> Vec<u8> {
+    client_hello(&random32(), 0x01)
+}
+
+/// `minor` is the TLS 1.x version byte: 0x01 for 1.0, 0x03 for 1.2.
+fn client_hello(random: &[u8; 32], minor: u8) -> Vec<u8> {
     const SUITES: &[u16] = &[
         0xc02f, 0xc030, 0xc02b, 0xc02c, 0xcca8, 0xcca9, 0xc013, 0xc014, 0xc009, 0xc00a, 0x009c,
         0x009d, 0x002f, 0x0035, 0x000a, 0x00ff,
@@ -79,7 +90,7 @@ pub fn tls_client_hello(random: &[u8; 32]) -> Vec<u8> {
     // extended_master_secret
     extension(&mut exts, 0x0017, &[]);
 
-    let mut hello = vec![0x03, 0x03];
+    let mut hello = vec![0x03, minor];
     hello.extend_from_slice(random);
     hello.push(0); // empty session id
     hello.extend_from_slice(&u16be(SUITES.len() * 2));
@@ -168,6 +179,7 @@ mod tests {
         assert_eq!(hs_len, r.len() - 9);
         assert_eq!(&r[9..11], &[0x03, 0x03]);
         assert_eq!(&r[11..43], &[7; 32]);
+        assert_eq!(&tls10_client_hello()[9..11], &[0x03, 0x01]);
         // Extensions block length matches what's left.
         let suites = u16::from_be_bytes([r[44], r[45]]) as usize;
         let ext_at = 46 + suites + 2;

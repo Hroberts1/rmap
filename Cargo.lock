@@ -1271,6 +1271,7 @@ dependencies = [
  "rmap-detect",
  "rmap-log",
  "rmap-names",
+ "rmap-oui",
  "rmap-packet",
  "rmap-vuln",
  "tokio",

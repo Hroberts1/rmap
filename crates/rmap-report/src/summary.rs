@@ -83,22 +83,23 @@ pub struct Group<'a> {
     pub label: String,
     /// Set when the ports are distro builds (`CheckedUpstreamOnly`).
     pub distro: Option<&'a str>,
-    /// Counted tiers first, then worst first.
-    pub findings: Vec<Finding<'a>>,
+    /// Counted per device (see [`device_findings`]), with every address
+    /// each was seen on; counted tiers first, then worst first.
+    pub findings: Vec<(Finding<'a>, Vec<IpAddr>)>,
 }
 
 impl<'a> Group<'a> {
-    /// See [`group_line`].
+    /// See [`group_line`]. Ports are counted once per device.
     pub fn line(&self) -> String {
         let ports: std::collections::HashSet<_> = self
             .findings
             .iter()
-            .map(|f| (f.ip, f.port, f.protocol))
+            .map(|(f, ips)| (ips.first().copied().unwrap_or(f.ip), f.port, f.protocol))
             .collect();
         group_line(
             &self.label,
             self.distro,
-            self.findings.iter().map(|f| f.tier),
+            self.findings.iter().map(|(f, _)| f.tier),
             ports.len(),
         )
     }
@@ -108,47 +109,46 @@ impl<'a> Group<'a> {
         let mut seen = std::collections::HashSet::new();
         self.findings
             .iter()
+            .map(|(f, _)| f)
             .filter(|f| f.tier == tier && seen.insert(f.vuln.id.as_str()))
             .collect()
     }
 }
 
-/// Every match in the report grouped by product and version, worst group
-/// first.
+/// Every match in the report grouped by product and version, counted per
+/// device, worst group first.
 pub fn groups(r: &ScanReport) -> Vec<Group<'_>> {
     let mut groups: Vec<Group> = Vec::new();
-    for h in &r.hosts {
-        for p in h.ports.iter().filter(|p| !p.vulnerabilities.is_empty()) {
-            let label = p
-                .service
-                .as_ref()
-                .and_then(Service::version_label)
-                .unwrap_or_else(|| service_name(p));
-            let distro = match &p.vuln_check {
-                Some(VulnCheck::CheckedUpstreamOnly { distro, .. }) => Some(distro.as_str()),
-                _ => None,
-            };
-            let i = match groups
+    // Already worst first, so each group's first finding is its worst.
+    for (f, ips) in device_findings(r) {
+        let Some(p) = r.host(f.ip).and_then(|h| {
+            h.ports
                 .iter()
-                .position(|g| g.label == label && g.distro == distro)
-            {
-                Some(i) => i,
-                None => {
-                    groups.push(Group {
-                        label,
-                        distro,
-                        findings: Vec::new(),
-                    });
-                    groups.len() - 1
-                }
-            };
-            groups[i].findings.extend(port_findings(h.ip, p));
+                .find(|p| (p.port, p.protocol) == (f.port, f.protocol))
+        }) else {
+            continue;
+        };
+        let label = p
+            .service
+            .as_ref()
+            .and_then(Service::version_label)
+            .unwrap_or_else(|| service_name(p));
+        let distro = match &p.vuln_check {
+            Some(VulnCheck::CheckedUpstreamOnly { distro, .. }) => Some(distro.as_str()),
+            _ => None,
+        };
+        match groups
+            .iter_mut()
+            .find(|g| g.label == label && g.distro == distro)
+        {
+            Some(g) => g.findings.push((f, ips)),
+            None => groups.push(Group {
+                label,
+                distro,
+                findings: vec![(f, ips)],
+            }),
         }
     }
-    for g in &mut groups {
-        g.findings.sort_by(worse_first);
-    }
-    groups.sort_by(|a, b| worse_first(&a.findings[0], &b.findings[0]));
     groups
 }
 
@@ -190,8 +190,8 @@ pub fn group_line(
 /// `3 conditional, 9 client-only`: matches left out of the counts, or
 /// `None` when there are none.
 pub fn not_counted_line(r: &ScanReport) -> Option<String> {
-    let all = findings(r);
-    let n = |tier| all.iter().filter(|f| f.tier == tier).count();
+    let all = device_findings(r);
+    let n = |tier| all.iter().filter(|(f, _)| f.tier == tier).count();
     let parts: Vec<String> = [
         (n(VulnTier::Conditional), "conditional"),
         (n(VulnTier::ClientOnly), "client-only"),
@@ -203,10 +203,38 @@ pub fn not_counted_line(r: &ScanReport) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-/// Counted findings per severity, in [`SEVERITIES`] order.
+/// [`findings`] counted per device: the same CVE on the same product
+/// version at several addresses of one device is listed once, with every
+/// address it was seen on.
+pub fn device_findings(r: &ScanReport) -> Vec<(Finding<'_>, Vec<IpAddr>)> {
+    let groups = crate::devices::device_groups(&r.hosts);
+    crate::devices::dedup_per_device(findings(r), &groups, |f| {
+        let version = r
+            .host(f.ip)
+            .and_then(|h| {
+                h.ports
+                    .iter()
+                    .find(|p| (p.port, p.protocol) == (f.port, f.protocol))
+            })
+            .map(version_text)
+            .unwrap_or_default();
+        (f.ip, format!("{} {version}", f.vuln.id))
+    })
+}
+
+/// `10.0.0.20, 10.0.0.88`.
+pub fn ip_list(ips: &[IpAddr]) -> String {
+    ips.iter()
+        .map(IpAddr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Counted findings per severity, in [`SEVERITIES`] order, counted per
+/// device.
 pub fn severity_counts(r: &ScanReport) -> [usize; 4] {
     let mut counts = [0; 4];
-    for f in findings(r).iter().filter(|f| f.counted()) {
+    for (f, _) in device_findings(r).iter().filter(|(f, _)| f.counted()) {
         counts[SEVERITIES
             .iter()
             .position(|s| *s == f.vuln.severity)
@@ -330,11 +358,23 @@ pub fn service_name(p: &PortResult) -> String {
         .map_or_else(String::new, Service::display_name)
 }
 
-/// `10.0.0.2 (db.lan)`.
+/// `10.0.0.2 (db.lan)`, plus `, same device as 10.0.0.1` for a device's
+/// second and later addresses.
 pub fn host_label(h: &HostReport) -> String {
-    match &h.hostname {
+    let mut s = match &h.hostname {
         Some(name) => format!("{} ({name})", h.ip),
         None => h.ip.to_string(),
+    };
+    s.push_str(&same_device_note(h));
+    s
+}
+
+/// `, same device as 10.0.0.1` for a device's second and later addresses,
+/// else empty.
+pub fn same_device_note(h: &HostReport) -> String {
+    match h.device_group.as_ref().and_then(|g| g.members.first()) {
+        Some(first) if *first != h.ip => format!(", same device as {first}"),
+        _ => String::new(),
     }
 }
 
@@ -451,6 +491,47 @@ pub(crate) mod tests {
         data.built_at = HOSTILE.into();
         data.source = HOSTILE.into();
         r
+    }
+
+    /// The fixture's host again at a second address with the same MAC,
+    /// so its two findings are one device's.
+    pub(crate) fn two_homed() -> ScanReport {
+        let mut r = fixture();
+        r.hosts[0].mac = Some("00:11:32:aa:bb:cc".parse().unwrap());
+        let mut twin = r.hosts[0].clone();
+        twin.ip = "10.0.0.3".parse().unwrap();
+        r.hosts.push(twin);
+        crate::devices::assign(&mut r);
+        r
+    }
+
+    #[test]
+    fn findings_count_once_per_device() {
+        let r = two_homed();
+        assert_eq!(findings(&r).len(), 4);
+        let per = device_findings(&r);
+        assert_eq!(per.len(), 2);
+        assert_eq!(ip_list(&per[0].1), "10.0.0.2, 10.0.0.3");
+        assert_eq!(severity_line(&r), "2 (high 1, medium 1)");
+        assert_eq!(
+            host_label(&r.hosts[2]),
+            "10.0.0.3 (db.lan), same device as 10.0.0.2"
+        );
+
+        let md = crate::markdown::to_string(&r);
+        assert!(
+            md.contains("### OpenSSH 9.6p1: 2 potential · 1 port"),
+            "{md}"
+        );
+        assert!(md.contains(" on 10.0.0.2, 10.0.0.3 22/tcp:"), "{md}");
+        let html = crate::html::to_string(&r);
+        assert!(html.contains("<td>10.0.0.2, 10.0.0.3</td>"), "{html}");
+        assert!(html.contains("same device as 10.0.0.2"), "{html}");
+
+        // A different version on the twin is a separate finding.
+        let mut r = two_homed();
+        r.hosts[2].ports[0].service.as_mut().unwrap().version = Some("9.7p1".into());
+        assert_eq!(device_findings(&r).len(), 4);
     }
 
     #[test]
