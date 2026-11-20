@@ -71,6 +71,9 @@ match ftp ^220[ -]FileZilla Server(?: version)? ([\w.]+(?: beta)?)
   product  FileZilla ftpd
   version  $1
   os       Windows
+match ftp ^220[ -]ZBR-\d+ Version (\S+) ready\.
+  product  Zebra print server
+  version  $1
 match ftp ^220[ -]Microsoft FTP Service
   product  Microsoft ftpd
   os       Windows
@@ -374,6 +377,17 @@ probe generic-lines
   wait     3s
   generic
   fallback banner http-get rtsp-options sip-options
+
+# --------------------------------------------------------- dns-over-tcp ---
+# The UDP version.bind query with the two-byte length TCP adds. DNS over
+# TCP never speaks first, so without this 53/tcp would look silent. The
+# reply is decoded in code like the UDP one, then matched against the
+# dns-version rules.
+probe dns-version-tcp
+  send     @dns-version-bind-tcp
+  ports    53
+  wait     2s
+  fallback dns-version
 
 # =================================================================== UDP ===
 # A UDP probe sends one datagram and reads the first reply. Replies to the

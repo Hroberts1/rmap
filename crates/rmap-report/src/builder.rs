@@ -208,6 +208,7 @@ impl ReportBuilder {
     pub fn report(&self) -> ScanReport {
         let mut report = self.report.clone();
         report.hosts = self.hosts.values().cloned().collect();
+        crate::tags::tag_hosts(&mut report.hosts);
         report
     }
 }

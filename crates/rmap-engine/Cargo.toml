@@ -11,6 +11,7 @@ rmap-core = { workspace = true }
 rmap-detect = { workspace = true }
 rmap-log = { workspace = true }
 rmap-names = { workspace = true }
+rmap-oui = { workspace = true }
 rmap-packet = { workspace = true }
 rmap-vuln = { workspace = true }
 tokio = { workspace = true }

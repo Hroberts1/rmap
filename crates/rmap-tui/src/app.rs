@@ -1360,7 +1360,8 @@ mod tests {
             }
         });
         let screen = render(&mut app, 120, 30);
-        assert!(screen.contains("likely a firewall or IPS"), "{screen}");
+        assert!(screen.contains("likely honeypot or tarpit"), "{screen}");
+        assert!(screen.contains("5 ports accept connections"), "{screen}");
         assert!(screen.contains("smb?"), "{screen}");
     }
 

@@ -23,8 +23,10 @@ enum Behaviour {
     /// Read an HTTP request and send the reply of the first route whose
     /// needle is in it; close without a reply if none is.
     Routes(&'static [(&'static [u8], &'static [u8])]),
-    /// Wait for a TLS ClientHello and answer with this server flight.
-    Tls,
+    /// Wait for a TLS ClientHello and answer with a server flight whose
+    /// certificate has subject `cn`. A TLS 1.2 hello gets `alert
+    /// protocol_version` when `only_tls10` is set.
+    Tls { cn: &'static str, only_tls10: bool },
     /// Accept and never say anything.
     Silent,
     /// Accept and close at once without a word.
@@ -82,17 +84,19 @@ async fn handle(mut s: TcpStream, behaviour: Behaviour) {
                 let _ = s.write_all(reply).await;
             }
         }
-        Behaviour::Tls => {
+        Behaviour::Tls { cn, only_tls10 } => {
             let Ok(n) = s.read(&mut chunk).await else {
                 return;
             };
-            if n >= 6 && chunk[0] == 0x16 && chunk[5] == 0x01 {
-                let cert = crate::der::tests::fake_cert(
-                    "router.example.test",
-                    "Example Internal CA",
-                    &["router.example.test", "10.0.0.1"],
-                );
-                let _ = s.write_all(&crate::tls::tests::server_flight(&cert)).await;
+            if n >= 11 && chunk[0] == 0x16 && chunk[5] == 0x01 {
+                if only_tls10 && chunk[10] != 0x01 {
+                    let _ = s.write_all(b"\x15\x03\x01\x00\x02\x02\x46").await;
+                    return;
+                }
+                let mut flight = crate::tls::tests::server_flight(&test_cert(cn));
+                // Answer in the version offered: ServerHello's version byte.
+                flight[10] = chunk[10];
+                let _ = s.write_all(&flight).await;
                 let _ = tokio::time::timeout(Duration::from_secs(10), s.read(&mut chunk)).await;
             } else {
                 // Not TLS: what an HTTPS server says to plain HTTP.
@@ -104,6 +108,11 @@ async fn handle(mut s: TcpStream, behaviour: Behaviour) {
         }
         Behaviour::Close => drop(s),
     }
+}
+
+/// The certificate the fake TLS servers present.
+fn test_cert(cn: &str) -> Vec<u8> {
+    crate::der::tests::fake_cert(cn, "Example Internal CA", &[cn, "10.0.0.1"])
 }
 
 fn timing() -> Timing {
@@ -211,7 +220,11 @@ async fn redis_info() {
 
 #[tokio::test]
 async fn tls_certificate_names() {
-    let addr = serve(Behaviour::Tls).await;
+    let addr = serve(Behaviour::Tls {
+        cn: "router.example.test",
+        only_tls10: false,
+    })
+    .await;
     let s = detect_as(addr, 443).await;
     assert_eq!(s.name, "https");
     assert_eq!(
@@ -221,6 +234,105 @@ async fn tls_certificate_names() {
         )
     );
     assert_eq!(s.method, DetectMethod::Probe);
+    // Pinned so a change to the hashing or the DER slicing can't go unnoticed.
+    assert_eq!(
+        s.fingerprints,
+        ["tls-cert SHA256:b25fc749142504fe12d98a70f383017dfa256b3e64c69471b500f01650e90794"]
+    );
+    assert_eq!(
+        s.cert,
+        Some(rmap_core::CertInfo {
+            subject_cn: Some("router.example.test".into()),
+            sans: vec!["router.example.test".into(), "10.0.0.1".into()],
+            issuer_cn: Some("Example Internal CA".into()),
+            not_before: Some("2024-01-01".into()),
+            not_after: Some("2035-06-30".into()),
+            self_signed: false,
+        })
+    );
+}
+
+#[tokio::test]
+async fn tls10_only_server_is_retried_and_named() {
+    let addr = serve(Behaviour::Tls {
+        cn: "ap.example.test",
+        only_tls10: true,
+    })
+    .await;
+    let s = detect_as(addr, 8443).await;
+    let info = s.info.unwrap();
+    assert!(
+        info.starts_with("TLSv1.0; accepts TLS 1.0 only; CN=ap.example.test"),
+        "{info}"
+    );
+    assert_eq!(
+        s.cert.unwrap().subject_cn.as_deref(),
+        Some("ap.example.test")
+    );
+}
+
+#[tokio::test]
+async fn tls_on_the_ssh_port() {
+    let unifi = serve(Behaviour::Tls {
+        cn: "f09fc2a1b2c3U7PG2",
+        only_tls10: false,
+    })
+    .await;
+    let s = detect_as(unifi, 22).await;
+    assert_eq!(s.name, "tls");
+    let info = s.info.unwrap();
+    assert!(
+        info.starts_with("UniFi device inform/adoption (TLS on 22); TLSv1.2"),
+        "{info}"
+    );
+
+    let other = serve(Behaviour::Tls {
+        cn: "box.example.test",
+        only_tls10: false,
+    })
+    .await;
+    let s = detect_as(other, 22).await;
+    assert_eq!(s.name, "tls");
+    assert!(s.info.unwrap().starts_with("tls (not ssh); TLSv1.2"));
+}
+
+#[tokio::test]
+async fn dns_over_tcp_answers_version_bind() {
+    use crate::udp::tests::{dns_answer, txt};
+    let reply = dns_answer(&crate::udp::dns_version_bind(), 0, &[(16, txt("9.18.28"))]);
+    let reply: &'static [u8] = Box::leak(crate::udp::dns_over_tcp(&reply).into_boxed_slice());
+    let addr = serve(Behaviour::Reply {
+        needle: b"version",
+        reply,
+    })
+    .await;
+    let s = detect_as(addr, 53).await;
+    assert_eq!(
+        (s.name.as_str(), s.product.as_deref(), s.version.as_deref()),
+        ("dns", Some("ISC BIND"), Some("9.18.28"))
+    );
+    assert_eq!(s.method, DetectMethod::Probe);
+}
+
+#[tokio::test]
+async fn quiet_client_first_port_is_not_called_silent() {
+    let addr = serve(Behaviour::Silent).await;
+    let s = Detector::builtin()
+        .detect(addr, Protocol::Tcp, &Timing::template(5), 135)
+        .await
+        .unwrap();
+    assert_eq!((s.name.as_str(), s.confidence, s.info), ("msrpc", 3, None));
+}
+
+#[tokio::test]
+async fn telnet_negotiation_goes_in_info() {
+    let addr = serve(Behaviour::Banner(b"\xff\xfb\x01\xff\xfb\x03\r\nlogin: ")).await;
+    let s = detect_as(addr, 23).await;
+    assert_eq!(s.name, "telnet");
+    assert_eq!(
+        s.info.as_deref(),
+        Some("IAC: WILL ECHO, WILL SGA; prompt \"login:\"")
+    );
 }
 
 #[tokio::test]

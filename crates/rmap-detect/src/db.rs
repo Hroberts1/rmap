@@ -71,6 +71,8 @@ pub enum Builtin {
     // UDP requests (see [`crate::udp`]). All but SSDP have binary replies,
     // decoded in code; match rules then read any text the decoder found.
     DnsVersionBind,
+    /// `version.bind` over TCP: the DNS query with a 2-byte length prefix.
+    DnsVersionBindTcp,
     MdnsServices,
     NtpReadvar,
     NtpClient,
@@ -87,6 +89,7 @@ impl Builtin {
             "smb-negotiate" => Builtin::SmbNegotiate,
             "mongodb-buildinfo" => Builtin::MongoBuildInfo,
             "dns-version-bind" => Builtin::DnsVersionBind,
+            "dns-version-bind-tcp" => Builtin::DnsVersionBindTcp,
             "mdns-services" => Builtin::MdnsServices,
             "ntp-readvar" => Builtin::NtpReadvar,
             "ntp-client" => Builtin::NtpClient,
