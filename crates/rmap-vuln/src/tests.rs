@@ -39,6 +39,7 @@ fn m(vendor: &str, product: &str, min: Option<Bound>, max: Option<Bound>) -> Cpe
         product: product.into(),
         min,
         max,
+        condition: None,
     }
 }
 
@@ -62,6 +63,8 @@ fn entry(
             score: Some(score),
             published: Some(published.into()),
             kev_added: None,
+            condition: None,
+            client_only: false,
         },
         matches,
     }
@@ -304,6 +307,66 @@ fn kev_added_round_trips() {
 }
 
 #[test]
+fn conditions_and_client_scope_round_trip_and_unconditional_rows_win() {
+    let path = TempPath::new("tiers");
+    let mut cond = starter_set().remove(0);
+    cond.finding.id = "CVE-2026-0002".into();
+    cond.matches[0].condition = Some("musl-libc:musl".into());
+    let mut both = starter_set().remove(0);
+    both.finding.id = "CVE-2026-0001".into();
+    both.finding.client_only = true;
+    // A conditional and an unconditional rule for the same CVE.
+    let mut extra = both.matches[0].clone();
+    extra.condition = Some("x:y".into());
+    both.matches.insert(0, extra);
+    build(&path.0, &[cond, both]);
+    let db = Database::open(&path.0).unwrap();
+    let found = db.find("cpe:2.3:a:openbsd:openssh:9.6:*:*:*:*:*:*:*");
+    let got: Vec<_> = found
+        .iter()
+        .map(|f| (f.id.as_str(), f.condition.as_deref(), f.client_only))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("CVE-2026-0001", None, true),
+            ("CVE-2026-0002", Some("musl-libc:musl"), false)
+        ]
+    );
+}
+
+/// Handoff regression (d): a database file in the old (v1) format is
+/// reported as needing a rebuild, never read with missing columns.
+#[test]
+fn an_old_format_file_says_rebuild_needed() {
+    let path = TempPath::new("v1");
+    tamper(
+        &path.0,
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE cve (id TEXT PRIMARY KEY, summary TEXT NOT NULL, severity TEXT NOT NULL,
+           score REAL, published TEXT, kev_added TEXT);
+         CREATE TABLE cpe_match (cve_id TEXT NOT NULL REFERENCES cve(id),
+           vendor TEXT NOT NULL, product TEXT NOT NULL, version_exact TEXT,
+           start TEXT, start_incl INTEGER, end TEXT, end_incl INTEGER);
+         INSERT INTO meta VALUES ('schema_version', '1'), ('built_at', '2026-11-19T14:11:51Z');
+         INSERT INTO cve VALUES ('CVE-2026-0001', 'x', 'high', 8.1, NULL, '2026-01-01');
+         INSERT INTO cpe_match VALUES ('CVE-2026-0001', 'openbsd', 'openssh', NULL,
+           NULL, NULL, '10.6p2', 0);",
+    );
+    let err = Database::open(&path.0).err().unwrap();
+    assert_eq!(err, DbError::OldSchema(1));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("older format") && msg.contains("rebuild"),
+        "{msg}"
+    );
+    assert!(matches!(
+        Writer::open_existing(&path.0),
+        Err(DbError::Invalid(_))
+    ));
+}
+
+#[test]
 fn info_is_read_at_open() {
     let (_path, db) = starter_db();
     assert_eq!(
@@ -419,10 +482,10 @@ fn open_rejects_a_wrong_or_missing_schema_version() {
     build(&path.0, &starter_set());
     tamper(
         &path.0,
-        "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
+        "UPDATE meta SET value = '99' WHERE key = 'schema_version'",
     );
     match Database::open(&path.0) {
-        Err(DbError::Invalid(msg)) => assert!(msg.contains("schema version 2"), "{msg}"),
+        Err(DbError::Invalid(msg)) => assert!(msg.contains("schema version 99"), "{msg}"),
         other => panic!("{:?}", other.map(|_| ())),
     }
     tamper(&path.0, "DELETE FROM meta WHERE key = 'schema_version'");
@@ -445,14 +508,16 @@ fn hostile_rows_are_skipped_or_cleaned() {
     build(&path.0, &[]);
     tamper(
         &path.0,
-        "INSERT INTO cve VALUES ('CVE-1', 'evil' || char(27) || '[2J' || char(10) || 'x', 'high', 99, 'soon', '2024-01-01');
-         INSERT INTO cpe_match VALUES ('CVE-1', 'acme', 'widget', NULL, NULL, NULL, NULL, NULL);
-         INSERT INTO cve VALUES ('CVE-2', 'bad severity', 'apocalyptic', 5, NULL, NULL);
-         INSERT INTO cpe_match VALUES ('CVE-2', 'acme', 'widget', NULL, NULL, NULL, NULL, NULL);
-         INSERT INTO cve VALUES (X'00', 'blob id', 'low', 'nan', NULL, NULL);
-         INSERT INTO cpe_match VALUES (X'00', 'acme', 'widget', NULL, NULL, NULL, NULL, NULL);
-         INSERT INTO cve VALUES ('CVE-3', 'numeric version', 'low', NULL, NULL, NULL);
-         INSERT INTO cpe_match VALUES ('CVE-3', 'acme', 'widget', 42, NULL, NULL, NULL, NULL);",
+        "INSERT INTO cve VALUES ('CVE-1', 'evil' || char(27) || '[2J' || char(10) || 'x', 'high', 99, 'soon', '2024-01-01', 'yes');
+         INSERT INTO cpe_match VALUES ('CVE-1', 'acme', 'widget', NULL, NULL, NULL, NULL, NULL, 'on' || char(27) || '[2J');
+         INSERT INTO cve VALUES ('CVE-2', 'bad severity', 'apocalyptic', 5, NULL, NULL, 0);
+         INSERT INTO cpe_match VALUES ('CVE-2', 'acme', 'widget', NULL, NULL, NULL, NULL, NULL, NULL);
+         INSERT INTO cve VALUES (X'00', 'blob id', 'low', 'nan', NULL, NULL, 0);
+         INSERT INTO cpe_match VALUES (X'00', 'acme', 'widget', NULL, NULL, NULL, NULL, NULL, NULL);
+         INSERT INTO cve VALUES ('CVE-3', 'numeric version', 'low', NULL, NULL, NULL, 0);
+         INSERT INTO cpe_match VALUES ('CVE-3', 'acme', 'widget', 42, NULL, NULL, NULL, NULL, NULL);
+         INSERT INTO cve VALUES ('CVE-4', 'blob condition', 'low', NULL, NULL, NULL, 0);
+         INSERT INTO cpe_match VALUES ('CVE-4', 'acme', 'widget', NULL, NULL, NULL, NULL, NULL, X'00');",
     );
     let db = Database::open(&path.0).unwrap();
     let found = db.find("cpe:2.3:a:acme:widget:1.0:*:*:*:*:*:*:*");
@@ -463,6 +528,9 @@ fn hostile_rows_are_skipped_or_cleaned() {
     assert_eq!(f.score, None);
     assert_eq!(f.published, None);
     assert_eq!(f.kev_added.as_deref(), Some("2024-01-01"));
+    assert_eq!(f.condition.as_deref(), Some("on\u{FFFD}[2J"));
+    // A wrong type is not client-only (and doesn't drop the row).
+    assert!(!f.client_only);
 }
 
 #[test]

@@ -122,8 +122,9 @@ fn open(path: Option<PathBuf>) -> Result<Database, String> {
 
 /// Matches every checkable CPE the service carries, deduplicated by CVE id
 /// (more than one CPE, or more than one match rule, can name the same
-/// CVE), and one status for the port: `Checked` if any CPE could be looked
-/// up, else `VersionHidden`, else `NotCovered`.
+/// CVE), and one status for the port: `Checked` (`CheckedUpstreamOnly` for
+/// a distro build) if any CPE could be looked up, else `VersionHidden`,
+/// else `NotCovered`.
 ///
 /// A CPE with no version is not looked up at all: its `*` would fall
 /// inside every "before version X" range and match CVEs it can't be shown
@@ -184,13 +185,88 @@ fn lookup(db: &Database, service: &Service) -> (Vec<Vulnerability>, VulnCheck) {
         }
     }
     let mut status = match (best, &service.product) {
+        (
+            Some((
+                _,
+                VulnCheck::Checked {
+                    product, version, ..
+                },
+            )),
+            _,
+        ) if let Some(d) = distro(service) => VulnCheck::CheckedUpstreamOnly {
+            product,
+            version,
+            matches: 0,
+            distro: d.to_string(),
+        },
         (Some((_, status)), _) => status,
         // A named product rmap has no CPE for: no data to check it with.
         (None, Some(p)) => VulnCheck::NotCovered { product: p.clone() },
         (None, None) => VulnCheck::NoProduct,
     };
-    if let VulnCheck::Checked { matches, .. } = &mut status {
-        *matches = u32::try_from(findings.len()).unwrap_or(u32::MAX);
+    if let VulnCheck::Checked { matches, .. } | VulnCheck::CheckedUpstreamOnly { matches, .. } =
+        &mut status
+    {
+        // Conditional and client-only matches are reported but not counted.
+        let counted = findings
+            .iter()
+            .filter(|f| f.condition.is_none() && !f.client_only)
+            .count();
+        *matches = u32::try_from(counted).unwrap_or(u32::MAX);
     }
     (findings, status)
+}
+
+/// The distro a package tag in the version or banner info names
+/// (`Ubuntu-2ubuntu3.5`, `Debian-2+deb12u3`, `9.9p1-11.0.1.el10`,
+/// `FreeBSD-20240806`): its build may carry fixes the upstream version
+/// number doesn't show.
+fn distro(service: &Service) -> Option<&'static str> {
+    let el_tag = |t: &str| {
+        t.match_indices(".el")
+            .any(|(i, _)| t[i + 3..].starts_with(|c: char| c.is_ascii_digit()))
+    };
+    [&service.version, &service.info]
+        .into_iter()
+        .flatten()
+        .find_map(|t| {
+            if t.contains("Ubuntu-") {
+                Some("Ubuntu")
+            } else if t.contains("Debian-") || t.contains("+deb") {
+                Some("Debian")
+            } else if t.contains("FreeBSD-") {
+                Some("FreeBSD")
+            } else if el_tag(t) {
+                Some("Enterprise Linux")
+            } else {
+                None
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distro_package_tags() {
+        let svc = |version: &str, info: &str| Service {
+            name: "ssh".into(),
+            product: Some("OpenSSH".into()),
+            version: Some(version.into()),
+            info: Some(info.into()),
+            ..Service::default()
+        };
+        let cases = [
+            ("10.2p1", "protocol 2.0; Ubuntu-2ubuntu3.5", Some("Ubuntu")),
+            ("9.2p1", "protocol 2.0; Debian-2+deb12u3", Some("Debian")),
+            ("9.9p1-11.0.1.el10", "", Some("Enterprise Linux")),
+            ("9.7", "FreeBSD-20240806", Some("FreeBSD")),
+            ("9.9", "protocol 2.0", None),
+            ("9.9", "help.else", None),
+        ];
+        for (version, info, want) in cases {
+            assert_eq!(distro(&svc(version, info)), want, "{version} {info}");
+        }
+    }
 }

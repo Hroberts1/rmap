@@ -26,6 +26,7 @@ pub use model::{
     ConfigSummary, FORMAT_VERSION, HostReport, RunStatus, ScanReport, port_ranges, unix_millis_now,
 };
 pub use store::{SavedScan, ScanStore};
+pub use summary::group_line;
 
 /// Export formats the TUI offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

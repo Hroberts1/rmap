@@ -79,7 +79,11 @@ impl Database {
             return Err(db::invalid("missing tables"));
         }
         let version = db::meta(&conn, "schema_version").map_err(db::invalid)?;
-        if version.as_deref().and_then(|v| v.parse().ok()) != Some(SCHEMA_VERSION) {
+        let parsed: Option<u32> = version.as_deref().and_then(|v| v.parse().ok());
+        if let Some(old @ 1..SCHEMA_VERSION) = parsed {
+            return Err(DbError::OldSchema(old));
+        }
+        if parsed != Some(SCHEMA_VERSION) {
             let found = version.map_or("none".to_string(), |v| db::clean_meta(Some(v)));
             return Err(db::invalid(format!(
                 "schema version {found}, rmap reads {SCHEMA_VERSION}"

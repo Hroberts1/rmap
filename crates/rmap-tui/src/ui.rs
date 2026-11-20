@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Cell, Clear, LineGauge, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
-use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, Vulnerability};
+use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, VulnTier, Vulnerability};
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
 use crate::input::TextInput;
@@ -464,7 +464,7 @@ pub(crate) fn draw_header(frame: &mut Frame, area: Rect, view: &ScanView) {
         .hosts
         .values()
         .flat_map(|h| &h.open)
-        .map(|p| p.vulnerabilities.len())
+        .map(|p| p.counted_vulns().count())
         .sum();
     let mut spans = vec![
         Span::raw(format!(" {up} up")).fg(Color::Green).bold(),
@@ -605,7 +605,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut Hi
         } else {
             Span::raw("…").fg(ACCENT)
         }];
-        if h.open.iter().any(|p| !p.vulnerabilities.is_empty()) {
+        if h.open.iter().any(|p| p.counted_vulns().next().is_some()) {
             open.push(Span::raw(" !").fg(Color::Red).bold());
         }
         let name = crate::mac::host_name(h).unwrap_or_default();
@@ -819,12 +819,42 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
             rows.push(spanning_row(Text::from(lines), ncols));
         }
         // Actively exploited first; the sort is stable, so newest next.
-        let mut vulns: Vec<&Vulnerability> = p.vulnerabilities.iter().collect();
+        // A distro build's matches fold into its status line above, and
+        // conditional / client-only ones into one line: all are listed on
+        // the Vulns tab.
+        let mut vulns: Vec<&Vulnerability> = p
+            .vulnerabilities
+            .iter()
+            .filter(|v| p.vuln_tier(v) == VulnTier::Potential)
+            .collect();
         vulns.sort_by_key(|v| v.kev_added.is_none());
         for v in vulns {
             let text = vuln_text(v, span_w);
             heights.push(text.lines.len());
             rows.push(spanning_row(text, ncols));
+        }
+        let folded: Vec<String> = [
+            (VulnTier::Conditional, "conditional"),
+            (VulnTier::ClientOnly, "client-only"),
+        ]
+        .into_iter()
+        .filter_map(|(tier, name)| {
+            let n = p
+                .vulnerabilities
+                .iter()
+                .filter(|v| p.vuln_tier(v) == tier)
+                .count();
+            (n > 0).then(|| format!("{n} {name}"))
+        })
+        .collect();
+        if !folded.is_empty() {
+            let note = format!("{} not counted (see the Vulns tab)", folded.join(", "));
+            let lines: Vec<Line> = wrap(&note, span_w, 2)
+                .into_iter()
+                .map(|l| Line::from(l).dim())
+                .collect();
+            heights.push(lines.len());
+            rows.push(spanning_row(Text::from(lines), ncols));
         }
         groups.push((first, rows.len() - 1));
     }
@@ -944,11 +974,19 @@ pub(crate) fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
             Line::from(vec![lead, Span::raw(line).fg(color)])
         })
         .collect::<Vec<_>>();
-    if let Some(date) = v
-        .kev_added
-        .as_ref()
-        .filter(|_| crate::settings::highlight_exploited())
-    {
+    if let Some(condition) = &v.condition {
+        let note = format!("conditional: only with {condition} (not verified)");
+        for line in wrap(&note, width.saturating_sub(indent), 0) {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(indent)),
+                Span::raw(line).dim(),
+            ]));
+        }
+    }
+    // Never on a match whose platform or scope rmap couldn't confirm.
+    if let Some(date) = v.kev_added.as_ref().filter(|_| {
+        v.condition.is_none() && !v.client_only && crate::settings::highlight_exploited()
+    }) {
         let note = format!("actively exploited (CISA KEV, added {date})");
         for line in wrap(&note, width.saturating_sub(indent), 0) {
             lines.push(Line::from(vec![

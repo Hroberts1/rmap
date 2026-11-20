@@ -17,12 +17,15 @@ use crate::ParsedCpe;
 use crate::version::compare;
 use rmap_core::{VulnSeverity, Vulnerability};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
-/// Schema v1. `meta` keys: `schema_version`, `built_at` (RFC 3339 UTC),
+/// Schema v2 (v1 had no `cve.client_only` or `cpe_match.condition`, so
+/// it is refused as [`DbError::OldSchema`]). `meta` keys: `schema_version`, `built_at` (RFC 3339 UTC),
 /// `source` (free text) and `cve_count`; builders may add their own (the
 /// NVD builder records `nvd_last_modified` and `nvd_products`), which
-/// readers ignore. Versions are stored in the
+/// readers ignore. `condition` is the platform an NVD "running on / with"
+/// configuration also needs, as text; `client_only` is 1 for a CVE in
+/// client programs only. Versions are stored in the
 /// combined form `version.rs` compares (`9.7p1`); SQL only selects rows by
 /// vendor and product, and Rust decides range membership.
 pub const SCHEMA_SQL: &str = "
@@ -30,13 +33,14 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE cve (
   id TEXT PRIMARY KEY, summary TEXT NOT NULL, severity TEXT NOT NULL,
   score REAL, published TEXT,
-  kev_added TEXT
+  kev_added TEXT, client_only INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE cpe_match (
   cve_id TEXT NOT NULL REFERENCES cve(id),
   vendor TEXT NOT NULL, product TEXT NOT NULL,
   version_exact TEXT,
-  start TEXT, start_incl INTEGER, end TEXT, end_incl INTEGER
+  start TEXT, start_incl INTEGER, end TEXT, end_incl INTEGER,
+  condition TEXT
 );
 CREATE INDEX cpe_match_product ON cpe_match (vendor, product);
 ";
@@ -44,6 +48,7 @@ CREATE INDEX cpe_match_product ON cpe_match (vendor, product);
 /// Longest CVE id and summary kept from the file, in characters.
 const MAX_ID: usize = 64;
 const MAX_SUMMARY: usize = 4000;
+const MAX_CONDITION: usize = 300;
 /// Longest `built_at` / `source` meta value kept, in characters.
 const MAX_META: usize = 200;
 
@@ -53,6 +58,9 @@ pub enum DbError {
     NotFound,
     /// [`Writer::create`] won't overwrite an existing file.
     AlreadyExists,
+    /// A file in an older format (this schema version): rebuild it or
+    /// download a new copy.
+    OldSchema(u32),
     /// A file rmap can't use: not SQLite, corrupt, missing tables, or a
     /// different schema version.
     Invalid(String),
@@ -65,6 +73,11 @@ impl fmt::Display for DbError {
         match self {
             DbError::NotFound => write!(f, "file not found"),
             DbError::AlreadyExists => write!(f, "file already exists"),
+            DbError::OldSchema(v) => write!(
+                f,
+                "in an older format (v{v}, this rmap reads v{SCHEMA_VERSION}): rebuild it or \
+                 download a new copy in Settings"
+            ),
             DbError::Invalid(m) => write!(f, "not a usable vulnerability database: {m}"),
             DbError::Write(m) => write!(f, "could not write the vulnerability database: {m}"),
         }
@@ -106,6 +119,8 @@ pub struct CpeMatch {
     pub product: String,
     pub min: Option<Bound>,
     pub max: Option<Bound>,
+    /// Platform this match also needs (see `Vulnerability::condition`).
+    pub condition: Option<String>,
 }
 
 impl CpeMatch {
@@ -169,7 +184,8 @@ fn is_date(v: &str) -> bool {
 /// Columns, in order, that [`read_row`] expects.
 const FIND_SQL: &str = "
 SELECT c.id, c.summary, c.severity, c.score, c.published, c.kev_added,
-       m.version_exact, m.start, m.start_incl, m.end, m.end_incl
+       m.version_exact, m.start, m.start_incl, m.end, m.end_incl,
+       m.condition, c.client_only
 FROM cpe_match m JOIN cve c ON c.id = m.cve_id
 WHERE m.vendor = ?1 AND m.product = ?2";
 
@@ -212,6 +228,11 @@ fn read_row(row: &Row) -> Option<(Vulnerability, CpeMatch)> {
             .map(|s| s as f32),
         published: col(4).flatten().filter(|d| is_date(d)),
         kev_added: col(5).flatten().filter(|d| is_date(d)),
+        condition: col(11)?
+            .map(|c| clean(&c, MAX_CONDITION))
+            .filter(|c| !c.trim().is_empty()),
+        // Anything but 0 is client-only; a wrong type is not.
+        client_only: row.get::<_, i64>(12).is_ok_and(|v| v != 0),
     };
     // Vendor and product are left empty: the query already matched them.
     let range = CpeMatch {
@@ -219,6 +240,7 @@ fn read_row(row: &Row) -> Option<(Vulnerability, CpeMatch)> {
         product: String::new(),
         min,
         max,
+        condition: None,
     };
     Some((finding, range))
 }
@@ -241,8 +263,12 @@ pub(crate) fn find(conn: &Connection, cpe: &ParsedCpe) -> rusqlite::Result<Vec<V
         .map(|(finding, _)| finding)
         .collect();
     // Sort-and-dedup rather than a linear search per row: a product can
-    // have thousands of rows.
-    found.sort_by(|a, b| a.id.cmp(&b.id));
+    // have thousands of rows. An unconditional row for a CVE wins over a
+    // conditional one.
+    found.sort_by(|a, b| {
+        a.id.cmp(&b.id)
+            .then(a.condition.is_some().cmp(&b.condition.is_some()))
+    });
     found.dedup_by(|a, b| a.id == b.id);
     found.sort_by(|a, b| b.published.cmp(&a.published).then(a.id.cmp(&b.id)));
     Ok(found)
@@ -273,7 +299,7 @@ impl Writer {
         Ok(Writer { conn })
     }
 
-    /// Opens an existing schema-v1 file for changes, for refreshing a copy
+    /// Opens an existing current-schema file for changes, for refreshing a copy
     /// in place. The file may have been downloaded, so anything besides
     /// rmap's own tables and index (a trigger or view that would run on
     /// our writes) makes it [`DbError::Invalid`].
@@ -352,8 +378,9 @@ impl Writer {
         let f = &entry.finding;
         self.conn
             .prepare_cached(
-                "INSERT INTO cve (id, summary, severity, score, published, kev_added)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO cve (id, summary, severity, score, published, kev_added,
+                                  client_only)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .and_then(|mut s| {
                 s.execute(params![
@@ -362,7 +389,8 @@ impl Writer {
                     f.severity.as_str(),
                     f.score.map(f64::from),
                     f.published,
-                    f.kev_added
+                    f.kev_added,
+                    f.client_only
                 ])
             })
             .map_err(write_err)?;
@@ -383,8 +411,8 @@ impl Writer {
             self.conn
                 .prepare_cached(
                     "INSERT INTO cpe_match (cve_id, vendor, product, version_exact,
-                                            start, start_incl, end, end_incl)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                            start, start_incl, end, end_incl, condition)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 )
                 .and_then(|mut s| {
                     s.execute(params![
@@ -395,7 +423,8 @@ impl Writer {
                         start,
                         start_incl,
                         end,
-                        end_incl
+                        end_incl,
+                        m.condition
                     ])
                 })
                 .map_err(write_err)?;
@@ -469,6 +498,7 @@ mod tests {
             product: String::new(),
             min,
             max,
+            condition: None,
         };
         let inc = |v: &str| Some(Bound::Including(v.into()));
         let exc = |v: &str| Some(Bound::Excluding(v.into()));

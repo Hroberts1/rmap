@@ -264,6 +264,8 @@ mod tests {
                 score: Some(8.1),
                 published: None,
                 kev_added: None,
+                condition: None,
+                client_only: false,
             }],
         });
         view.selected = Some(nas);

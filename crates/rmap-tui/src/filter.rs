@@ -73,7 +73,7 @@ pub fn matches(ip: IpAddr, host: &HostRow, query: &str) -> bool {
 fn worst_cve(host: &HostRow) -> Option<(VulnSeverity, f32)> {
     host.open
         .iter()
-        .flat_map(|p| &p.vulnerabilities)
+        .flat_map(|p| p.counted_vulns())
         .map(|v| (v.severity, v.score.unwrap_or(0.0)))
         .max_by(cmp_cve)
 }
@@ -129,6 +129,8 @@ mod tests {
             score,
             published: None,
             kev_added: None,
+            condition: None,
+            client_only: false,
         }
     }
 

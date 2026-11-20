@@ -50,6 +50,8 @@ fn db_bytes(cves: usize) -> Vec<u8> {
                 score: Some(7.5),
                 published: Some("2026-01-01".into()),
                 kev_added: None,
+                condition: None,
+                client_only: false,
             },
             matches: Vec::new(),
         })
@@ -69,7 +71,7 @@ fn digest(bytes: &[u8]) -> String {
 
 fn manifest_json(size: usize, sha256: &str, cve_count: u64, db: &str) -> String {
     format!(
-        r#"{{"schema_version":1,"built_at":"2026-11-01T06:12:00Z","cve_count":{cve_count},"source":"test","size":{size},"sha256":"{sha256}","db":"{db}"}}"#
+        r#"{{"schema_version":{SCHEMA_VERSION},"built_at":"2026-11-01T06:12:00Z","cve_count":{cve_count},"source":"test","size":{size},"sha256":"{sha256}","db":"{db}"}}"#
     )
 }
 
@@ -265,10 +267,10 @@ fn http_errors_are_reported() {
 fn too_new_manifest_asks_for_a_newer_rmap() {
     let base = serve(vec![(
         "/vulns.json",
-        ok(r#"{"schema_version":2,"something":"else"}"#),
+        ok(r#"{"schema_version":3,"something":"else"}"#),
     )]);
     let err = update_fails(&base);
-    assert_eq!(err, UpdateError::TooNewSchema(2));
+    assert_eq!(err, UpdateError::TooNewSchema(3));
     assert!(err.to_string().contains("update rmap"));
 }
 
@@ -347,7 +349,7 @@ fn insecure_urls_are_refused_without_connecting() {
 #[test]
 fn install_refuses_oversized_manifest() {
     let manifest = Manifest {
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
         built_at: "x".into(),
         cve_count: 0,
         source: String::new(),

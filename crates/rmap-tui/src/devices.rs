@@ -154,6 +154,8 @@ mod tests {
                     score: Some(8.0),
                     published: None,
                     kev_added: None,
+                    condition: None,
+                    client_only: false,
                 }],
             });
         }
@@ -179,7 +181,12 @@ mod tests {
         let screen = render(&mut app, 120, 32);
         assert_eq!(screen.matches("CVE-2099-0001").count(), 2, "{screen}");
         assert!(screen.contains("+ 192.168.1.30"), "{screen}");
-        assert!(screen.contains("of 2"), "{screen}");
+        // One Samba group row, then the two findings.
+        assert!(screen.contains("1 of 3"), "{screen}");
+        assert!(
+            screen.contains("Samba 4.15: 2 potential · 2 ports"),
+            "{screen}"
+        );
         for (w, h) in [(1, 1), (20, 8), (40, 12)] {
             render(&mut app, w, h);
         }

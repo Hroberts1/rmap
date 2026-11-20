@@ -1,6 +1,6 @@
 //! JSON export and import.
 
-use rmap_core::{PortState, Protocol, VulnCheck, VulnSeverity};
+use rmap_core::{PortState, Protocol, VulnCheck, VulnSeverity, VulnTier};
 use serde::Serialize;
 
 use crate::exposure::{self, Finding, Severity};
@@ -43,6 +43,9 @@ pub struct ByProtocol {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CveCoverage {
     pub checked: usize,
+    /// Checked, but a distro build: matches are against the upstream
+    /// version and may be fixed by backports.
+    pub checked_upstream_only: usize,
     pub version_hidden: usize,
     pub no_product: usize,
     pub not_covered: usize,
@@ -50,10 +53,18 @@ pub struct CveCoverage {
     pub not_run: usize,
 }
 
-/// Potential CVE matches (one per CVE per port).
+/// Potential CVE matches (one per CVE per port). `total`, the severities
+/// and `kev` count only potential and upstream-only matches; the other
+/// tiers are counted apart (see `rmap_core::VulnTier`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CveCounts {
     pub total: usize,
+    /// Of `total`, matches on distro builds (`checked_upstream_only`).
+    pub upstream_only: usize,
+    /// Need a platform rmap can't verify; not in `total`.
+    pub conditional: usize,
+    /// Client programs only; not in `total`.
+    pub client_only: usize,
     pub critical: usize,
     pub high: usize,
     pub medium: usize,
@@ -84,6 +95,7 @@ pub fn summary(r: &ScanReport, findings: &[Finding]) -> Summary {
     for p in r.hosts.iter().flat_map(|h| &h.ports) {
         let n = match &p.vuln_check {
             Some(VulnCheck::Checked { .. }) => &mut cve_check.checked,
+            Some(VulnCheck::CheckedUpstreamOnly { .. }) => &mut cve_check.checked_upstream_only,
             Some(VulnCheck::VersionHidden { .. }) => &mut cve_check.version_hidden,
             Some(VulnCheck::NoProduct) => &mut cve_check.no_product,
             Some(VulnCheck::NotCovered { .. }) => &mut cve_check.not_covered,
@@ -94,12 +106,22 @@ pub fn summary(r: &ScanReport, findings: &[Finding]) -> Summary {
         *n += 1;
     }
     let mut cves = CveCounts::default();
-    for v in r
+    for (p, v) in r
         .hosts
         .iter()
         .flat_map(|h| &h.ports)
-        .flat_map(|p| &p.vulnerabilities)
+        .flat_map(|p| p.vulnerabilities.iter().map(move |v| (p, v)))
     {
+        let tier = p.vuln_tier(v);
+        match tier {
+            VulnTier::Conditional => cves.conditional += 1,
+            VulnTier::ClientOnly => cves.client_only += 1,
+            VulnTier::UpstreamOnly => cves.upstream_only += 1,
+            VulnTier::Potential => {}
+        }
+        if !tier.shows_kev() {
+            continue;
+        }
         cves.total += 1;
         cves.kev += usize::from(v.kev_added.is_some());
         *match v.severity {
@@ -290,6 +312,33 @@ pub(crate) mod tests {
             FindingCounts {
                 total: 2,
                 high: 1,
+                medium: 1,
+                ..Default::default()
+            }
+        );
+
+        // A distro build, with the KEV CVE conditional and one client-only.
+        let p = &mut r.hosts[0].ports[0];
+        p.vuln_check = Some(VulnCheck::CheckedUpstreamOnly {
+            product: "OpenSSH".into(),
+            version: "9.6p1".into(),
+            matches: 1,
+            distro: "Ubuntu".into(),
+        });
+        p.vulnerabilities[1].condition = Some("musl-libc:musl".into());
+        let mut client = p.vulnerabilities[0].clone();
+        client.id = "CVE-2026-60002".into();
+        client.client_only = true;
+        p.vulnerabilities.push(client);
+        let s = summary(&r, &findings);
+        assert_eq!(s.cve_check.checked_upstream_only, 1);
+        assert_eq!(
+            s.cves_by_severity,
+            CveCounts {
+                total: 1,
+                upstream_only: 1,
+                conditional: 1,
+                client_only: 1,
                 medium: 1,
                 ..Default::default()
             }

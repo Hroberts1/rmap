@@ -4,15 +4,16 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use rmap_core::{PortResult, Protocol, Service, VulnSeverity, Vulnerability};
+use rmap_core::{PortResult, Protocol, Service, VulnCheck, VulnSeverity, VulnTier, Vulnerability};
 use rmap_log::Timestamp;
 
 use crate::model::{HostReport, ScanReport};
 
 /// Note shown wherever findings are listed: matching is by version only.
 pub const FINDINGS_NOTE: &str = "Potential findings: CVEs are matched on the detected product \
-    version only, so backported fixes and configuration are not taken into account. Verify \
-    each finding before acting on it.";
+    version only, so backported fixes and configuration are not taken into account. Matches \
+    that need a platform rmap can't verify are listed as conditional, and client-only CVEs \
+    are not counted on listening ports. Verify each finding before acting on it.";
 
 /// Severities from worst to least bad, for listing.
 pub const SEVERITIES: [VulnSeverity; 4] = [
@@ -28,39 +29,178 @@ pub struct Finding<'a> {
     pub port: u16,
     pub protocol: Protocol,
     pub vuln: &'a Vulnerability,
+    pub tier: VulnTier,
 }
 
-/// Every finding in the report, worst first, then by score, host and port.
+impl Finding<'_> {
+    /// Counted as a potential finding (not conditional, not client-only).
+    pub fn counted(&self) -> bool {
+        matches!(self.tier, VulnTier::Potential | VulnTier::UpstreamOnly)
+    }
+}
+
+/// Counted tiers first, then worst first, then by score, host and port.
+fn worse_first(a: &Finding, b: &Finding) -> std::cmp::Ordering {
+    a.tier
+        .cmp(&b.tier)
+        .then(b.vuln.severity.cmp(&a.vuln.severity))
+        .then(
+            b.vuln
+                .score
+                .unwrap_or(0.0)
+                .total_cmp(&a.vuln.score.unwrap_or(0.0)),
+        )
+        .then(a.ip.cmp(&b.ip))
+        .then(a.port.cmp(&b.port))
+        .then(a.vuln.id.cmp(&b.vuln.id))
+}
+
+fn port_findings<'a>(ip: IpAddr, p: &'a PortResult) -> impl Iterator<Item = Finding<'a>> {
+    p.vulnerabilities.iter().map(move |v| Finding {
+        ip,
+        port: p.port,
+        protocol: p.protocol,
+        vuln: v,
+        tier: p.vuln_tier(v),
+    })
+}
+
+/// Every match in the report, counted tiers first, worst first, then by
+/// score, host and port.
 pub fn findings(r: &ScanReport) -> Vec<Finding<'_>> {
     let mut out: Vec<Finding> = r
         .hosts
         .iter()
-        .flat_map(|h| {
-            h.ports.iter().flat_map(move |p| {
-                p.vulnerabilities.iter().map(move |v| Finding {
-                    ip: h.ip,
-                    port: p.port,
-                    protocol: p.protocol,
-                    vuln: v,
-                })
-            })
-        })
+        .flat_map(|h| h.ports.iter().flat_map(move |p| port_findings(h.ip, p)))
         .collect();
-    out.sort_by(|a, b| {
-        b.vuln
-            .severity
-            .cmp(&a.vuln.severity)
-            .then(
-                b.vuln
-                    .score
-                    .unwrap_or(0.0)
-                    .total_cmp(&a.vuln.score.unwrap_or(0.0)),
-            )
-            .then(a.ip.cmp(&b.ip))
-            .then(a.port.cmp(&b.port))
-            .then(a.vuln.id.cmp(&b.vuln.id))
-    });
+    out.sort_by(worse_first);
     out
+}
+
+/// Every match on one product and version (and distro build).
+pub struct Group<'a> {
+    /// `OpenSSH 10.2p1`, or the service name when there's no version.
+    pub label: String,
+    /// Set when the ports are distro builds (`CheckedUpstreamOnly`).
+    pub distro: Option<&'a str>,
+    /// Counted per device (see [`device_findings`]), with every address
+    /// each was seen on; counted tiers first, then worst first.
+    pub findings: Vec<(Finding<'a>, Vec<IpAddr>)>,
+}
+
+impl<'a> Group<'a> {
+    /// See [`group_line`]. Ports are counted once per device.
+    pub fn line(&self) -> String {
+        let ports: std::collections::HashSet<_> = self
+            .findings
+            .iter()
+            .map(|(f, ips)| (ips.first().copied().unwrap_or(f.ip), f.port, f.protocol))
+            .collect();
+        group_line(
+            &self.label,
+            self.distro,
+            self.findings.iter().map(|(f, _)| f.tier),
+            ports.len(),
+        )
+    }
+
+    /// This group's matches in `tier`, one per CVE id.
+    pub fn unique(&self, tier: VulnTier) -> Vec<&Finding<'a>> {
+        let mut seen = std::collections::HashSet::new();
+        self.findings
+            .iter()
+            .map(|(f, _)| f)
+            .filter(|f| f.tier == tier && seen.insert(f.vuln.id.as_str()))
+            .collect()
+    }
+}
+
+/// Every match in the report grouped by product and version, counted per
+/// device, worst group first.
+pub fn groups(r: &ScanReport) -> Vec<Group<'_>> {
+    let mut groups: Vec<Group> = Vec::new();
+    // Already worst first, so each group's first finding is its worst.
+    for (f, ips) in device_findings(r) {
+        let Some(p) = r.host(f.ip).and_then(|h| {
+            h.ports
+                .iter()
+                .find(|p| (p.port, p.protocol) == (f.port, f.protocol))
+        }) else {
+            continue;
+        };
+        let label = p
+            .service
+            .as_ref()
+            .and_then(Service::version_label)
+            .unwrap_or_else(|| service_name(p));
+        let distro = match &p.vuln_check {
+            Some(VulnCheck::CheckedUpstreamOnly { distro, .. }) => Some(distro.as_str()),
+            _ => None,
+        };
+        match groups
+            .iter_mut()
+            .find(|g| g.label == label && g.distro == distro)
+        {
+            Some(g) => g.findings.push((f, ips)),
+            None => groups.push(Group {
+                label,
+                distro,
+                findings: vec![(f, ips)],
+            }),
+        }
+    }
+    groups
+}
+
+/// `OpenSSH 10.2p1: 29 potential (upstream match; Ubuntu build) · 3
+/// conditional (platform not verified) · 8 client-only, not counted · 2
+/// ports`, for a group of matches with these tiers. Unescaped. Shared
+/// with the TUI's Vulns tab.
+pub fn group_line(
+    label: &str,
+    distro: Option<&str>,
+    tiers: impl Iterator<Item = VulnTier>,
+    ports: usize,
+) -> String {
+    let (mut counted, mut conditional, mut client) = (0, 0, 0);
+    for t in tiers {
+        match t {
+            VulnTier::Potential | VulnTier::UpstreamOnly => counted += 1,
+            VulnTier::Conditional => conditional += 1,
+            VulnTier::ClientOnly => client += 1,
+        }
+    }
+    let mut s = format!("{label}: {counted} potential");
+    if let Some(d) = distro {
+        s.push_str(&format!(" (upstream match; {d} build)"));
+    }
+    if conditional > 0 {
+        s.push_str(&format!(
+            " · {conditional} conditional (platform not verified)"
+        ));
+    }
+    if client > 0 {
+        s.push_str(&format!(" · {client} client-only, not counted"));
+    }
+    let plural = if ports == 1 { "" } else { "s" };
+    s.push_str(&format!(" · {ports} port{plural}"));
+    s
+}
+
+/// `3 conditional, 9 client-only`: matches left out of the counts, or
+/// `None` when there are none.
+pub fn not_counted_line(r: &ScanReport) -> Option<String> {
+    let all = device_findings(r);
+    let n = |tier| all.iter().filter(|(f, _)| f.tier == tier).count();
+    let parts: Vec<String> = [
+        (n(VulnTier::Conditional), "conditional"),
+        (n(VulnTier::ClientOnly), "client-only"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// [`findings`] counted per device: the same CVE on the same product
@@ -90,10 +230,11 @@ pub fn ip_list(ips: &[IpAddr]) -> String {
         .join(", ")
 }
 
-/// Findings per severity, in [`SEVERITIES`] order, counted per device.
+/// Counted findings per severity, in [`SEVERITIES`] order, counted per
+/// device.
 pub fn severity_counts(r: &ScanReport) -> [usize; 4] {
     let mut counts = [0; 4];
-    for (f, _) in device_findings(r) {
+    for (f, _) in device_findings(r).iter().filter(|(f, _)| f.counted()) {
         counts[SEVERITIES
             .iter()
             .position(|s| *s == f.vuln.severity)
@@ -118,16 +259,34 @@ pub fn severity_line(r: &ScanReport) -> String {
     format!("{total} ({})", parts.join(", "))
 }
 
+/// The worst counted finding's severity.
 pub fn worst(p: &PortResult) -> Option<VulnSeverity> {
-    p.vulnerabilities.iter().map(|v| v.severity).max()
+    p.counted_vulns().map(|v| v.severity).max()
 }
 
 /// `actively exploited (CISA KEV, added 2024-07-01)` for a CVE on CISA's
-/// Known Exploited Vulnerabilities list. Unescaped.
+/// Known Exploited Vulnerabilities list, unless the match is conditional
+/// or client-only. Unescaped.
 pub fn kev_note(v: &Vulnerability) -> Option<String> {
     v.kev_added
         .as_ref()
+        .filter(|_| v.condition.is_none() && !v.client_only)
         .map(|d| format!("actively exploited (CISA KEV, added {d})"))
+}
+
+/// `4 of 65 open ports checked`, said up front so a short findings list
+/// isn't read as a clean network; `None` when matching never ran.
+pub fn coverage_line(r: &ScanReport) -> Option<String> {
+    if checked_ports(r) == 0 {
+        return None;
+    }
+    let checked = ports(r)
+        .filter(|p| p.vuln_check.as_ref().is_some_and(|c| !c.is_unchecked()))
+        .count();
+    Some(format!(
+        "{checked} of {} open ports checked",
+        r.open_ports()
+    ))
 }
 
 /// `built 2026-11-01, 245000 CVEs (NVD)`; `none available` when matching
@@ -273,6 +432,8 @@ pub(crate) mod tests {
             score: Some(score),
             published: Some("2024-07-01".into()),
             kev_added: None,
+            condition: None,
+            client_only: false,
         }
     }
 
@@ -358,8 +519,11 @@ pub(crate) mod tests {
         );
 
         let md = crate::markdown::to_string(&r);
-        assert!(md.contains("### high (1)"), "{md}");
-        assert!(md.contains(": 10.0.0.2, 10.0.0.3 22/tcp:"), "{md}");
+        assert!(
+            md.contains("### OpenSSH 9.6p1: 2 potential · 1 port"),
+            "{md}"
+        );
+        assert!(md.contains(" on 10.0.0.2, 10.0.0.3 22/tcp:"), "{md}");
         let html = crate::html::to_string(&r);
         assert!(html.contains("<td>10.0.0.2, 10.0.0.3</td>"), "{html}");
         assert!(html.contains("same device as 10.0.0.2"), "{html}");
@@ -403,6 +567,42 @@ pub(crate) mod tests {
         let expected = std::fs::read_to_string(&path).unwrap();
         // Git may check fixtures out with CRLF; CSV is CRLF by design.
         assert_eq!(actual.replace("\r\n", "\n"), expected.replace("\r\n", "\n"));
+    }
+
+    #[test]
+    fn tiers_group_and_count_apart() {
+        let mut r = fixture();
+        let p = &mut r.hosts[0].ports[0];
+        p.vuln_check = Some(VulnCheck::CheckedUpstreamOnly {
+            product: "OpenSSH".into(),
+            version: "9.6p1".into(),
+            matches: 1,
+            distro: "Ubuntu".into(),
+        });
+        // regreSSHion (on KEV) needs a platform; another is client-only.
+        p.vulnerabilities[1].condition = Some("musl-libc:musl".into());
+        let mut client = vuln("CVE-2026-60002", VulnSeverity::Critical, 9.4, "ssh client");
+        client.client_only = true;
+        p.vulnerabilities.push(client);
+        assert_eq!(kev_note(&p.vulnerabilities[1]), None);
+        assert_eq!(severity_line(&r), "1 (medium 1)");
+        assert_eq!(worst(&r.hosts[0].ports[0]), Some(VulnSeverity::Medium));
+        assert_eq!(
+            not_counted_line(&r).as_deref(),
+            Some("1 conditional, 1 client-only")
+        );
+        let groups = groups(&r);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].line(),
+            "OpenSSH 9.6p1: 1 potential (upstream match; Ubuntu build) · 1 conditional \
+             (platform not verified) · 1 client-only, not counted · 1 port"
+        );
+        assert_eq!(
+            coverage_line(&r).as_deref(),
+            Some("1 of 1 open ports checked")
+        );
+        assert_eq!(coverage_line(&sample()), None);
     }
 
     #[test]

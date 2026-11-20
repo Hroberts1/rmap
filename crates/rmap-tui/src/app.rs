@@ -1431,6 +1431,8 @@ mod tests {
                 score: Some(8.1),
                 published: None,
                 kev_added: None,
+                condition: None,
+                client_only: false,
             }],
         });
         let host = &view.hosts[&ip];
@@ -1461,6 +1463,8 @@ mod tests {
                 score: None,
                 published: None,
                 kev_added: None,
+                condition: None,
+                client_only: false,
             }],
         });
     }
@@ -1616,6 +1620,8 @@ mod tests {
             score: Some(score),
             published: None,
             kev_added: None,
+            condition: None,
+            client_only: false,
         };
         view.apply(ScanEvent::Vulnerabilities {
             ip,
