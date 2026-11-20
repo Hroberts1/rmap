@@ -22,6 +22,7 @@ pub mod der;
 pub mod http;
 pub mod pattern;
 pub mod payloads;
+pub mod ssh;
 pub mod tls;
 pub mod udp;
 
@@ -260,6 +261,15 @@ impl Detector {
                             let wait = probe.wait.min(max_wait).min(remaining);
                             let connect = timing.connect_timeout.min(remaining);
                             add_title(&mut service, &response, addr, connect, wait).await;
+                        }
+                        // The handshake sends data, so never on print ports.
+                        if protocol == Protocol::Tcp
+                            && response.starts_with(b"SSH-")
+                            && !is_print_port(port)
+                        {
+                            let remaining = budget.saturating_sub(started.elapsed());
+                            let connect = timing.connect_timeout.min(remaining);
+                            ssh::enrich(&mut service, addr, connect, max_wait.min(remaining)).await;
                         }
                         rmap_log::debug!(
                             "service {addr}: {} {:?} via probe {} in {:?}",
