@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Cell, Clear, LineGauge, Padding, Paragraph, Row, Table, TableState, Wrap,
 };
-use rmap_core::{HostState, PortResult, PortState, Service, Timing, VulnSeverity, Vulnerability};
+use rmap_core::{HostState, PortState, Service, Timing, VulnSeverity, Vulnerability};
 
 use crate::app::{App, Confirm, Field, HostRow, Pane, ScanView, Screen};
 use crate::input::TextInput;
@@ -729,7 +729,16 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
     let mut info_lines = vec![host_info(host)];
     info_lines.extend(crate::names::detail_line(host));
     info_lines.extend(crate::mac::detail_line(host));
-    info_lines.extend(silent_hint(host));
+    let decoy = rmap_report::tags::honeypot_reasons(
+        ip,
+        &host.open,
+        host.mac,
+        view.hosts
+            .iter()
+            .filter(|(_, h)| h.state != HostState::Down)
+            .map(|(ip, h)| (*ip, h.mac)),
+    );
+    info_lines.extend(decoy_hint(&decoy));
     let [info, ports, footer] = Layout::vertical([
         Constraint::Length(info_lines.len() as u16),
         Constraint::Min(1),
@@ -775,7 +784,12 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
         if show_rtt {
             cells.push(Cell::from(p.rtt.map(fmt_rtt).unwrap_or_default()).dim());
         }
-        rows.push(Row::new(cells));
+        // A likely decoy's ports are dimmed: they aren't real services.
+        rows.push(if decoy.is_empty() {
+            Row::new(cells)
+        } else {
+            Row::new(cells).dim()
+        });
         heights.push(1);
 
         if let Some(d) = p.service.as_ref().and_then(service_detail) {
@@ -999,16 +1013,16 @@ fn service_detail(s: &Service) -> Option<String> {
     (!parts.is_empty()).then(|| format!("└ {}", parts.join(" · ")))
 }
 
-/// Many open ports that all accept and say nothing: something in the path
-/// (firewall, IPS) is likely completing the handshake for the real host.
-fn silent_hint(h: &HostRow) -> Option<Line<'static>> {
-    let silent = |p: &PortResult| p.service.as_ref().is_some_and(Service::is_silent);
-    (h.open.len() >= 5 && h.open.iter().all(silent)).then(|| {
-        Line::from(
-            "all ports accept but stay silent: likely a firewall or IPS intercepting connections",
-        )
-        .fg(Color::Yellow)
-    })
+/// Many open ports that all accept and say nothing: a decoy, a tarpit, or
+/// a firewall completing the handshake for the real host.
+fn decoy_hint(reasons: &[String]) -> Vec<Line<'static>> {
+    if reasons.is_empty() {
+        return Vec::new();
+    }
+    let head = "likely honeypot or tarpit (or a firewall answering for the host)";
+    std::iter::once(Line::from(head).fg(Color::Yellow))
+        .chain(reasons.iter().map(|r| Line::from(format!("· {r}")).dim()))
+        .collect()
 }
 
 fn host_info(h: &HostRow) -> Line<'static> {

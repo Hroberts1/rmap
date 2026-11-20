@@ -235,7 +235,10 @@ async fn tls_certificate_names() {
     );
     assert_eq!(s.method, DetectMethod::Probe);
     // Pinned so a change to the hashing or the DER slicing can't go unnoticed.
-    assert_eq!(s.fingerprints, ["tls-cert SHA256:b25fc749142504fe12d98a70f383017dfa256b3e64c69471b500f01650e90794"]);
+    assert_eq!(
+        s.fingerprints,
+        ["tls-cert SHA256:b25fc749142504fe12d98a70f383017dfa256b3e64c69471b500f01650e90794"]
+    );
     assert_eq!(
         s.cert,
         Some(rmap_core::CertInfo {

@@ -98,6 +98,13 @@ pub struct HostReport {
     /// first. The first also fills `hostname` when no name was typed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<HostName>,
+    /// Conclusions about the whole host, e.g. `likely_honeypot_or_tarpit`
+    /// (see [`crate::tags`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// The evidence behind `tags`, for people to read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tag_reasons: Vec<String>,
 }
 
 impl HostReport {
@@ -114,6 +121,8 @@ impl HostReport {
             mac: None,
             vendor: None,
             names: Vec::new(),
+            tags: Vec::new(),
+            tag_reasons: Vec::new(),
         }
     }
 

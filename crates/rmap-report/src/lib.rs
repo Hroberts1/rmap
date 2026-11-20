@@ -14,6 +14,7 @@ pub mod markdown;
 pub mod model;
 pub mod store;
 mod summary;
+pub mod tags;
 pub mod xml;
 
 pub use builder::ReportBuilder;
