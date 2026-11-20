@@ -3,8 +3,8 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
-use rmap_core::sha256::hex;
 use crate::{Entry, VulnSeverity, Vulnerability, Writer};
+use rmap_core::sha256::hex;
 
 /// A unique directory under the temp dir, removed when dropped.
 struct TempDir(PathBuf);

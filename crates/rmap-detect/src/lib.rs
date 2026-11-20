@@ -19,9 +19,11 @@
 pub mod cpe;
 pub mod db;
 pub mod der;
+pub mod host;
 pub mod http;
 pub mod pattern;
 pub mod payloads;
+pub mod telnet;
 pub mod tls;
 pub mod udp;
 
@@ -37,7 +39,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use rmap_core::{DetectMethod, Protocol, SILENT_INFO, Service, Timing, service_name};
+pub use rmap_core::is_print_port;
+use rmap_core::{
+    DetectMethod, Protocol, SILENT_INFO, Service, Timing, client_speaks_first, service_name,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{Instant, timeout, timeout_at};
@@ -168,6 +173,9 @@ impl Detector {
         if m.probe.payload == Payload::None {
             service.method = DetectMethod::Banner;
         }
+        if service.name == "telnet" && service.info.is_none() {
+            service.info = telnet::summary(response);
+        }
         service.cpes = cpe::for_service(&service);
         Some(service)
     }
@@ -255,6 +263,16 @@ impl Detector {
                     }
                     answered = true;
                     if let Some(mut service) = self.analyze(index, &response, port) {
+                        if probe.payload == Payload::Builtin(Builtin::TlsClientHello)
+                            && tls::analyze(&response).is_some_and(|i| i.refused_version())
+                        {
+                            let remaining = budget.saturating_sub(started.elapsed());
+                            let wait = probe.wait.min(max_wait).min(remaining);
+                            let connect = timing.connect_timeout.min(remaining);
+                            if let Some(s) = retry_tls10(addr, port, connect, wait).await {
+                                service = s;
+                            }
+                        }
                         if response.starts_with(b"HTTP/") {
                             let remaining = budget.saturating_sub(started.elapsed());
                             let wait = probe.wait.min(max_wait).min(remaining);
@@ -287,9 +305,14 @@ impl Detector {
             }
         }
         rmap_log::debug!("service {addr}: no rule matched; using the port table");
-        // UDP silence is normal (open|filtered), so only TCP is marked.
+        // UDP silence is normal (open|filtered), so only TCP is marked, and
+        // not where the protocol waits for a request we don't know how to send.
         let printing = protocol == Protocol::Tcp && is_print_port(port);
-        let silent = protocol == Protocol::Tcp && connected && !answered && !printing;
+        let silent = protocol == Protocol::Tcp
+            && connected
+            && !answered
+            && !printing
+            && !client_speaks_first(port);
         let mut service = port_table(port, unmatched.as_deref(), silent);
         if printing && service.as_ref().is_none_or(|s| s.info.is_none()) {
             let s = service.get_or_insert_with(|| Service {
@@ -302,6 +325,26 @@ impl Detector {
         }
         Detected { service, answered }
     }
+}
+
+/// Offer TLS 1.0 to a server that refused our TLS 1.2 ClientHello; the
+/// service it describes if the server then completes a ServerHello.
+async fn retry_tls10(
+    addr: SocketAddr,
+    port: u16,
+    connect: Duration,
+    wait: Duration,
+) -> Option<Service> {
+    if wait.is_zero() {
+        return None;
+    }
+    let reply = exchange(addr, &payloads::tls10_client_hello(), connect, wait)
+        .await
+        .ok()?;
+    let mut info = tls::analyze(&reply)?;
+    info.version?;
+    info.legacy_retry = true;
+    Some(tls_service(&info, port))
 }
 
 /// Add the page title of an HTTP response to `service`, following one
@@ -406,30 +449,40 @@ async fn exchange_udp(addr: SocketAddr, payload: &[u8], wait: Duration) -> io::R
 
 fn tls_service(info: &tls::TlsInfo, port: u16) -> Service {
     let name = match service_name(port) {
+        // TLS on 22 is not SSH over TLS; it's something else on the SSH port.
+        Some(_) if port == 22 => "tls".to_string(),
         Some(n) if TLS_NAMES.contains(&n) => n.to_string(),
         Some(n) => format!("tls/{n}"),
         None => "tls".to_string(),
     };
+    let mut summary = info.summary();
+    if port == 22 {
+        let unifi = info
+            .cert
+            .as_ref()
+            .and_then(|c| c.subject_cn.as_deref())
+            .is_some_and(host::unifi_cn);
+        let note = if unifi { host::UNIFI_INFORM } else { NOT_SSH };
+        summary = format!("{note}; {summary}");
+    }
     Service {
         name,
-        info: Some(info.summary()),
+        info: Some(summary),
         method: DetectMethod::Probe,
         confidence: if info.version.is_some() { 8 } else { 7 },
+        fingerprints: info.fingerprint.iter().cloned().collect(),
+        cert: info.cert.clone(),
         ..Default::default()
     }
 }
+
+/// `info` prefix of TLS found on the SSH port without a UniFi sign.
+pub(crate) const NOT_SSH: &str = "tls (not ssh)";
 
 /// The guess from the port number, noting any reply nothing recognised,
 /// or that the port accepted connections but stayed `silent`.
 /// Shown on print ports that were listened to but sent no probes.
 pub const PRINT_PORT_INFO: &str = "not probed: data sent here would print";
-
-/// Ports that print whatever bytes arrive: raw/AppSocket (JetDirect) 9100-9107
-/// and LPD 515. Sending any probe payload there wastes paper on the client's
-/// printer, so detection only listens on them.
-pub fn is_print_port(port: u16) -> bool {
-    matches!(port, 515 | 9100..=9107)
-}
 
 fn port_table(port: u16, unmatched: Option<&[u8]>, silent: bool) -> Option<Service> {
     let name = service_name(port);

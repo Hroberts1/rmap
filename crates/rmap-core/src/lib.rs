@@ -14,7 +14,7 @@ pub mod vuln;
 
 pub use mac::MacAddr;
 pub use names::{HostName, NameSource};
-pub use ports::{PortList, service_name};
+pub use ports::{PortList, client_speaks_first, is_print_port, service_name};
 pub use result::{HostState, PortResult, PortState, Protocol, ScanEvent};
 pub use scan::ScanType;
 pub use service::{CertInfo, DetectMethod, SILENT_INFO, Service};

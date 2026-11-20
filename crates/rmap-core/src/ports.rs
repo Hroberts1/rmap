@@ -170,6 +170,36 @@ pub fn service_name(port: u16) -> Option<&'static str> {
     })
 }
 
+/// Ports that print whatever bytes arrive: raw/AppSocket (JetDirect) 9100-9107
+/// and LPD 515. Sending any probe payload there wastes paper on the client's
+/// printer, so detection only listens on them.
+pub fn is_print_port(port: u16) -> bool {
+    matches!(port, 515 | 9100..=9107)
+}
+
+/// TCP ports whose protocols wait for the client to send a request and say
+/// nothing until then, so a quiet connection there is expected, not a sign
+/// of a decoy or an intercepting firewall. Detection doesn't mark them
+/// silent, and the honeypot heuristic doesn't count them. Protocols rmap
+/// sends a request to anyway (HTTP, SMB on 139/445) are left out: silence
+/// after a real request is worth flagging.
+pub fn client_speaks_first(port: u16) -> bool {
+    matches!(
+        port,
+        53 // DNS over TCP (probed, but a resolver may refuse version.bind)
+        | 88 // Kerberos
+        | 111 // rpcbind / portmapper
+        | 135 // MSRPC endpoint mapper
+        | 389 // LDAP
+        | 464 // Kerberos kpasswd
+        | 1433 // MSSQL (TDS pre-login)
+        | 1521 // Oracle TNS
+        | 2049 // NFS
+        | 3268 // LDAP global catalog
+        | 9389 // AD Web Services (.NET framing)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +220,13 @@ mod tests {
     #[test]
     fn common_list_is_sorted_and_unique() {
         assert!(COMMON_PORTS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn port_classes() {
+        assert!(client_speaks_first(135) && client_speaks_first(53));
+        assert!(!client_speaks_first(22) && !client_speaks_first(445));
+        assert!(is_print_port(9100) && is_print_port(515) && !is_print_port(631));
     }
 
     #[test]

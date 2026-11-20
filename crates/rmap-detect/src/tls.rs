@@ -5,10 +5,15 @@
 //! the ClientHello offers TLS 1.2 at most, the certificate travels in the
 //! clear. A server that only answers with an alert still counts as TLS.
 
-use crate::der::{self, CertNames};
+use rmap_core::CertInfo;
+use rmap_core::sha256;
+
+use crate::der;
 
 const HANDSHAKE: u8 = 0x16;
 const ALERT: u8 = 0x15;
+/// Alert sent when the server won't speak the version the client offered.
+pub const PROTOCOL_VERSION: u8 = 70;
 /// Largest record allowed by the spec (2^14 plus expansion).
 const MAX_RECORD: usize = 18_432;
 
@@ -18,7 +23,13 @@ pub struct TlsInfo {
     pub version: Option<&'static str>,
     /// Alert description code, if the server sent an alert.
     pub alert: Option<u8>,
-    pub cert: Option<CertNames>,
+    pub cert: Option<CertInfo>,
+    /// `tls-cert SHA256:<hex>` of the leaf certificate's DER, when it
+    /// arrived whole.
+    pub fingerprint: Option<String>,
+    /// This answered a TLS 1.0 retry after the TLS 1.2 ClientHello got
+    /// `protocol_version`.
+    pub legacy_retry: bool,
 }
 
 impl TlsInfo {
@@ -26,7 +37,14 @@ impl TlsInfo {
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         parts.push(self.version.unwrap_or("TLS").to_string());
-        if let Some(a) = self.alert {
+        if self.legacy_retry {
+            parts.push(match self.version {
+                Some("TLSv1.0") => "accepts TLS 1.0 only".to_string(),
+                v => format!("accepts {} after refusing TLS 1.2", v.unwrap_or("TLS")),
+            });
+        } else if self.refused_version() {
+            parts.push("refused TLS 1.2 ClientHello (protocol_version)".into());
+        } else if let Some(a) = self.alert {
             parts.push(format!("alert {}", alert_name(a)));
         }
         if let Some(c) = &self.cert {
@@ -59,6 +77,11 @@ impl TlsInfo {
         }
         parts.join("; ")
     }
+
+    /// The server turned down the TLS 1.2 ClientHello's version.
+    pub fn refused_version(&self) -> bool {
+        self.version.is_none() && self.alert == Some(PROTOCOL_VERSION)
+    }
 }
 
 fn version_name(v: u16) -> Option<&'static str> {
@@ -75,7 +98,7 @@ fn version_name(v: u16) -> Option<&'static str> {
 fn alert_name(code: u8) -> String {
     match code {
         40 => "handshake_failure".into(),
-        70 => "protocol_version".into(),
+        PROTOCOL_VERSION => "protocol_version".into(),
         71 => "insufficient_security".into(),
         80 => "internal_error".into(),
         112 => "unrecognized_name".into(),
@@ -125,7 +148,14 @@ fn parse_handshake(mut buf: &[u8], info: &mut TlsInfo) {
         let body = &buf[4..(4 + len).min(buf.len())];
         match kind {
             2 => info.version = server_hello_version(body),
-            11 => info.cert = first_certificate(body).and_then(der::certificate),
+            11 => {
+                let leaf = first_certificate(body);
+                info.cert = leaf.and_then(der::certificate);
+                // Hash only a whole DER element, never a truncated one.
+                info.fingerprint = leaf.and_then(der::read).map(|(t, _)| {
+                    format!("tls-cert SHA256:{}", sha256::hex(&sha256::digest(t.raw)))
+                });
+            }
             _ => {}
         }
         if 4 + len > buf.len() {
@@ -226,6 +256,35 @@ pub(crate) mod tests {
         let info = analyze(&record(ALERT, &[2, 40])).unwrap();
         assert_eq!(info.alert, Some(40));
         assert_eq!(info.summary(), "TLS; alert handshake_failure");
+    }
+
+    #[test]
+    fn protocol_version_alert_names_the_refused_version() {
+        let info = analyze(&record(ALERT, &[2, 70])).unwrap();
+        assert!(info.refused_version());
+        assert_eq!(
+            info.summary(),
+            "TLS; refused TLS 1.2 ClientHello (protocol_version)"
+        );
+        let mut retried = info.clone();
+        retried.version = Some("TLSv1.0");
+        retried.legacy_retry = true;
+        assert_eq!(retried.summary(), "TLSv1.0; accepts TLS 1.0 only");
+    }
+
+    #[test]
+    fn leaf_fingerprint_and_cert_info() {
+        let cert = fake_cert("nas.example.test", "nas.example.test", &[]);
+        let info = analyze(&server_flight(&cert)).unwrap();
+        let want = format!("tls-cert SHA256:{}", sha256::hex(&sha256::digest(&cert)));
+        assert_eq!(info.fingerprint.as_deref(), Some(want.as_str()));
+        let c = info.cert.unwrap();
+        assert_eq!(c.not_before.as_deref(), Some("2024-01-01"));
+        assert!(c.self_signed);
+        // A truncated certificate gets names but no fingerprint.
+        let flight = server_flight(&cert);
+        let cut = analyze(&flight[..flight.len() - 30]).unwrap();
+        assert_eq!(cut.fingerprint, None);
     }
 
     #[test]
