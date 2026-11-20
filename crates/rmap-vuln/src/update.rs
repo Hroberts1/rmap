@@ -20,7 +20,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use ureq::Agent;
 
-use crate::sha256::Sha256;
+use rmap_core::sha256::Sha256;
 use crate::{Database, DbError, DbInfo, SCHEMA_VERSION};
 
 /// The project's manifest on GitHub Pages. Its `db` points at that

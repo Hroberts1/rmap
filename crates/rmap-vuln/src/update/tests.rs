@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::*;
-use crate::sha256::hex;
+use rmap_core::sha256::hex;
 use crate::{Entry, VulnSeverity, Vulnerability, Writer};
 
 /// A unique directory under the temp dir, removed when dropped.
