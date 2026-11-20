@@ -20,8 +20,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use ureq::Agent;
 
-use crate::sha256::Sha256;
 use crate::{Database, DbError, DbInfo, SCHEMA_VERSION};
+use rmap_core::sha256::Sha256;
 
 /// The project's manifest on GitHub Pages. Its `db` points at that
 /// month's immutable `vulndb-YYYY-MM-DD` release (see vulndb.yml).

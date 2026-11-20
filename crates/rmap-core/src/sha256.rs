@@ -1,4 +1,5 @@
-//! SHA-256 (FIPS 180-4), streaming, used to verify downloaded databases.
+//! SHA-256 (FIPS 180-4), streaming: verifies downloaded databases and
+//! fingerprints TLS certificates and SSH host keys.
 
 const K: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -15,7 +16,7 @@ const H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-pub(crate) struct Sha256 {
+pub struct Sha256 {
     state: [u32; 8],
     block: [u8; 64],
     /// Bytes buffered in `block`.
@@ -24,8 +25,14 @@ pub(crate) struct Sha256 {
     len: u64,
 }
 
+impl Default for Sha256 {
+    fn default() -> Sha256 {
+        Sha256::new()
+    }
+}
+
 impl Sha256 {
-    pub(crate) fn new() -> Sha256 {
+    pub fn new() -> Sha256 {
         Sha256 {
             state: H0,
             block: [0; 64],
@@ -34,7 +41,7 @@ impl Sha256 {
         }
     }
 
-    pub(crate) fn update(&mut self, mut data: &[u8]) {
+    pub fn update(&mut self, mut data: &[u8]) {
         self.len = self.len.wrapping_add(data.len() as u64);
         while !data.is_empty() {
             let n = (64 - self.used).min(data.len());
@@ -48,7 +55,7 @@ impl Sha256 {
         }
     }
 
-    pub(crate) fn finish(mut self) -> [u8; 32] {
+    pub fn finish(mut self) -> [u8; 32] {
         let bits = self.len.wrapping_mul(8);
         // Padding: 0x80, zeros, then the 64-bit length, ending on a block boundary.
         let pad_zeros = (64 + 56 - (self.used + 1) % 64) % 64;
@@ -105,8 +112,15 @@ fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn hex(bytes: &[u8]) -> String {
+/// One-shot digest of `data`.
+pub fn digest(data: &[u8]) -> [u8; 32] {
+    let mut s = Sha256::new();
+    s.update(data);
+    s.finish()
+}
+
+/// Lowercase hex, two digits per byte.
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -115,9 +129,7 @@ mod tests {
     use super::*;
 
     fn digest(data: &[u8]) -> String {
-        let mut s = Sha256::new();
-        s.update(data);
-        hex(&s.finish())
+        hex(&super::digest(data))
     }
 
     #[test]

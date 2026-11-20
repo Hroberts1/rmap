@@ -7,6 +7,7 @@ pub mod ports;
 pub mod result;
 pub mod scan;
 pub mod service;
+pub mod sha256;
 pub mod target;
 pub mod timing;
 pub mod vuln;

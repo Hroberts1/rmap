@@ -11,7 +11,6 @@
 //! NVD builder (`rmap-nvd`).
 
 mod db;
-mod sha256;
 mod update;
 pub mod version;
 
