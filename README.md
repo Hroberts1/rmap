@@ -40,6 +40,7 @@
   - [Adaptive timeouts](#adaptive-timeouts)
   - [MAC vendor lookup](#mac-vendor-lookup)
   - [Host names](#host-names)
+  - [Device grouping](#device-grouping)
 - [Service detection](#service-detection)
   - [UDP detection](#udp-detection)
   - [Adding a probe or match rule](#adding-a-probe-or-match-rule)
@@ -381,6 +382,16 @@ When ARP discovers a host's hardware address, the host detail pane shows it with
 With **Names** ticked on the setup form (the default), rmap looks up every live host's names while its ports are scanned, from three sources at once: reverse DNS (a PTR query), the host's NetBIOS name table (UDP 137) and its own mDNS responder (UDP 5353). No single one names everything: DNS covers domain-joined and DHCP-registered machines, NetBIOS covers Windows PCs, Samba, NAS boxes and many printers, and mDNS covers Macs, phones, Linux, printers and IoT. The best name fills the host list (DNS first, then NetBIOS, then mDNS); the detail pane lists all of them with their source, e.g. `names frontdesk.corp.lan (DNS) · FRONTDESK (NetBIOS)`, which makes a stale DNS record easy to spot. A name typed as the target is kept.
 
 Reverse DNS uses the **DNS server** field if set, otherwise the system resolver (`/etc/resolv.conf` on Linux, the first IPv4 DNS server Windows reports on Windows). Set the field to override it, for example to the client's domain controller when your machine isn't using it; NetBIOS and mDNS work either way. Each lookup is one small UDP packet that waits its turn under the rate cap, loopback targets skip reverse DNS, and names from the network are cleaned of control characters before they're shown or saved. Names go into every export, and the scan diff reports a host whose name changed.
+
+### Device grouping
+
+One device often answers at several addresses: a server wired and on Wi-Fi, a NAS with two NICs, a gateway's decoy address. rmap links them so they aren't counted, or their CVEs listed, twice. Two up hosts are one device when they have:
+
+- **the same MAC address** (strongest; this also links a decoy or proxy-ARP address to the device behind it, which is worth seeing), or
+- **the same SSH host key or TLS certificate** - unless more than 4 hosts share it, which means a vendor default or a cloned image, not one device (logged and ignored), or
+- **neighbouring burned-in MACs** (same vendor prefix, 1-2 apart, like a multi-port NIC) **and** the same short hostname or the same vendor. Neighbouring MACs alone aren't enough: machines from one batch can have them too.
+
+Links are transitive. The Hosts tab shows a device's other addresses right under its first one, marked `↳`, and the detail pane says `same device as …` with the reason for each link. The Vulns tab and the Markdown and HTML reports list a CVE found on the same product version at several addresses of one device once, with every address, and count it once. The scan diff doesn't call a device's new address a new host when the device was already up. JSON reports carry each grouped host's `device_group` (`id`, `members`, `reasons`) and a top-level `devices` count; both are recomputed whenever a report is loaded, so older saved scans gain them too. CSV and XML stay one row per address.
 
 ## Service detection
 

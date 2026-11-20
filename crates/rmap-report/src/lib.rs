@@ -7,6 +7,7 @@
 
 pub mod builder;
 pub mod csv;
+pub mod devices;
 pub mod diff;
 pub mod html;
 pub mod json;
@@ -18,6 +19,7 @@ pub mod tags;
 pub mod xml;
 
 pub use builder::ReportBuilder;
+pub use devices::{DeviceGroup, dedup_per_device, device_groups};
 pub use diff::{DiffKind, DiffLine, ScanDiff, diff};
 pub use model::{
     ConfigSummary, FORMAT_VERSION, HostReport, RunStatus, ScanReport, port_ranges, unix_millis_now,

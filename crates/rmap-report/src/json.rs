@@ -24,7 +24,12 @@ pub fn from_str(text: &str) -> Result<ScanReport, String> {
         }
         Some(_) => {}
     }
-    serde_json::from_str(text).map_err(|e| format!("invalid rmap report: {e}"))
+    let mut report: ScanReport =
+        serde_json::from_str(text).map_err(|e| format!("invalid rmap report: {e}"))?;
+    // Derived data: recompute, so old files gain groups and a file's own
+    // (possibly edited) groups are never trusted.
+    crate::devices::assign(&mut report);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -118,8 +123,45 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_report_round_trips() {
-        let report = ScanReport::new(config(), 0);
+        let mut report = ScanReport::new(config(), 0);
+        crate::devices::assign(&mut report);
         assert_eq!(from_str(&to_string(&report).unwrap()).unwrap(), report);
+    }
+
+    #[test]
+    fn device_groups_round_trip_and_old_files_still_load() {
+        let mut b = ReportBuilder::new(config(), 0);
+        for a in ["10.0.0.2", "10.0.0.3"] {
+            b.apply(&ScanEvent::Host {
+                ip: ip(a),
+                hostname: None,
+                state: HostState::Up,
+                rtt: None,
+            });
+            b.apply(&ScanEvent::Mac {
+                ip: ip(a),
+                mac: "00:11:32:aa:bb:cc".parse().unwrap(),
+            });
+        }
+        let report = b.report();
+        assert_eq!(report.devices, Some(1));
+        let g = report.hosts[1].device_group.as_ref().unwrap();
+        assert_eq!(g.members, [ip("10.0.0.2"), ip("10.0.0.3")]);
+        let text = to_string(&report).unwrap();
+        assert!(text.contains("\"device_group\": {"), "{text}");
+        assert!(text.contains("same MAC"), "{text}");
+        assert_eq!(from_str(&text).unwrap(), report);
+
+        // Saved before grouping existed: the groups are recomputed on load.
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v.as_object_mut().unwrap().remove("devices");
+        for h in v["hosts"].as_array_mut().unwrap() {
+            h.as_object_mut().unwrap().remove("device_group");
+        }
+        assert_eq!(from_str(&v.to_string()).unwrap(), report);
+        // A file's own groups aren't trusted, even malformed ones.
+        v["hosts"][0]["device_group"] = serde_json::json!({"id": 9, "members": [], "reasons": []});
+        assert_eq!(from_str(&v.to_string()).unwrap(), report);
     }
 
     #[test]

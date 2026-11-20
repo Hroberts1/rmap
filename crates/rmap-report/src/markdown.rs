@@ -6,8 +6,9 @@ use rmap_core::Vulnerability;
 
 use crate::model::ScanReport;
 use crate::summary::{
-    FINDINGS_NOTE, SEVERITIES, findings, host_label, kev_note, no_findings_text, one_line,
-    service_name, severity_line, unchecked_counts, utc, version_text, vuln_data_line, worst,
+    FINDINGS_NOTE, SEVERITIES, device_findings, findings, host_label, ip_list, kev_note,
+    no_findings_text, one_line, service_name, severity_line, unchecked_counts, utc, version_text,
+    vuln_data_line, worst,
 };
 
 /// Scanned text made safe for a Markdown table cell or list item: one
@@ -142,19 +143,23 @@ pub fn to_string(r: &ScanReport) -> String {
     if all.is_empty() {
         let _ = writeln!(o, "{}", no_findings_text(r));
     }
+    let per_device = device_findings(r);
     for sev in SEVERITIES {
-        let group: Vec<_> = all.iter().filter(|f| f.vuln.severity == sev).collect();
+        let group: Vec<_> = per_device
+            .iter()
+            .filter(|(f, _)| f.vuln.severity == sev)
+            .collect();
         if group.is_empty() {
             continue;
         }
         let _ = writeln!(o, "### {} ({})\n", sev.as_str(), group.len());
-        for f in group {
+        for (f, ips) in group {
             let score = f.vuln.score.map_or(String::new(), |s| format!(" ({s:.1})"));
             let _ = writeln!(
                 o,
                 "- **{}**{score}: {} {}/{}: {}{}",
                 escape(&f.vuln.id),
-                f.ip,
+                ip_list(ips),
                 f.port,
                 f.protocol.as_str(),
                 escape(&f.vuln.summary),

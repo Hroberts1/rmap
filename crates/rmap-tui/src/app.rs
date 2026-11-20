@@ -214,7 +214,7 @@ impl ScanView {
             .map(|(ip, _)| *ip)
             .collect();
         crate::filter::sort(&mut ips, &self.hosts, self.sort);
-        ips
+        crate::devices::order(ips, &self.report.device_groups())
     }
 
     /// After the filter or sort changes: keep the selected host if it is
