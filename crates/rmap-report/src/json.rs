@@ -77,6 +77,7 @@ pub(crate) mod tests {
                 cpes: vec!["cpe:2.3:a:openbsd:openssh:9.6p1:*:*:*:*:*:*:*".into()],
                 method: DetectMethod::Probe,
                 confidence: 10,
+                ..Default::default()
             },
         });
         b.apply(&ScanEvent::HostDone {

@@ -41,6 +41,37 @@ pub struct Service {
     pub method: DetectMethod,
     /// 0 (guess) to 10 (certain).
     pub confidence: u8,
+    /// Stable identities of the service, used to recognise one device
+    /// behind several addresses. Format `<kind> <algorithm>:<value>`, e.g.
+    /// `ssh-ed25519 SHA256:<base64, no padding>` (the same text `ssh-keygen -l`
+    /// prints) or `tls-cert SHA256:<lowercase hex of the DER certificate>`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub fingerprints: Vec<String>,
+    /// The leaf certificate a TLS service presented, when one was parsed.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub cert: Option<CertInfo>,
+}
+
+/// Structured facts about a presented X.509 certificate. Fields the
+/// certificate didn't carry (or that failed to parse) are `None`/empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CertInfo {
+    pub subject_cn: Option<String>,
+    pub sans: Vec<String>,
+    pub issuer_cn: Option<String>,
+    /// `YYYY-MM-DD` (UTC).
+    pub not_before: Option<String>,
+    /// `YYYY-MM-DD` (UTC).
+    pub not_after: Option<String>,
+    /// Subject and issuer are the same name.
+    pub self_signed: bool,
 }
 
 impl Service {
