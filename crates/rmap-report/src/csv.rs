@@ -3,7 +3,7 @@
 use crate::model::ScanReport;
 use crate::summary::{kev_note, neutralise, worst};
 
-const HEADER: [&str; 13] = [
+const HEADER: [&str; 14] = [
     "ip",
     "hostname",
     "port",
@@ -17,6 +17,7 @@ const HEADER: [&str; 13] = [
     "worst_severity",
     "cve_check",
     "exploited",
+    "exposure_findings",
 ];
 
 /// One RFC 4180 field. Every field is quoted, and one that a spreadsheet
@@ -41,8 +42,20 @@ fn row(out: &mut String, cells: &[&str]) {
 pub fn to_string(r: &ScanReport) -> String {
     let mut out = String::new();
     row(&mut out, &HEADER);
+    let exposures = crate::exposure::findings(r);
     for h in r.hosts.iter().filter(|h| h.is_up()) {
-        for p in &h.ports {
+        for (i, p) in h.ports.iter().enumerate() {
+            // `high: Telnet (plaintext remote login); ...`. Host-wide
+            // findings go on the host's first row only, so they count once.
+            let exposure: Vec<String> = exposures
+                .iter()
+                .filter(|f| f.ip == h.ip)
+                .filter(|f| match f.port {
+                    Some(port) => port == p.port && f.protocol == Some(p.protocol),
+                    None => i == 0,
+                })
+                .map(|f| format!("{}: {}", f.severity.as_str(), f.title))
+                .collect();
             let s = p.service.as_ref();
             let cves: Vec<&str> = p.vulnerabilities.iter().map(|v| v.id.as_str()).collect();
             // `CVE-2024-6387 actively exploited (CISA KEV, added 2024-07-01); ...`
@@ -69,6 +82,7 @@ pub fn to_string(r: &ScanReport) -> String {
                         .as_ref()
                         .map_or(String::new(), |c| c.to_string()),
                     &exploited.join("; "),
+                    &exposure.join("; "),
                 ],
             );
         }
@@ -117,6 +131,21 @@ mod tests {
         }
         assert!(rows[1][1].starts_with("'=cmd"));
         assert_eq!(rows[1][7], "'@SUM(1+1)");
+    }
+
+    #[test]
+    fn exposure_findings_column() {
+        let mut r = fixture();
+        r.hosts.push(crate::exposure::tests::printer());
+        let rows = parse(&to_string(&r));
+        let last = HEADER.len() - 1;
+        let telnet = rows
+            .iter()
+            .find(|r| r[0] == "10.9.0.26" && r[2] == "23")
+            .unwrap();
+        assert_eq!(telnet[last], "high: Telnet (plaintext remote login)");
+        let raw = rows.iter().find(|r| r[2] == "9100").unwrap();
+        assert_eq!(raw[last], "");
     }
 
     #[test]
