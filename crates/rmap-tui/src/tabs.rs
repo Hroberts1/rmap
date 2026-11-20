@@ -19,6 +19,7 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use rmap_core::{PortResult, Protocol, Vulnerability, service_name};
 
 use crate::app::{HostRow, ScanView};
+use crate::devices::Groups;
 use crate::ui::{ACCENT, STACK_BELOW, centered, ellipsize, highlight, pane_block, vuln_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -64,6 +65,8 @@ impl ServiceGroup<'_> {
 
 pub struct Finding<'a> {
     pub ip: IpAddr,
+    /// Every address of the device this finding is on, `ip` first.
+    pub ips: Vec<IpAddr>,
     pub port: &'a PortResult,
     pub vuln: &'a Vulnerability,
 }
@@ -103,14 +106,16 @@ pub fn service_groups(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<ServiceGroup<'_>
 
 /// Every finding in the scan, worst first: actively exploited (CISA KEV),
 /// then severity, then score, unscored last. Ties keep address and port
-/// order.
-pub fn findings(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<Finding<'_>> {
+/// order. The same CVE and product version on several addresses of one
+/// device is listed once.
+pub fn findings<'a>(hosts: &'a BTreeMap<IpAddr, HostRow>, groups: &Groups) -> Vec<Finding<'a>> {
     let mut all: Vec<Finding> = hosts
         .iter()
         .flat_map(|(ip, h)| {
             h.open.iter().flat_map(move |port| {
                 port.vulnerabilities.iter().map(move |vuln| Finding {
                     ip: *ip,
+                    ips: Vec::new(),
                     port,
                     vuln,
                 })
@@ -125,7 +130,16 @@ pub fn findings(hosts: &BTreeMap<IpAddr, HostRow>) -> Vec<Finding<'_>> {
             .then(b.vuln.severity.cmp(&a.vuln.severity))
             .then(score(b).total_cmp(&score(a)))
     });
-    all
+    rmap_report::dedup_per_device(all, groups, |f| {
+        let version = f.port.service.as_ref().and_then(|s| s.version_label());
+        (
+            f.ip,
+            format!("{} {}", f.vuln.id, version.unwrap_or_default()),
+        )
+    })
+    .into_iter()
+    .map(|(f, ips)| Finding { ips, ..f })
+    .collect()
 }
 
 /// Service name for display; guesses from the port number end in `?`.
@@ -197,7 +211,11 @@ pub fn on_key(view: &mut ScanView, code: KeyCode) -> bool {
             let Some(delta) = nav_delta(code) else {
                 return false;
             };
-            let keys: Vec<FindingKey> = findings(&view.hosts).iter().map(Finding::key).collect();
+            let groups = view.report.device_groups();
+            let keys: Vec<FindingKey> = findings(&view.hosts, &groups)
+                .iter()
+                .map(Finding::key)
+                .collect();
             tabs.finding = step(&keys, tabs.finding.as_ref(), delta);
             true
         }
@@ -398,8 +416,9 @@ fn draw_services(frame: &mut Frame, area: Rect, view: &mut ScanView) {
 
 fn draw_vulns(frame: &mut Frame, area: Rect, view: &mut ScanView) {
     let running = view.is_running();
+    let groups = view.report.device_groups();
     let ScanView { hosts, tabs, .. } = view;
-    let all = findings(hosts);
+    let all = findings(hosts, &groups);
     if all.is_empty() {
         frame.render_widget(pane_block(" potential CVEs ", true), area);
         empty_message(
@@ -438,12 +457,19 @@ fn draw_vulns(frame: &mut Frame, area: Rect, view: &mut ScanView) {
             Some(s) => s.version_label().unwrap_or_else(|| s.display_name()),
             None => service_label(f.port),
         };
-        let left = Text::from(vec![
+        let mut left = vec![
             Line::from(ellipsize(place, place_w)),
             Line::from(ellipsize(&product, place_w)).dim(),
-        ]);
+        ];
+        // The same device's other addresses with this finding.
+        left.extend(
+            f.ips[1..]
+                .iter()
+                .map(|ip| Line::from(ellipsize(&format!("+ {ip}"), place_w)).dim()),
+        );
         let right = vuln_text(f.vuln, text_w);
-        let height = right.lines.len().max(2) as u16;
+        let height = right.lines.len().max(left.len()) as u16;
+        let left = Text::from(left);
         Row::new([Cell::from(left), Cell::from(right)]).height(height)
     });
     let title = format!(
@@ -609,7 +635,7 @@ mod tests {
     #[test]
     fn findings_are_worst_first() {
         let (_rt, mut app) = audit_scan();
-        let ids: Vec<&str> = findings(&view(&mut app).hosts)
+        let ids: Vec<&str> = findings(&view(&mut app).hosts, &Groups::new())
             .iter()
             .map(|f| f.vuln.id.as_str())
             .collect();

@@ -554,6 +554,11 @@ pub(crate) fn pane_block(title: impl Into<Line<'static>>, focused: bool) -> Bloc
 
 fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut HitMap) {
     let visible = view.visible();
+    let groups = view.report.device_groups();
+    // A device's other addresses, shown under its first one as `↳ addr`.
+    let tucked = |ip: &std::net::IpAddr| {
+        crate::devices::primary_of(*ip, &groups).is_some_and(|p| visible.contains(&p))
+    };
     let focused = view.focus == Pane::Hosts;
 
     // Fixed widths for address and open count; the name gets what's left,
@@ -562,7 +567,7 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut Hi
     let inner = area.width.saturating_sub(3) as usize;
     let addr_w = visible
         .iter()
-        .map(|ip| ip.to_string().len())
+        .map(|ip| ip.to_string().len() + if tucked(ip) { 2 } else { 0 })
         .max()
         .unwrap_or(0)
         .max("ADDRESS".len());
@@ -606,7 +611,11 @@ fn draw_host_table(frame: &mut Frame, area: Rect, view: &ScanView, hits: &mut Hi
         let name = crate::mac::host_name(h).unwrap_or_default();
         let mut cells = vec![
             Cell::from(mark).style(style),
-            Cell::from(ip.to_string()),
+            Cell::from(if tucked(ip) {
+                format!("↳ {ip}")
+            } else {
+                ip.to_string()
+            }),
             Cell::from(ellipsize(name, name_w)).dim(),
             Cell::from(Line::from(open)),
         ];
@@ -729,6 +738,10 @@ fn draw_host_detail(frame: &mut Frame, area: Rect, view: &mut ScanView, hits: &m
     let mut info_lines = vec![host_info(host)];
     info_lines.extend(crate::names::detail_line(host));
     info_lines.extend(crate::mac::detail_line(host));
+    info_lines.extend(crate::devices::detail_lines(
+        ip,
+        &view.report.device_groups(),
+    ));
     info_lines.extend(silent_hint(host));
     let [info, ports, footer] = Layout::vertical([
         Constraint::Length(info_lines.len() as u16),

@@ -6,8 +6,9 @@ use std::fmt::Write as _;
 
 use crate::model::{HostReport, ScanReport};
 use crate::summary::{
-    FINDINGS_NOTE, SEVERITIES, duration, findings, kev_note, no_findings_text, one_line,
-    service_name, severity_counts, unchecked_counts, utc, version_text, vuln_data_line, worst,
+    FINDINGS_NOTE, SEVERITIES, device_findings, duration, ip_list, kev_note, no_findings_text,
+    one_line, same_device_note, service_name, severity_counts, unchecked_counts, utc, version_text,
+    vuln_data_line, worst,
 };
 
 const STYLE: &str = r#"
@@ -71,6 +72,10 @@ fn write_host(o: &mut String, h: &HostReport) {
     let _ = write!(o, "<section class=\"host\">\n<h3>{}", h.ip);
     if let Some(name) = &h.hostname {
         let _ = write!(o, " <span class=\"muted\">{}</span>", escape(name));
+    }
+    let same = same_device_note(h);
+    if !same.is_empty() {
+        let _ = write!(o, " <span class=\"muted\">{}</span>", &same[2..]);
     }
     let _ = writeln!(o, "</h3>");
     if h.ports.is_empty() {
@@ -207,7 +212,7 @@ pub fn to_string(r: &ScanReport) -> String {
     }
 
     let _ = writeln!(o, "<h2>Potential findings</h2>");
-    let all = findings(r);
+    let all = device_findings(r);
     if all.is_empty() {
         let _ = writeln!(o, "<p class=\"muted\">{}</p>", escape(&no_findings_text(r)));
     } else {
@@ -215,7 +220,7 @@ pub fn to_string(r: &ScanReport) -> String {
             o,
             "<table>\n<thead><tr><th>Severity</th><th>CVE</th><th>Score</th><th>Host</th><th>Port</th><th>Summary</th></tr></thead>\n<tbody>"
         );
-        for f in all {
+        for (f, ips) in all {
             let sev = f.vuln.severity.as_str();
             let score = f.vuln.score.map_or(String::new(), |s| format!("{s:.1}"));
             let kev = kev_note(f.vuln).map_or(String::new(), |n| {
@@ -225,7 +230,7 @@ pub fn to_string(r: &ScanReport) -> String {
                 o,
                 "<tr><td><span class=\"sev {sev}\">{sev}</span></td><td>{}</td><td>{score}</td><td>{}</td><td>{}/{}</td><td>{}{kev}</td></tr>",
                 escape(&f.vuln.id),
-                f.ip,
+                ip_list(&ips),
                 f.port,
                 f.protocol.as_str(),
                 escape(&f.vuln.summary)

@@ -3,7 +3,9 @@
 //! Hosts match by address and ports by (port, protocol), so the order of
 //! hosts or ports in either report doesn't matter. A host counts as present
 //! when it is up (or assumed up); a host that was down in one scan and
-//! absent from the other isn't reported, since it was never seen.
+//! absent from the other isn't reported, since it was never seen. A new
+//! address of a device already present (see [`crate::devices`]) isn't a
+//! new host either.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -159,10 +161,19 @@ pub fn diff(old: &ScanReport, new: &ScanReport) -> ScanDiff {
     let old_hosts = index(old);
     let new_hosts = index(new);
     let mut d = ScanDiff::default();
+    let groups = crate::devices::device_groups(&new.hosts);
+    // Another address of a device that was already up isn't a new host.
+    let known_device = |ip: &IpAddr| {
+        groups.get(ip).is_some_and(|g| {
+            g.members
+                .iter()
+                .any(|m| old_hosts.get(m).is_some_and(|o| o.is_up()))
+        })
+    };
 
     for (ip, n) in &new_hosts {
         match old_hosts.get(ip) {
-            None if n.is_up() => d.new_hosts.push(host_change(n)),
+            None if n.is_up() && !known_device(ip) => d.new_hosts.push(host_change(n)),
             None => {}
             Some(o) if o.is_up() != n.is_up() => d.state_changes.push(StateChange {
                 ip: *ip,
@@ -528,6 +539,20 @@ mod tests {
         let d = diff(&full, &e);
         assert_eq!(d.gone_hosts.len(), 1);
         assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn second_address_of_a_known_device_is_not_a_new_host() {
+        let mac = Some("00:11:32:aa:bb:cc".parse::<MacAddr>().unwrap());
+        let mut a = host("10.0.0.20", UP, &[]);
+        a.mac = mac;
+        let mut b = host("10.0.0.88", UP, &[]);
+        b.mac = mac;
+        let d = diff(&report(vec![a.clone()]), &report(vec![a, b.clone()]));
+        assert!(d.new_hosts.is_empty(), "{d:?}");
+        // Without the first address it's still new.
+        let d = diff(&report(vec![]), &report(vec![b]));
+        assert_eq!(d.new_hosts.len(), 1);
     }
 
     #[test]

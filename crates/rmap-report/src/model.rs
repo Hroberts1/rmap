@@ -98,6 +98,10 @@ pub struct HostReport {
     /// first. The first also fills `hostname` when no name was typed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<HostName>,
+    /// Other addresses of the same device, when rmap recognised them. See
+    /// [`crate::devices`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_group: Option<crate::devices::DeviceGroup>,
 }
 
 impl HostReport {
@@ -114,6 +118,7 @@ impl HostReport {
             mac: None,
             vendor: None,
             names: Vec::new(),
+            device_group: None,
         }
     }
 
@@ -148,6 +153,9 @@ pub struct ScanReport {
     /// no database opened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vuln_data: Option<VulnData>,
+    /// Distinct devices among the hosts up, counting each device group once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devices: Option<usize>,
 }
 
 impl ScanReport {
@@ -162,6 +170,7 @@ impl ScanReport {
             config,
             hosts: Vec::new(),
             vuln_data: None,
+            devices: None,
         }
     }
 

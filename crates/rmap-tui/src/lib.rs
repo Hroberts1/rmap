@@ -6,6 +6,7 @@
 
 mod app;
 mod clipboard;
+mod devices;
 mod filter;
 mod input;
 mod limits;
