@@ -824,10 +824,13 @@ fn build_from_nvd_asks_then_builds_with_the_saved_key() {
     assert_eq!(notice, "CVE data built from NVD: 0 CVEs");
     assert!(!error);
     let screen = render(&mut app, 120, 40);
-    assert!(
-        screen.contains("NVD API 2.0 + CISA KEV") && screen.contains("(built locally)"),
-        "{screen}"
-    );
+    // The fixture's build date is fixed, so "(N days ago)" grows over time
+    // and wraps the status line; compare with borders and wrapping removed.
+    let flat: String = screen
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '│')
+        .collect();
+    assert!(flat.contains("NVDAPI2.0+CISAKEV(builtlocally)"), "{screen}");
     assert!(
         screen.contains("••••••••-…-e1f0") && !screen.contains(KEY),
         "{screen}"
