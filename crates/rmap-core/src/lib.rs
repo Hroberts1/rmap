@@ -16,7 +16,7 @@ pub use names::{HostName, NameSource};
 pub use ports::{PortList, service_name};
 pub use result::{HostState, PortResult, PortState, Protocol, ScanEvent};
 pub use scan::ScanType;
-pub use service::{DetectMethod, SILENT_INFO, Service};
+pub use service::{CertInfo, DetectMethod, SILENT_INFO, Service};
 pub use target::{Target, parse_targets};
 pub use timing::Timing;
 pub use vuln::{VulnCheck, VulnData, VulnSeverity, Vulnerability};

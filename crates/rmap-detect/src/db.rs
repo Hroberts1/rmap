@@ -216,6 +216,7 @@ impl Rule {
             cpes: Vec::new(),
             method: rmap_core::DetectMethod::Probe,
             confidence,
+            ..Default::default()
         })
     }
 }
