@@ -300,6 +300,8 @@ pub(crate) mod tests {
     fn summary_and_findings_are_written_and_ignored_on_read() {
         let mut r = sample();
         r.hosts.push(crate::exposure::tests::printer());
+        // Device groups are derived; reading recomputes them, so do it here too.
+        crate::devices::assign(&mut r);
         let text = to_string(&r).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["summary"]["hosts_up"], 3);
