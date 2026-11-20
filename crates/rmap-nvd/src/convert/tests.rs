@@ -24,6 +24,7 @@ fn range(vendor: &str, product: &str, min: Option<Bound>, max: Option<Bound>) ->
         product: product.into(),
         min,
         max,
+        condition: None,
     }
 }
 
@@ -244,7 +245,7 @@ fn cve_conversion() {
 }
 
 #[test]
-fn and_configurations_keep_the_vulnerable_app() {
+fn and_configurations_keep_the_vulnerable_app_with_its_platform_as_a_condition() {
     let c = json!({
         "id": "CVE-2020-0001",
         "configurations": [{"operator": "AND", "nodes": [
@@ -254,10 +255,93 @@ fn and_configurations_keep_the_vulnerable_app() {
         ]}]
     });
     let e = convert_cve(&c, &products(), &HashMap::new()).unwrap();
+    let mut want = range("apache", "http_server", inc("2.4.49"), inc("2.4.49"));
+    want.condition = Some("microsoft:windows".into());
+    assert_eq!(e.matches, [want]);
+}
+
+/// Handoff regression (c): an NVD AND configuration ("OpenSSH with musl
+/// on Linux", fabricated in NVD's shape) converts into a conditional
+/// match, not an unconditional one.
+#[test]
+fn and_node_sample_converts_into_a_conditional_match() {
+    let c = json!({
+        "id": "CVE-2026-123158",
+        "descriptions": [{"lang": "en", "value": "sshd in OpenSSH before 10.6p2 on Linux, when musl libc is used without PAM, lacks a workaround for a password authentication bypass."}],
+        "configurations": [
+            {"operator": "AND", "nodes": [
+                {"operator": "OR", "negate": false, "cpeMatch": [
+                    cm("cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*", json!({"versionEndExcluding": "10.6p2"}))
+                ]},
+                {"operator": "OR", "negate": false, "cpeMatch": [
+                    {"vulnerable": false, "criteria": "cpe:2.3:a:musl-libc:musl:-:*:*:*:*:*:*:*"}
+                ]},
+                {"operator": "OR", "negate": false, "cpeMatch": [
+                    {"vulnerable": false, "criteria": "cpe:2.3:o:linux:linux_kernel:-:*:*:*:*:*:*:*"},
+                    {"vulnerable": false, "criteria": "garbage"}
+                ]}
+            ]},
+            // A plain OR configuration elsewhere stays unconditional.
+            {"nodes": [{"operator": "OR", "cpeMatch": [
+                cm("cpe:2.3:a:openbsd:openssh:1.0:*:*:*:*:*:*:*", json!({}))
+            ]}]}
+        ]
+    });
+    let e = convert_cve(&c, &products(), &HashMap::new()).unwrap();
+    let mut conditional = range("openbsd", "openssh", None, exc("10.6p2"));
+    conditional.condition =
+        Some("musl-libc:musl and linux:linux_kernel or an unrecognised platform".into());
     assert_eq!(
         e.matches,
-        [range("apache", "http_server", inc("2.4.49"), inc("2.4.49"))]
+        [
+            conditional,
+            range("openbsd", "openssh", inc("1.0"), inc("1.0"))
+        ]
     );
+    assert!(!e.finding.client_only, "sshd wording is server-side");
+}
+
+#[test]
+fn client_only_follows_the_curated_openssh_wording() {
+    let ssh = [range("openbsd", "openssh", None, exc("10.6"))];
+    // Real NVD summaries from the field review (CVE ids in comments).
+    let client = [
+        // CVE-2026-106583
+        r"In ssh in OpenSSH before 10.6, a $ or \ character can occur in a command-line username, leading to injection.",
+        // CVE-2026-106552
+        "In sftp in OpenSSH before 10.6, a server can trigger directory traversal (causing files to be written to unintended locations) during a recursive copy operation.",
+        // CVE-2026-106584
+        "In ssh-keygen in OpenSSH before 10.6, certificates could have incorrect expiration times because of Daylight Saving mishandling.",
+        // CVE-2026-59995
+        "sftp in OpenSSH before 10.4 does not properly constrain the location of downloaded files when \"sftp server:/path .\" is used with an attacker-controlled server.",
+        // CVE-2026-59996
+        "scp in OpenSSH before 10.4 may place a file in the parent directory of an intended directory when the copy occurs between two remote destinations.",
+        // CVE-2026-60002
+        "ssh in OpenSSH before 10.4 can have a use-after-free when a server changes its host key during a key re-exchange. (This outcome occurs only on the client side.)",
+        // CVE-2026-73281
+        "In ssh-agent in OpenSSH before 10.5, some operations can occur remotely but were intended to occur only locally.",
+        // CVE-2026-73282
+        "In ssh in OpenSSH before 10.5, a use-after-free for realloc data can occur if a certain pair of remote-forwarding operations are concurrent.",
+    ];
+    let server = [
+        // CVE-2026-106582: sshd wording wins over ssh.
+        "In sshd and ssh in OpenSSH before 10.6, an LZ77 dictionary coder can be used even though this is contraindicated.",
+        // CVE-2026-59997
+        "internal-sftp in sshd in OpenSSH before 10.4 recognizes only the first 9 command-line arguments.",
+        // CVE-2026-106553
+        "In sshd in OpenSSH before 10.6, credentials can incorrectly persist after failure of a GSSAPIAuthentication authentication attempt.",
+        // CVE-2026-35388: no program named, so not client-only.
+        "OpenSSH before 10.3 omits connection multiplexing confirmation for proxy-mode multiplexing sessions.",
+    ];
+    for s in client {
+        assert!(client_only(s, &ssh), "{s}");
+    }
+    for s in server {
+        assert!(!client_only(s, &ssh), "{s}");
+    }
+    // Only for OpenSSH-only CVEs.
+    let other = [range("apache", "http_server", None, None)];
+    assert!(!client_only(client[0], &other));
 }
 
 #[test]

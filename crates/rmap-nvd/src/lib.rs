@@ -201,6 +201,7 @@ fn plan_at(dest: &Path, products: &convert::Products, now: u64) -> Plan {
     let db = match Database::open(dest) {
         Ok(db) => db,
         Err(DbError::NotFound) => return full("no CVE data yet"),
+        Err(DbError::OldSchema(_)) => return full("the current data is in an older format"),
         Err(_) => return full("the current file is unusable"),
     };
     let Some(watermark) = db.meta("nvd_last_modified").and_then(|s| time::parse(&s)) else {

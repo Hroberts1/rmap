@@ -18,9 +18,30 @@ pub(crate) fn stale_after_days() -> i64 {
 pub(crate) fn detail(check: &VulnCheck) -> Option<(String, Style)> {
     match check {
         VulnCheck::Checked { matches: 1.., .. } => None,
-        VulnCheck::Checked { .. } => Some((check.to_string(), Style::new().dim())),
+        VulnCheck::Checked { .. } | VulnCheck::CheckedUpstreamOnly { matches: 0, .. } => {
+            Some((check.to_string(), Style::new().dim()))
+        }
+        // Its matches are folded into this line, not listed one by one.
+        VulnCheck::CheckedUpstreamOnly { .. } => Some((
+            format!("{check} (see the Vulns tab)"),
+            Style::new().fg(Color::Yellow),
+        )),
         _ => Some((check.to_string(), Style::new().fg(Color::Yellow))),
     }
+}
+
+/// `CVE coverage: 4 of 65 open ports checked`: said up front so a short
+/// findings list isn't read as a clean network.
+pub(crate) fn coverage(view: &ScanView) -> String {
+    let open = view.hosts.values().flat_map(|h| &h.open);
+    let checked = open
+        .clone()
+        .filter(|p| p.vuln_check.as_ref().is_some_and(|c| !c.is_unchecked()))
+        .count();
+    format!(
+        "CVE coverage: {checked} of {} open ports checked",
+        open.count()
+    )
 }
 
 /// For the header's bottom border: ` 3 unchecked · CVE data 2026-11-01 `.
@@ -237,6 +258,8 @@ mod tests {
                         score: Some(8.1),
                         published: None,
                         kev_added: Some("2024-07-15".into()),
+                        condition: None,
+                        client_only: false,
                     }],
                 });
             }

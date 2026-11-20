@@ -235,7 +235,7 @@ sudo setcap cap_net_raw+ep target/release/rmap
 
 ### Tabs: Hosts, Services, Vulns
 
-`1` (Hosts, the default) shows one host at a time with its ports, as described above. `2` (Services) groups every open port across the whole scan by port and protocol - "which hosts have 445 open?" - with the service name and a count. `3` (Vulns) lists every potential finding in the scan, worst severity first, host and port alongside each one. Both rebuild from the live results every frame, so they fill in as the scan runs, and arrow keys move through whichever group or finding is selected.
+`1` (Hosts, the default) shows one host at a time with its ports, as described above. `2` (Services) groups every open port across the whole scan by port and protocol - "which hosts have 445 open?" - with the service name and a count. `3` (Vulns) starts with a coverage line (`CVE coverage: 4 of 65 open ports checked`), then lists every match grouped by product and version (`OpenSSH 10.2p1: 29 potential (upstream match; Ubuntu build) · 3 conditional (platform not verified) · 8 client-only, not counted · 2 ports`), worst group first, host and port alongside each finding. `Enter` or `Space` opens or closes the selected group; groups with plain potential findings start open, groups holding only distro-build, conditional or client-only matches start closed (see [Match tiers](#match-tiers)). Both rebuild from the live results every frame, so they fill in as the scan runs, and arrow keys move through whichever group or finding is selected.
 
 ### Filtering and sorting the host list
 
@@ -299,7 +299,7 @@ Set `RMAP_SCAN_DIR` to keep scans somewhere else; exports then default to `$RMAP
 
 - **JSON:** rmap's own report format, the same one used for saved scans. It carries a `format_version` so later versions of rmap can keep reading old files. It records the rmap version, start and end times, how the scan ended (`completed`, `stopped`, `failed`), the configuration, and every host with its open and open|filtered ports, detected services and CPEs, and closed/filtered counts.
 - **Nmap XML:** the commonly used subset of Nmap's documented XML output (`nmaprun`, `scaninfo`, `host`, `status`, `address`, `hostnames`, `ports`, `extraports`, `port`, `state`, `service` with product/version/extrainfo/CPE, `times`, `runstats`), so tools that import Nmap results can read rmap scans. It's written by rmap's own small XML writer; times are in UTC, and CPEs are converted to the `cpe:/` form Nmap uses.
-- **Markdown:** a readable summary for pasting into a ticket: scope, times, hosts up, open ports and potential CVE counts by severity, then a ports table and findings per host, then all findings by severity.
+- **Markdown:** a readable summary for pasting into a ticket: scope, times, hosts up, open ports and potential CVE counts by severity, then a ports table and findings per host, then all matches grouped by product and version (distro-build, conditional and client-only matches as one collapsed line each).
 - **CSV:** one row per open or open|filtered port (`ip, hostname, port, protocol, state, service, product, version, info, cves, worst_severity, cve_check, exploited`). Every field is quoted per RFC 4180, and fields a spreadsheet would treat as a formula (starting with `=`, `+`, `-`, `@`, tab or CR) get a leading `'`, since banners and hostnames come from the scanned devices.
 - **HTML:** one self-contained, printable page for handing to a client: inline CSS only, no JavaScript or external requests (a Content-Security-Policy blocks them), light and dark friendly.
 
@@ -448,21 +448,35 @@ Tick **Services** and **Vulns** on the setup form and rmap checks every identifi
 
 A match is **potentially** vulnerable, not certain: a vendor backport can fix the real bug while leaving the version string unchanged, and a version with no entry in the database is not evidence it's safe. This is an offline lookup against a local database file, not a live query - nothing is sent anywhere during a scan.
 
+### Match tiers
+
+A version match alone over-reports (a field review of four OpenSSH ports found 120 matches and no real server-side finding), so rmap sorts every match into one of four tiers and only the first two count:
+
+| Tier | When | Shown |
+|---|---|---|
+| potential | The version is in range and the CVE needs nothing else. | Listed in full, worst first; CISA KEV entries get the red marker and sort first. |
+| upstream only | As above, but the banner names a distro package (`Ubuntu-*`, `Debian-*`, `+deb*`, `.el<N>`, `FreeBSD-*`), so the port's status is `checked_upstream_only` and the distro may have backported the fix without changing the upstream version. | Counted, but folded into one line: `29 potential CVEs (OpenSSH 10.2p1): upstream version; Ubuntu may have backported fixes`. Check the distro's security tracker for the package version. |
+| conditional | NVD says the CVE needs a platform too ("OpenSSH **with** musl libc", "**on** RHEL 5"), which a network scan can't verify. The JSON export keeps it as `condition`. | Apart from the counts, with `conditional: only with musl-libc:musl (not verified)`; never the KEV marker, never sorted first. |
+| client-only | The CVE is in a client program (`ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-agent`), not reachable through a listening port. The JSON export marks it `client_only`. | Not counted; only a count on the group's line. |
+
+**How client-only is decided.** At database build time, from the CVE's English description, for CVEs whose every match is OpenSSH: a description starting `In ssh `, `ssh in OpenSSH`, `In sftp `, `sftp in OpenSSH`, `In scp `, `scp in OpenSSH`, `In ssh-keygen `, `ssh-keygen in OpenSSH`, `In ssh-agent ` or `ssh-agent in OpenSSH`, or containing `client side`, is client-only - unless it mentions `sshd` anywhere, since server wording wins. It is a deliberately small, conservative list (`OPENSSH_CLIENT_OPENINGS` in `crates/rmap-nvd/src/convert.rs`): a client CVE worded some other way (`a file downloaded by scp ...`) stays counted rather than risk hiding a server bug. Other products get rules as their noise shows up.
+
 ### Was the port actually checked?
 
 "No CVEs listed" must never be confused with "safe", so every port with a detected service gets a CVE check status. It shows as a dim line under the port in the detail pane, and in every export:
 
 | Status | Shown as | What it means for you |
 |---|---|---|
-| checked | `no known CVEs for nginx 1.24.0` / `2 potential CVEs (nginx 1.24.0)` | The product and version were looked up. No matches means the database knows of nothing for that version, not that the service is secure. |
+| checked | `no known CVEs for nginx 1.24.0` / `2 potential CVEs (nginx 1.24.0)` | The product and version were looked up. No matches means the database knows of nothing for that version, not that the service is secure. The count leaves out conditional and client-only matches. |
+| checked upstream only | `29 potential CVEs (OpenSSH 10.2p1): upstream version; Ubuntu may have backported fixes` | As checked, for a distro build (see [Match tiers](#match-tiers)). |
 | version hidden | `nginx detected, version unknown: can't check` | The product was identified but not its version (banner hidden or unversioned). rmap does **not** guess: a hidden version is never matched against "before version X" CVEs. Check the version on the device. |
 | no product | `product not identified: can't check` | The service is known only by its protocol or port number, so there is nothing to look up. |
 | not covered | `no CVE data for vsftpd: not checked` | The product was identified, but the CVE database (or rmap's product-to-CPE table) has nothing on it. |
 | no database | `no vulnerability data: not checked` | Matching was on but no usable database was found. |
 
-Everything except "checked" counts as **unchecked**: the header's bottom border shows how many (`4 unchecked`), the Markdown and HTML reports give a "Not checked for CVEs: N of M ports" line, and `/` with the filter text `unchecked` lists the hosts that have any. When a service carries several CPEs, the port gets the best outcome among them (checked, else version hidden, else not covered).
+Everything except "checked" counts as **unchecked**: the header's bottom border shows how many (`4 unchecked`), the Vulns tab and the Markdown and HTML reports open with a "CVE coverage: N of M open ports checked" line, and `/` with the filter text `unchecked` lists the hosts that have any. When a service carries several CPEs, the port gets the best outcome among them (checked, else version hidden, else not covered).
 
-**Actively exploited.** CVEs on CISA's [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) list carry a bold red `actively exploited (CISA KEV, added YYYY-MM-DD)` marker in the detail pane and the Vulns tab, where they sort first, and the same text in the Markdown, HTML and CSV exports. These are being used in real attacks: fix them first.
+**Actively exploited.** CVEs on CISA's [Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) list carry a bold red `actively exploited (CISA KEV, added YYYY-MM-DD)` marker in the detail pane and the Vulns tab, where they sort first, and the same text in the Markdown and HTML exports - but only on potential and upstream-only matches, never on a conditional or client-only one. These are being used in real attacks: fix them first.
 
 **Data age.** The header's bottom border also shows when the CVE data was built (`CVE data 2026-11-01`); once it is more than 30 days old that turns into a warning (`CVE data 45 days old`), since anything published after that date can't be matched. Reports record the same thing ("Vulnerability data: built 2026-11-01, 245000 CVEs").
 
@@ -478,11 +492,11 @@ The CVE data is a SQLite file, `vulns.db`, in rmap's data directory (next to the
 
 rmap doesn't ship CVE data in the binary. If the file is missing or unreadable, the scan runs normally with one warning (`no vulnerability data at <path>; CVE matching skipped`) and no CVE lines. Building or downloading it from inside rmap is covered [below](#updating-vulnerability-data).
 
-The schema (`rmap_vuln::SCHEMA_SQL`, version 1) is rmap's own - not Nmap's `nmap-vulners` or any other scanner's database:
+The schema (`rmap_vuln::SCHEMA_SQL`, version 2) is rmap's own - not Nmap's `nmap-vulners` or any other scanner's database:
 
-- `meta`: `schema_version`, `built_at` (RFC 3339 UTC), `source`, `cve_count`, plus the NVD builder's `nvd_last_modified` and `nvd_products` (used only to decide whether a refresh is possible). rmap refuses a file whose `schema_version` it doesn't know.
-- `cve`: one row per CVE - `id`, `summary`, `severity` (`low`/`medium`/`high`/`critical`), optional CVSS `score`, `published` date, and `kev_added`, the date it joined CISA's Known Exploited Vulnerabilities list.
-- `cpe_match`: which versions of which product each CVE affects - lowercase `vendor` and `product` as `crates/rmap-detect/src/cpe.rs` produces them, then either `version_exact` or a range (`start`/`end`, each inclusive or exclusive, missing = open-ended). A CVE can have several rows, for disjoint ranges across branches; a row with no version at all matches every version.
+- `meta`: `schema_version`, `built_at` (RFC 3339 UTC), `source`, `cve_count`, plus the NVD builder's `nvd_last_modified` and `nvd_products` (used only to decide whether a refresh is possible). rmap refuses a file whose `schema_version` it doesn't know. A version 1 file (before match tiers) is reported as `in an older format (v1, this rmap reads v2): rebuild it or download a new copy in Settings`, both in the scan warning and on the Settings screen, and the next **Build from NVD** is a full build; it is never read with the new columns missing.
+- `cve`: one row per CVE - `id`, `summary`, `severity` (`low`/`medium`/`high`/`critical`), optional CVSS `score`, `published` date, `kev_added`, the date it joined CISA's Known Exploited Vulnerabilities list, and `client_only` (1 for a client-program CVE).
+- `cpe_match`: which versions of which product each CVE affects - lowercase `vendor` and `product` as `crates/rmap-detect/src/cpe.rs` produces them, then either `version_exact` or a range (`start`/`end`, each inclusive or exclusive, missing = open-ended). A CVE can have several rows, for disjoint ranges across branches; a row with no version at all matches every version. `condition`, when set, is the platform an NVD AND configuration also needs, as text (`musl-libc:musl and linux:linux_kernel`).
 
 `rmap_vuln::Writer` builds a file in this format. The file will come from the internet, so rmap treats it as untrusted: it opens it read-only, uses only bound query parameters, refuses views in place of its tables, skips rows that don't fit the schema, and replaces control characters in CVE text before it can reach the terminal.
 
@@ -490,7 +504,7 @@ How matching works (`crates/rmap-vuln`):
 
 1. Each detected service's CPE 2.3 strings give a vendor, a product, and the version + update combined (e.g. `9.7p1`). The database's rows for that vendor and product are fetched by index.
 2. Each row's range is checked in Rust, comparing versions the way dpkg/rpm do: split into alternating digit and text runs, compare each run in order, and treat a side that runs out of runs first as smaller - so `9.7` sorts before `9.7p1`, and that before `9.7p2`. Versions are stored in that same combined form.
-3. Matches are deduplicated by CVE id and reported newest first.
+3. Matches are deduplicated by CVE id (an unconditional row wins over a conditional one) and reported newest first.
 
 ### Updating vulnerability data
 
@@ -527,10 +541,13 @@ How NVD data is converted:
 - A CPE with version `*` and no range means NVD lists every version as affected, and is stored as a row with no bounds, which matches any version. Version `-` (not applicable) is skipped.
 - Severity and score come from CVSS v3.1, else v3.0, else v4.0, else v2 (NVD's primary metric first; v2's low/medium/high kept as NVD rated them). A CVE with no CVSS data yet is kept with no score and severity `medium`, or `high` if it is on the KEV list.
 - Summary: the English description, whitespace collapsed, at most 1000 characters. `published` is the date part of NVD's timestamp; `kev_added` is the KEV `dateAdded`.
+- **AND configurations** ("X running on / with Y"): X's matches keep the configuration's non-vulnerable CPEs as their `condition` - a node's choices joined by `or`, nodes by `and`, a negated node as `not ...`, an unreadable CPE as `an unrecognised platform` (never dropped, which would make the match unconditional).
+- `client_only` comes from the description, as described under [Match tiers](#match-tiers).
 
 Limitations:
 
-- **AND configurations.** NVD often says "product X is vulnerable when running on platform Y". rmap keeps X's match and ignores Y, since a scan can't verify the platform, so such CVEs can be over-reported.
+- **Conditions aren't checked.** A scan can't see a host's libc or PAM setup, so every conditional match stays conditional, even when the OS hint makes the platform unlikely.
+- **Distro builds aren't resolved.** rmap doesn't read the Ubuntu/Debian/Red Hat security trackers, so an upstream-only match may already be fixed in the package.
 - **NVD's backlog.** Many recent CVEs have no CPE data yet (NVD enrichment lags publication), so they can't be matched to a product and aren't in the file until NVD analyses them; the next build or refresh picks them up once NVD updates them.
 - **KEV on unscored CVEs.** A CVE with no CVSS data gets its placeholder severity when it is fetched; if it joins the KEV list later, a refresh updates its KEV date (and its marker) but its severity only once NVD next modifies it.
 

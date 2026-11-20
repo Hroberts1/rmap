@@ -17,6 +17,8 @@ use serde_json::Value;
 /// Longest summary kept, in characters (NVD descriptions can run to pages).
 const MAX_SUMMARY: usize = 1000;
 const MAX_ID: usize = 64;
+/// Longest condition text kept, in characters (rmap-vuln reads up to 300).
+const MAX_CONDITION: usize = 300;
 
 /// NVD (vendor, product) pairs rmap can detect, lowercase.
 pub type Products = HashSet<(String, String)>;
@@ -94,23 +96,27 @@ pub fn convert_cve(
         return None;
     }
     let mut matches: Vec<CpeMatch> = Vec::new();
-    let nodes = array(cve, "configurations")
-        .flat_map(|c| array(c, "nodes"))
-        // A negated node lists what is *not* affected.
-        .filter(|n| n.get("negate").and_then(Value::as_bool) != Some(true));
-    // AND configurations ("X running on Y") keep X's match: rmap can't
-    // verify the platform, so this can over-report.
-    for m in nodes.flat_map(|n| array(n, "cpeMatch")) {
-        if let Some(m) =
-            cpe_match(m).filter(|m| products.contains(&(m.vendor.clone(), m.product.clone())))
-            && !matches.contains(&m)
-        {
-            matches.push(m);
+    for config in array(cve, "configurations") {
+        // "X running on / with Y": X's matches keep Y as their condition.
+        let condition = condition(config);
+        let nodes = array(config, "nodes")
+            // A negated node lists what is *not* affected.
+            .filter(|n| n.get("negate").and_then(Value::as_bool) != Some(true));
+        for m in nodes.flat_map(|n| array(n, "cpeMatch")) {
+            if let Some(mut m) =
+                cpe_match(m).filter(|m| products.contains(&(m.vendor.clone(), m.product.clone())))
+            {
+                m.condition.clone_from(&condition);
+                if !matches.contains(&m) {
+                    matches.push(m);
+                }
+            }
         }
     }
     if matches.is_empty() {
         return None;
     }
+    let summary = summary(cve);
     let kev_added = kev.get(id).cloned();
     // No CVSS data (common for NVD's backlog): keep the CVE, with no score
     // and a placeholder severity - High if it is known to be exploited.
@@ -122,7 +128,8 @@ pub fn convert_cve(
     Some(Entry {
         finding: Vulnerability {
             id: id.to_string(),
-            summary: summary(cve),
+            client_only: client_only(&summary, &matches),
+            summary,
             severity,
             score,
             published: cve
@@ -130,9 +137,97 @@ pub fn convert_cve(
                 .and_then(Value::as_str)
                 .and_then(date_part),
             kev_added,
+            condition: None,
         },
         matches,
     })
+}
+
+/// The non-vulnerable platforms an AND configuration (or AND node) also
+/// needs, as text: a node's choices joined by " or ", nodes by " and ",
+/// e.g. `musl-libc:musl and linux:linux_kernel`. `None` when it needs none.
+fn condition(config: &Value) -> Option<String> {
+    let and = |v: &Value| v.get("operator").and_then(Value::as_str) == Some("AND");
+    let config_and = and(config);
+    let mut parts: Vec<String> = Vec::new();
+    for node in array(config, "nodes").filter(|n| config_and || and(n)) {
+        let mut names: Vec<String> = Vec::new();
+        for m in array(node, "cpeMatch")
+            .filter(|m| m.get("vulnerable").and_then(Value::as_bool) == Some(false))
+        {
+            // Unreadable is still a condition: dropping it would make the
+            // match unconditional.
+            let name = m
+                .get("criteria")
+                .and_then(Value::as_str)
+                .and_then(platform)
+                .unwrap_or_else(|| "an unrecognised platform".into());
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        if !names.is_empty() {
+            let any = names.join(" or ");
+            let negated = node.get("negate").and_then(Value::as_bool) == Some(true);
+            parts.push(if negated { format!("not {any}") } else { any });
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let text = parts.join(" and ");
+    Some(if text.chars().count() > MAX_CONDITION {
+        text.chars().take(MAX_CONDITION - 3).collect::<String>() + "..."
+    } else {
+        text
+    })
+}
+
+/// `vendor:product` (plus ` version` when one is given) from a CPE 2.3
+/// string, for a condition's text.
+fn platform(criteria: &str) -> Option<String> {
+    let fields = split_cpe(criteria)?;
+    let [_, _, _, vendor, product, version, ..] = fields.as_slice() else {
+        return None;
+    };
+    let short = |s: &str| unescape(s).chars().take(60).collect::<String>();
+    let mut name = format!("{}:{}", short(vendor), short(product));
+    if !matches!(version.as_str(), "*" | "-" | "") {
+        name = format!("{name} {}", short(version));
+    }
+    Some(name)
+}
+
+/// Description openings that scope an OpenSSH CVE to its client programs
+/// (`ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-agent`) rather than `sshd`.
+/// shortcut: a curated wording list for the one product it's been checked
+/// against; add rules per product (or CWE/CPE-based tagging) as more
+/// client/server products show the same noise.
+const OPENSSH_CLIENT_OPENINGS: [&str; 10] = [
+    "In ssh ",
+    "ssh in OpenSSH",
+    "In sftp ",
+    "sftp in OpenSSH",
+    "In scp ",
+    "scp in OpenSSH",
+    "In ssh-keygen ",
+    "ssh-keygen in OpenSSH",
+    "In ssh-agent ",
+    "ssh-agent in OpenSSH",
+];
+
+/// Whether a CVE affects only client programs, so it can't be reached
+/// through a listening port. Only for CVEs whose every match is OpenSSH;
+/// any mention of `sshd` (the server) wins over client wording.
+fn client_only(summary: &str, matches: &[CpeMatch]) -> bool {
+    matches
+        .iter()
+        .all(|m| m.vendor == "openbsd" && m.product == "openssh")
+        && !summary.contains("sshd")
+        && (OPENSSH_CLIENT_OPENINGS
+            .iter()
+            .any(|p| summary.starts_with(p))
+            || summary.contains("client side"))
 }
 
 fn array<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> + Clone {
@@ -275,6 +370,7 @@ fn cpe_match(m: &Value) -> Option<CpeMatch> {
         product,
         min,
         max,
+        condition: None,
     })
 }
 

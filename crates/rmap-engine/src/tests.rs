@@ -859,12 +859,15 @@ impl VulnDb {
                 score: Some(8.1),
                 published: Some("2024-07-01".into()),
                 kev_added: None,
+                condition: None,
+                client_only: false,
             },
             matches: vec![CpeMatch {
                 vendor: "openbsd".into(),
                 product: "openssh".into(),
                 min: Some(Bound::Including("8.5p1".into())),
                 max: Some(Bound::Including("9.7p1".into())),
+                condition: None,
             }],
         })
         .unwrap();
@@ -877,12 +880,15 @@ impl VulnDb {
                 score: Some(5.0),
                 published: Some("2022-10-12".into()),
                 kev_added: None,
+                condition: None,
+                client_only: false,
             },
             matches: vec![CpeMatch {
                 vendor: "dropbear_ssh_project".into(),
                 product: "dropbear_ssh".into(),
                 min: None,
                 max: Some(Bound::Excluding("2022.83".into())),
+                condition: None,
             }],
         })
         .unwrap();
@@ -895,12 +901,15 @@ impl VulnDb {
                 score: None,
                 published: None,
                 kev_added: None,
+                condition: None,
+                client_only: false,
             },
             matches: vec![CpeMatch {
                 vendor: "dropbear_ssh_project".into(),
                 product: "dropbear_ssh".into(),
                 min: None,
                 max: None,
+                condition: None,
             }],
         })
         .unwrap();
@@ -1054,10 +1063,11 @@ async fn vuln_check_follows_port_service_and_vulnerabilities() {
     assert!(port_at < service_at && service_at < vulns_at && vulns_at < checks[0].0);
     assert_eq!(
         checks[0].1,
-        rmap_core::VulnCheck::Checked {
+        rmap_core::VulnCheck::CheckedUpstreamOnly {
             product: "OpenSSH".into(),
             version: "9.6p1".into(),
-            matches: 1
+            matches: 1,
+            distro: "Ubuntu".into(),
         }
     );
     // VulnData comes once, before any port.
@@ -1073,6 +1083,80 @@ async fn vuln_check_follows_port_service_and_vulnerabilities() {
     assert_eq!(data.len(), 1, "{:?}", out.events);
     assert!(data[0].0 < port_at);
     assert_eq!(data[0].1.cve_count, 3);
+}
+
+/// Handoff regressions (a) and (b), fabricated: a KEV-listed CVE that
+/// needs musl, a client-only CVE and a plain one, against an Ubuntu build
+/// of OpenSSH 10.2p1. Only the plain one counts, and nothing gets the
+/// actively-exploited marker.
+#[tokio::test(flavor = "multi_thread")]
+async fn platform_conditions_client_scope_and_distro_builds_are_kept_apart() {
+    use rmap_core::{VulnCheck, VulnTier};
+    use rmap_vuln::{Bound, CpeMatch, Entry, Writer};
+    let db = VulnDb::missing("vuln-tiers");
+    let mut w = Writer::create(&db.0).unwrap();
+    let openssh = |condition: Option<&str>| CpeMatch {
+        vendor: "openbsd".into(),
+        product: "openssh".into(),
+        min: None,
+        max: Some(Bound::Excluding("10.6p2".into())),
+        condition: condition.map(Into::into),
+    };
+    for (id, kev, condition, client_only) in [
+        (
+            "CVE-2026-123158",
+            Some("2026-11-01"),
+            Some("musl-libc:musl and linux:linux_kernel"),
+            false,
+        ),
+        ("CVE-2026-60002", None, None, true),
+        ("CVE-2026-106553", None, None, false),
+    ] {
+        w.add(&Entry {
+            finding: rmap_core::Vulnerability {
+                id: id.into(),
+                summary: "test".into(),
+                severity: rmap_core::VulnSeverity::High,
+                score: Some(8.1),
+                published: Some("2026-10-01".into()),
+                kev_added: kev.map(Into::into),
+                condition: None,
+                client_only,
+            },
+            matches: vec![openssh(condition)],
+        })
+        .unwrap();
+    }
+    w.finish().unwrap();
+
+    let port = banner_server(b"SSH-2.0-OpenSSH_10.2p1 Ubuntu-2ubuntu3.5\r\n").await;
+    let out = run_scan(vuln_config(port, &db)).await;
+    let check = vuln_checks(&out)[0].1.clone();
+    assert_eq!(
+        check,
+        VulnCheck::CheckedUpstreamOnly {
+            product: "OpenSSH".into(),
+            version: "10.2p1".into(),
+            matches: 1,
+            distro: "Ubuntu".into(),
+        }
+    );
+    let findings = out
+        .events
+        .iter()
+        .find_map(|e| match e {
+            ScanEvent::Vulnerabilities { findings, .. } => Some(findings),
+            _ => None,
+        })
+        .expect("vulnerabilities event");
+    let tier = |id: &str| {
+        let v = findings.iter().find(|v| v.id == id).unwrap();
+        VulnTier::of(v, Some(&check))
+    };
+    assert_eq!(tier("CVE-2026-123158"), VulnTier::Conditional);
+    assert!(!tier("CVE-2026-123158").shows_kev());
+    assert_eq!(tier("CVE-2026-60002"), VulnTier::ClientOnly);
+    assert_eq!(tier("CVE-2026-106553"), VulnTier::UpstreamOnly);
 }
 
 #[tokio::test(flavor = "multi_thread")]

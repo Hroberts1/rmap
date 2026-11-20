@@ -4,10 +4,13 @@
 
 use std::fmt::Write as _;
 
+use rmap_core::VulnTier;
+
 use crate::model::{HostReport, ScanReport};
 use crate::summary::{
-    FINDINGS_NOTE, SEVERITIES, duration, findings, kev_note, no_findings_text, one_line,
-    service_name, severity_counts, unchecked_counts, utc, version_text, vuln_data_line, worst,
+    FINDINGS_NOTE, SEVERITIES, coverage_line, duration, groups, kev_note, no_findings_text,
+    not_counted_line, one_line, service_name, severity_counts, utc, version_text, vuln_data_line,
+    worst,
 };
 
 const STYLE: &str = r#"
@@ -40,6 +43,7 @@ th { font-size: 13px; color: var(--muted); font-weight: 600; }
 .critical { color: var(--critical); } .high { color: var(--high); }
 .medium { color: var(--medium); } .low { color: var(--low); }
 .kev { font-weight: 700; color: var(--critical); } .unchecked { color: var(--medium); }
+details.group { margin: 0 0 16px; } details.group > summary { cursor: pointer; font-weight: 600; }
 footer { margin-top: 40px; font-size: 13px; color: var(--muted); }
 @media print { main { max-width: none; padding: 0; } h2 { break-after: avoid; } tr { break-inside: avoid; } }
 "#;
@@ -188,8 +192,11 @@ pub fn to_string(r: &ScanReport) -> String {
     if let Some(line) = vuln_data_line(r) {
         rows.push(("Vulnerability data", escape(&line)));
     }
-    if let (n, total @ 1..) = unchecked_counts(r) {
-        rows.push(("Not checked for CVEs", format!("{n} of {total} ports")));
+    if let Some(line) = coverage_line(r) {
+        rows.push(("CVE coverage", line));
+    }
+    if let Some(line) = not_counted_line(r) {
+        rows.push(("Not counted", line));
     }
     let _ = writeln!(o, "<table class=\"kv\">\n<tbody>");
     for (k, v) in rows {
@@ -207,15 +214,31 @@ pub fn to_string(r: &ScanReport) -> String {
     }
 
     let _ = writeln!(o, "<h2>Potential findings</h2>");
-    let all = findings(r);
-    if all.is_empty() {
+    let groups = groups(r);
+    if groups.is_empty() {
         let _ = writeln!(o, "<p class=\"muted\">{}</p>", escape(&no_findings_text(r)));
-    } else {
+    }
+    for g in &groups {
+        // Open only when it holds findings that count without a caveat.
+        let open = g.findings.iter().any(|f| f.tier == VulnTier::Potential);
         let _ = writeln!(
             o,
-            "<table>\n<thead><tr><th>Severity</th><th>CVE</th><th>Score</th><th>Host</th><th>Port</th><th>Summary</th></tr></thead>\n<tbody>"
+            "<details class=\"group\"{}>\n<summary>{}</summary>",
+            if open { " open" } else { "" },
+            escape(&g.line())
         );
-        for f in all {
+        let shown: Vec<_> = g
+            .findings
+            .iter()
+            .filter(|f| f.tier == VulnTier::Potential)
+            .collect();
+        if !shown.is_empty() {
+            let _ = writeln!(
+                o,
+                "<table>\n<thead><tr><th>Severity</th><th>CVE</th><th>Score</th><th>Host</th><th>Port</th><th>Summary</th></tr></thead>\n<tbody>"
+            );
+        }
+        for f in &shown {
             let sev = f.vuln.severity.as_str();
             let score = f.vuln.score.map_or(String::new(), |s| format!("{s:.1}"));
             let kev = kev_note(f.vuln).map_or(String::new(), |n| {
@@ -231,7 +254,46 @@ pub fn to_string(r: &ScanReport) -> String {
                 escape(&f.vuln.summary)
             );
         }
-        let _ = writeln!(o, "</tbody>\n</table>");
+        if !shown.is_empty() {
+            let _ = writeln!(o, "</tbody>\n</table>");
+        }
+        let upstream = g
+            .distro
+            .map(|d| format!("Upstream version; {d} may have backported fixes"));
+        for (tier, label) in [
+            (VulnTier::UpstreamOnly, upstream),
+            (
+                VulnTier::Conditional,
+                Some("Conditional, platform not verified".into()),
+            ),
+            (
+                VulnTier::ClientOnly,
+                Some("Client-only, not counted on a listening port".into()),
+            ),
+        ] {
+            let list = g.unique(tier);
+            if list.is_empty() {
+                continue;
+            }
+            let ids: Vec<String> = list
+                .iter()
+                .map(|f| {
+                    let only = f
+                        .vuln
+                        .condition
+                        .as_ref()
+                        .map_or(String::new(), |c| format!(", only with {c}"));
+                    format!("{} ({}{only})", f.vuln.id, f.vuln.severity.as_str())
+                })
+                .collect();
+            let label = label.unwrap_or_else(|| "Upstream version".into());
+            let _ = writeln!(
+                o,
+                "<p class=\"muted\">{}</p>",
+                escape(&format!("{label}: {}.", ids.join(", ")))
+            );
+        }
+        let _ = writeln!(o, "</details>");
     }
     let _ = writeln!(
         o,

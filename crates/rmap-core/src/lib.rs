@@ -19,7 +19,7 @@ pub use scan::ScanType;
 pub use service::{CertInfo, DetectMethod, SILENT_INFO, Service};
 pub use target::{Target, parse_targets};
 pub use timing::Timing;
-pub use vuln::{VulnCheck, VulnData, VulnSeverity, Vulnerability};
+pub use vuln::{VulnCheck, VulnData, VulnSeverity, VulnTier, Vulnerability};
 
 /// Error returned when user input cannot be parsed.
 #[derive(Debug, Clone, PartialEq, Eq)]

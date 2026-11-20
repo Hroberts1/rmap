@@ -94,6 +94,21 @@ pub struct PortResult {
 }
 
 impl PortResult {
+    /// How much `v`, one of this port's matches, is worth.
+    pub fn vuln_tier(&self, v: &crate::Vulnerability) -> crate::VulnTier {
+        crate::VulnTier::of(v, self.vuln_check.as_ref())
+    }
+
+    /// Matches counted as findings: not conditional, not client-only.
+    pub fn counted_vulns(&self) -> impl Iterator<Item = &crate::Vulnerability> {
+        self.vulnerabilities.iter().filter(|v| {
+            matches!(
+                self.vuln_tier(v),
+                crate::VulnTier::Potential | crate::VulnTier::UpstreamOnly
+            )
+        })
+    }
+
     pub fn new(port: u16, protocol: Protocol, state: PortState, rtt: Option<Duration>) -> Self {
         PortResult {
             port,

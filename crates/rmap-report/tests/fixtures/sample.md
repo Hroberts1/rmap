@@ -1,6 +1,6 @@
 # rmap scan report
 
-> Potential findings: CVEs are matched on the detected product version only, so backported fixes and configuration are not taken into account. Verify each finding before acting on it.
+> Potential findings: CVEs are matched on the detected product version only, so backported fixes and configuration are not taken into account. Matches that need a platform rmap can't verify are listed as conditional, and client-only CVEs are not counted on listening ports. Verify each finding before acting on it.
 
 ## Summary
 
@@ -14,8 +14,8 @@
 - **Hosts up:** 2 of 2
 - **Open ports:** 1
 - **Potential CVEs:** 2 (high 1, medium 1)
+- **CVE coverage:** 1 of 1 open ports checked
 - **Vulnerability data:** built 2025-11-01, 245000 CVEs (NVD + CISA KEV)
-- **Not checked for CVEs:** 0 of 1 ports
 - **rmap version:** 0.1.0
 
 ## Hosts
@@ -36,12 +36,9 @@ Potential findings:
 
 No open ports found.
 
-## Potential findings by severity
+## Potential findings by product
 
-### high (1)
+### OpenSSH 9.6p1: 2 potential · 1 port
 
-- **CVE-2024-6387** (8.1): 10.0.0.2 22/tcp: Signal handler race condition (regreSSHion). · **actively exploited (CISA KEV, added 2024-07-15)**
-
-### medium (1)
-
-- **CVE-2023-51385** (6.5): 10.0.0.2 22/tcp: Shell metacharacters in user names may be expanded.
+- **CVE-2024-6387** (high, 8.1) on 10.0.0.2 22/tcp: Signal handler race condition (regreSSHion). · **actively exploited (CISA KEV, added 2024-07-15)**
+- **CVE-2023-51385** (medium, 6.5) on 10.0.0.2 22/tcp: Shell metacharacters in user names may be expanded.

@@ -191,7 +191,9 @@ fn parse_manifest(body: &[u8], manifest_url: &str) -> Result<Manifest, UpdateErr
         v if v > SCHEMA_VERSION => return Err(UpdateError::TooNewSchema(v)),
         v if v < SCHEMA_VERSION => {
             return Err(bad(format!(
-                "schema version {v} is older than this rmap reads ({SCHEMA_VERSION})"
+                "the published data is in format {v}, older than this rmap reads \
+                 ({SCHEMA_VERSION}); use \"Build from NVD\" instead until a newer \
+                 copy is published"
             )));
         }
         _ => {}

@@ -48,6 +48,56 @@ pub struct Vulnerability {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     pub kev_added: Option<String>,
+    /// Platform the CVE also needs, from an NVD "running on / with"
+    /// configuration, e.g. `musl-libc:musl and linux:linux_kernel`. rmap
+    /// can't verify it, so the match is only [`VulnTier::Conditional`].
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub condition: Option<String>,
+    /// The CVE is in client programs only (`ssh`, `scp`, ...), so it is
+    /// not reachable through a listening port.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub client_only: bool,
+}
+
+/// How much a match on a port is worth, most first. Only `Potential` and
+/// `UpstreamOnly` count as findings; the others are shown apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VulnTier {
+    /// The version is in range and nothing else is needed.
+    Potential,
+    /// As `Potential`, but the service is a distro build that may carry
+    /// backported fixes (the port is [`VulnCheck::CheckedUpstreamOnly`]).
+    UpstreamOnly,
+    /// Needs a platform rmap can't verify (see `Vulnerability::condition`).
+    Conditional,
+    /// Client programs only: not counted on a listening port.
+    ClientOnly,
+}
+
+impl VulnTier {
+    pub fn of(v: &Vulnerability, check: Option<&VulnCheck>) -> VulnTier {
+        if v.client_only {
+            VulnTier::ClientOnly
+        } else if v.condition.is_some() {
+            VulnTier::Conditional
+        } else if matches!(check, Some(VulnCheck::CheckedUpstreamOnly { .. })) {
+            VulnTier::UpstreamOnly
+        } else {
+            VulnTier::Potential
+        }
+    }
+
+    /// Whether a CISA KEV entry may be flagged as actively exploited: never
+    /// for a match whose condition or scope rmap couldn't confirm.
+    pub fn shows_kev(self) -> bool {
+        matches!(self, VulnTier::Potential | VulnTier::UpstreamOnly)
+    }
 }
 
 /// Whether vulnerability matching could check a port, and with what
@@ -65,10 +115,20 @@ pub struct Vulnerability {
 )]
 pub enum VulnCheck {
     /// Looked up; `matches` potential CVEs found (zero means none known).
+    /// `matches` leaves out conditional and client-only matches.
     Checked {
         product: String,
         version: String,
         matches: u32,
+    },
+    /// As `Checked`, but the banner names a distro package (`Ubuntu-*`,
+    /// `+deb*`, `.el9`, ...): matches are against the upstream version and
+    /// `distro` may have backported fixes.
+    CheckedUpstreamOnly {
+        product: String,
+        version: String,
+        matches: u32,
+        distro: String,
     },
     /// The product was identified but not its version.
     VersionHidden { product: String },
@@ -84,7 +144,10 @@ pub enum VulnCheck {
 impl VulnCheck {
     /// Every outcome except `Checked`: the port was not looked up.
     pub fn is_unchecked(&self) -> bool {
-        !matches!(self, VulnCheck::Checked { .. })
+        !matches!(
+            self,
+            VulnCheck::Checked { .. } | VulnCheck::CheckedUpstreamOnly { .. }
+        )
     }
 }
 
@@ -99,6 +162,19 @@ impl std::fmt::Display for VulnCheck {
                 0 => write!(f, "no known CVEs for {product} {version}"),
                 1 => write!(f, "1 potential CVE ({product} {version})"),
                 n => write!(f, "{n} potential CVEs ({product} {version})"),
+            },
+            VulnCheck::CheckedUpstreamOnly {
+                product,
+                version,
+                matches,
+                distro,
+            } => match matches {
+                0 => write!(f, "no known CVEs for {product} {version} ({distro} build)"),
+                n => write!(
+                    f,
+                    "{n} potential CVE{} ({product} {version}): upstream version; {distro} may have backported fixes",
+                    if *n == 1 { "" } else { "s" }
+                ),
             },
             VulnCheck::VersionHidden { product } => {
                 write!(f, "{product} detected, version unknown: can't check")
@@ -150,11 +226,51 @@ mod tests {
                 "no CVE data for nginx: not checked",
             ),
             (VulnCheck::NoDatabase, "no vulnerability data: not checked"),
+            (
+                VulnCheck::CheckedUpstreamOnly {
+                    product: "OpenSSH".into(),
+                    version: "10.2p1".into(),
+                    matches: 2,
+                    distro: "Ubuntu".into(),
+                },
+                "2 potential CVEs (OpenSSH 10.2p1): upstream version; Ubuntu may have backported fixes",
+            ),
         ];
         for (check, want) in cases {
             assert_eq!(check.to_string(), want);
             assert_eq!(check.is_unchecked(), want.contains("check"), "{want}");
         }
+    }
+
+    #[test]
+    fn tiers_put_conditions_and_client_scope_below_findings() {
+        let v = |condition: Option<&str>, client_only| Vulnerability {
+            id: "CVE-2026-0001".into(),
+            summary: String::new(),
+            severity: VulnSeverity::High,
+            score: None,
+            published: None,
+            kev_added: Some("2026-01-01".into()),
+            condition: condition.map(Into::into),
+            client_only,
+        };
+        let distro = VulnCheck::CheckedUpstreamOnly {
+            product: "OpenSSH".into(),
+            version: "10.2p1".into(),
+            matches: 1,
+            distro: "Ubuntu".into(),
+        };
+        assert_eq!(VulnTier::of(&v(None, false), None), VulnTier::Potential);
+        assert_eq!(
+            VulnTier::of(&v(None, false), Some(&distro)),
+            VulnTier::UpstreamOnly
+        );
+        let cond = VulnTier::of(&v(Some("musl-libc:musl"), false), Some(&distro));
+        assert_eq!(cond, VulnTier::Conditional);
+        assert!(!cond.shows_kev());
+        let client = VulnTier::of(&v(None, true), None);
+        assert_eq!(client, VulnTier::ClientOnly);
+        assert!(!client.shows_kev());
     }
 
     #[test]

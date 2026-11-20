@@ -2,12 +2,13 @@
 
 use std::fmt::Write as _;
 
-use rmap_core::Vulnerability;
+use rmap_core::{VulnTier, Vulnerability};
 
 use crate::model::ScanReport;
 use crate::summary::{
-    FINDINGS_NOTE, SEVERITIES, findings, host_label, kev_note, no_findings_text, one_line,
-    service_name, severity_line, unchecked_counts, utc, version_text, vuln_data_line, worst,
+    FINDINGS_NOTE, Group, coverage_line, findings, groups, host_label, kev_note, no_findings_text,
+    not_counted_line, one_line, service_name, severity_line, utc, version_text, vuln_data_line,
+    worst,
 };
 
 /// Scanned text made safe for a Markdown table cell or list item: one
@@ -30,6 +31,53 @@ pub fn escape(s: &str) -> String {
 /// ` · **actively exploited (CISA KEV, added …)**`, or nothing.
 fn kev(v: &Vulnerability) -> String {
     kev_note(v).map_or(String::new(), |n| format!(" · **{}**", escape(&n)))
+}
+
+/// A group's upstream-only, conditional and client-only matches, one
+/// collapsed line each: `Label: CVE-1 (high), CVE-2 (low).`
+fn folded(g: &Group) -> Vec<String> {
+    let upstream = g
+        .distro
+        .map(|d| format!("Upstream version; {} may have backported fixes", escape(d)));
+    [
+        (VulnTier::UpstreamOnly, upstream),
+        (
+            VulnTier::Conditional,
+            Some("Conditional, platform not verified".into()),
+        ),
+        (
+            VulnTier::ClientOnly,
+            Some("Client-only, not counted on a listening port".into()),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(tier, label)| {
+        let list = g.unique(tier);
+        if list.is_empty() {
+            return None;
+        }
+        let ids: Vec<String> = list
+            .iter()
+            .map(|f| {
+                let only = f
+                    .vuln
+                    .condition
+                    .as_ref()
+                    .map_or(String::new(), |c| format!(", only with {}", escape(c)));
+                format!(
+                    "{} ({}{only})",
+                    escape(&f.vuln.id),
+                    f.vuln.severity.as_str()
+                )
+            })
+            .collect();
+        Some(format!(
+            "{}: {}.",
+            label.unwrap_or_else(|| "Upstream version".into()),
+            ids.join(", ")
+        ))
+    })
+    .collect()
 }
 
 fn on_off(b: bool) -> &'static str {
@@ -77,11 +125,14 @@ pub fn to_string(r: &ScanReport) -> String {
     let _ = writeln!(o, "- **Hosts up:** {} of {}", r.hosts_up(), r.hosts.len());
     let _ = writeln!(o, "- **Open ports:** {}", r.open_ports());
     let _ = writeln!(o, "- **Potential CVEs:** {}", severity_line(r));
+    if let Some(line) = not_counted_line(r) {
+        let _ = writeln!(o, "- **Not counted:** {line}");
+    }
+    if let Some(line) = coverage_line(r) {
+        let _ = writeln!(o, "- **CVE coverage:** {line}");
+    }
     if let Some(line) = vuln_data_line(r) {
         let _ = writeln!(o, "- **Vulnerability data:** {}", escape(&line));
-    }
-    if let (n, total @ 1..) = unchecked_counts(r) {
-        let _ = writeln!(o, "- **Not checked for CVEs:** {n} of {total} ports");
     }
     let _ = writeln!(o, "- **rmap version:** {}\n", escape(&r.rmap_version));
 
@@ -118,7 +169,12 @@ pub fn to_string(r: &ScanReport) -> String {
             );
         }
         let _ = writeln!(o);
-        let mine: Vec<_> = all.iter().filter(|f| f.ip == h.ip).collect();
+        // Upstream-only, conditional and client-only matches are listed by
+        // product below.
+        let mine: Vec<_> = all
+            .iter()
+            .filter(|f| f.ip == h.ip && f.tier == VulnTier::Potential)
+            .collect();
         if !mine.is_empty() {
             let _ = writeln!(o, "Potential findings:\n");
             for f in mine {
@@ -138,28 +194,29 @@ pub fn to_string(r: &ScanReport) -> String {
         }
     }
 
-    let _ = writeln!(o, "## Potential findings by severity\n");
-    if all.is_empty() {
+    let _ = writeln!(o, "## Potential findings by product\n");
+    let groups = groups(r);
+    if groups.is_empty() {
         let _ = writeln!(o, "{}", no_findings_text(r));
     }
-    for sev in SEVERITIES {
-        let group: Vec<_> = all.iter().filter(|f| f.vuln.severity == sev).collect();
-        if group.is_empty() {
-            continue;
-        }
-        let _ = writeln!(o, "### {} ({})\n", sev.as_str(), group.len());
-        for f in group {
-            let score = f.vuln.score.map_or(String::new(), |s| format!(" ({s:.1})"));
+    for g in &groups {
+        let _ = writeln!(o, "### {}\n", escape(&g.line()));
+        for f in g.findings.iter().filter(|f| f.tier == VulnTier::Potential) {
+            let score = f.vuln.score.map_or(String::new(), |s| format!(", {s:.1}"));
             let _ = writeln!(
                 o,
-                "- **{}**{score}: {} {}/{}: {}{}",
+                "- **{}** ({}{score}) on {} {}/{}: {}{}",
                 escape(&f.vuln.id),
+                f.vuln.severity.as_str(),
                 f.ip,
                 f.port,
                 f.protocol.as_str(),
                 escape(&f.vuln.summary),
                 kev(f.vuln)
             );
+        }
+        for line in folded(g) {
+            let _ = writeln!(o, "\n{line}");
         }
         let _ = writeln!(o);
     }
