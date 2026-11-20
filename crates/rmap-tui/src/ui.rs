@@ -403,7 +403,7 @@ fn footer_help(view: &ScanView, width: u16) -> Line<'static> {
     let mut wanted = vec![
         ("Tab", "pane"),
         ("↑↓", "select"),
-        ("1-3", "tabs"),
+        ("1-4", "tabs"),
         ("/", "filter"),
     ];
     if view.is_running() || view.rescan.is_some() {
@@ -936,7 +936,7 @@ pub(crate) fn vuln_text(v: &Vulnerability, width: usize) -> Text<'static> {
 /// Word-wrap `text` to `width` columns, indenting continuation lines by
 /// `indent`. Words longer than a line are split. Too narrow to wrap
 /// usefully: returns the text as one line and lets the table clip it.
-fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
+pub(crate) fn wrap(text: &str, width: usize, indent: usize) -> Vec<String> {
     if width < indent + 10 {
         return vec![text.to_string()];
     }
@@ -1049,7 +1049,7 @@ fn draw_help(frame: &mut Frame) {
         ("PgUp PgDn", "move by 10"),
         ("Home End g G", "first / last"),
         ("Tab ← → h l", "switch between hosts and ports"),
-        ("1 2 3", "hosts / services / vulns tab"),
+        ("1 2 3 4", "hosts / services / vulns / findings tab"),
         ("d", "show or hide down hosts"),
         ("/", "filter by ip, name, port, service"),
         ("o", "sort: ip, open ports, worst CVE"),

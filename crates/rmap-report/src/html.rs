@@ -154,6 +154,10 @@ pub fn to_string(r: &ScanReport) -> String {
         let label = format!("<span class=\"sev {0}\">{0}</span>", sev.as_str());
         tile(o, &n.to_string(), &label);
     }
+    let exposure_count = crate::exposure::findings(r).len();
+    if exposure_count > 0 {
+        tile(o, &exposure_count.to_string(), "exposure findings");
+    }
     let _ = writeln!(o, "</div>");
 
     let on_off = |b: bool| if b { "on" } else { "off" };
@@ -196,6 +200,30 @@ pub fn to_string(r: &ScanReport) -> String {
         let _ = writeln!(o, "<tr><th>{k}</th><td>{v}</td></tr>");
     }
     let _ = writeln!(o, "</tbody>\n</table>");
+
+    let exposures = crate::exposure::findings(r);
+    if !exposures.is_empty() {
+        let _ = writeln!(
+            o,
+            "<h2>Exposure findings</h2>\n<table>\n<thead><tr><th>Severity</th><th>Where</th><th>Finding</th></tr></thead>\n<tbody>"
+        );
+        for f in &exposures {
+            // Exposure severities share the CVE colours; info is muted.
+            let class = match f.severity {
+                crate::exposure::Severity::Info => "muted",
+                s => s.as_str(),
+            };
+            let _ = writeln!(
+                o,
+                "<tr><td><span class=\"sev {class}\">{}</span></td><td>{}</td><td><b>{}</b><br><span class=\"muted\">{}</span></td></tr>",
+                f.severity.as_str(),
+                escape(&f.place()),
+                escape(&f.title),
+                escape(&f.detail)
+            );
+        }
+        let _ = writeln!(o, "</tbody>\n</table>");
+    }
 
     let _ = writeln!(o, "<h2>Hosts</h2>");
     let up: Vec<_> = r.hosts.iter().filter(|h| h.is_up()).collect();
@@ -244,7 +272,7 @@ pub fn to_string(r: &ScanReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::summary::tests::{fixture, hostile};
+    use crate::summary::tests::{HOSTILE, fixture, hostile};
 
     #[test]
     fn escapes_html_specials() {
@@ -275,6 +303,26 @@ mod tests {
         assert!(html.contains("default-src 'none'"));
         assert!(html.contains("prefers-color-scheme: dark") && html.contains("@media print"));
         assert!(html.contains("Verify each finding before acting on it."));
+    }
+
+    #[test]
+    fn exposure_findings_section_is_escaped() {
+        let mut r = fixture();
+        assert!(
+            !to_string(&r).contains("Exposure findings"),
+            "none: no section"
+        );
+        let mut printer = crate::exposure::tests::printer();
+        printer.ports[1].service.as_mut().unwrap().product = Some(HOSTILE.into());
+        r.hosts.push(printer);
+        let html = to_string(&r);
+        assert!(html.contains("<h2>Exposure findings</h2>"));
+        assert!(
+            html.contains("<span class=\"sev high\">high</span></td><td>10.9.0.26:23/tcp</td>")
+        );
+        assert!(html.contains("exposure findings</span>"), "summary tile");
+        assert_eq!(html.matches("<script").count(), 0, "{html}");
+        assert!(!html.chars().any(|c| c.is_control() && c != '\n'));
     }
 
     #[test]

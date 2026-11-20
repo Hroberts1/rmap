@@ -83,7 +83,27 @@ pub fn to_string(r: &ScanReport) -> String {
     if let (n, total @ 1..) = unchecked_counts(r) {
         let _ = writeln!(o, "- **Not checked for CVEs:** {n} of {total} ports");
     }
+    let exposures = crate::exposure::findings(r);
+    if !exposures.is_empty() {
+        let line = crate::exposure::severity_line(&exposures);
+        let _ = writeln!(o, "- **Exposure findings:** {line}");
+    }
     let _ = writeln!(o, "- **rmap version:** {}\n", escape(&r.rmap_version));
+
+    if !exposures.is_empty() {
+        let _ = writeln!(o, "## Exposure findings\n");
+        for f in &exposures {
+            let _ = writeln!(
+                o,
+                "- **{}** {}: {}. {}",
+                f.severity.as_str(),
+                escape(&f.place()),
+                escape(&f.title),
+                escape(&f.detail)
+            );
+        }
+        let _ = writeln!(o);
+    }
 
     let all = findings(r);
     let _ = writeln!(o, "## Hosts\n");
@@ -216,6 +236,26 @@ mod tests {
         assert!(md.contains("- **Potential CVEs:** none"));
         assert!(md.contains("No potential CVEs matched"));
         assert!(md.contains("not finished"));
+    }
+
+    #[test]
+    fn exposure_findings_section_is_escaped() {
+        let mut r = fixture();
+        assert!(
+            !to_string(&r).contains("Exposure findings"),
+            "none: no section"
+        );
+        let mut printer = crate::exposure::tests::printer();
+        printer.ports[1].service.as_mut().unwrap().product = Some("<b>|x".into());
+        r.hosts.push(printer);
+        let md = to_string(&r);
+        assert!(
+            md.contains("- **Exposure findings:** 2 (high 1, medium 1)"),
+            "{md}"
+        );
+        assert!(md.contains("## Exposure findings"));
+        assert!(md.contains("- **high** 10.9.0.26:23/tcp: Telnet (plaintext remote login)."));
+        assert!(md.contains("telnet \\<b\\>\\|x"), "{md}");
     }
 
     #[test]

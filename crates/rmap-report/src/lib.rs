@@ -8,6 +8,7 @@
 pub mod builder;
 pub mod csv;
 pub mod diff;
+pub mod exposure;
 pub mod html;
 pub mod json;
 pub mod markdown;
